@@ -1,0 +1,95 @@
+# llm-router 配置示例
+#
+# 这个文件现在只需要填两件事：监听设置 + 上游列表（名字/地址/Key）。
+# 模型的调用顺序不用在这里写 —— 启动后打开网页控制台
+# http://127.0.0.1:8010/ ，点「拉取模型」，再按模型排顺序就行。
+#
+# 网页上的改动会存到 config.state.json（不动这个文件），重启后依然有效。
+
+[server]
+host = "127.0.0.1"      # 只给自己用就保持默认；想让局域网别的机器用填 "0.0.0.0"
+port = 8010
+log_requests = true
+max_body_mb = 32
+# enable_cors = false   # 浏览器前端直连时才需要打开
+
+[router]
+# 新建模型路由时的默认调用方式，网页上可随时改
+default_strategy = "priority"    # priority | round_robin | random
+
+# 一个上游连续失败几次后暂时踢出队列
+failure_threshold = 3
+# 踢出后多久自动恢复（秒）
+cooldown_seconds = 60
+
+
+# ---------------------------------------------------------------------------
+# 上游来源：有几个写几个，[[upstreams]] 可以重复很多组
+#
+# 这里不用写模型清单。启动后点「拉取全部模型」，
+# 程序会去问每个上游自己有哪些模型，然后你在每个上游卡片上
+# 勾选要用的模型（默认一个都不选），并给它们起统一的分组名。
+#
+# 分组名 = 客户端调用的名字。各家把同一个模型叫成不同名字时
+# （比如 A 叫 ds1、B 叫 ds2），把分组名都填成 deepseek 就合并成一个了。
+# ---------------------------------------------------------------------------
+
+# --- DeepSeek 官方 ---
+[[upstreams]]
+name = "DeepSeek 官方"
+id = "u1"
+base_url = "https://api.deepseek.com"
+api_key = "sk-你的官方key"
+
+# --- 硅基流动 ---
+[[upstreams]]
+name = "硅基流动"
+id = "u2"
+base_url = "https://api.siliconflow.cn/v1"
+api_key = "sk-你的硅基流动key"
+
+# --- 火山方舟 ---
+[[upstreams]]
+name = "火山方舟"
+id = "u3"
+base_url = "https://ark.cn-beijing.volces.com/api/v3"
+api_key = "你的火山key"
+
+# --- 本地 Ollama（不需要 Key，随便填一个占位）---
+# [[upstreams]]
+# name = "本地 Ollama"
+# id = "u4"
+# base_url = "http://127.0.0.1:11434/v1"
+# api_key = "ollama"
+
+# --- 同一个厂商的多个账号（用来分摊额度）---
+# 就把同一个地址写多组，不同名字。然后在模型路由里选「轮流轮询」。
+# [[upstreams]]
+# name = "官方账号2"
+# id = "u5"
+# base_url = "https://api.deepseek.com"
+# api_key = "sk-第二个账号的key"
+
+
+# ---------------------------------------------------------------------------
+# 也可以在这里预先写好分组路由（可选）。
+# 网页上配好的内容会覆盖这里，所以平时用网页配就行。
+#
+# 注意 entries 里的 model 是「上游那边的真实名字」，而分组名（下面的键）
+# 才是客户端调用的名字 —— 各家把 deepseek 叫成不同名字时，就靠这个对应关系。
+# ---------------------------------------------------------------------------
+
+# [models."deepseek"]              # 客户端用这个名字调用
+# strategy = "priority"            # priority | round_robin | random
+# entries = [
+#   { upstream = "u1", model = "ds1" },                        # A 家叫 ds1
+#   { upstream = "u2", model = "ds2" },                        # B 家叫 ds2
+#   { upstream = "u3", model = "deepseek-ai/DeepSeek-V3" },    # C 家叫这个
+# ]
+#
+# [models."glm"]
+# strategy = "round_robin"
+# entries = [
+#   { upstream = "u2", model = "zai-org/GLM-4.6" },
+#   { upstream = "u3", model = "glm-4-6" },
+# ]

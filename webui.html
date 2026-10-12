@@ -1,0 +1,1616 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>llm-router 控制台</title>
+<style>
+  :root{
+    --bg:#0b0f16; --panel:#131a24; --panel2:#1a2330; --panel3:#202b3a; --line:#26323f;
+    --fg:#e6edf6; --dim:#8b9bb0; --accent:#4f9cf9; --ok:#3fb950;
+    --warn:#d29922; --bad:#f85149; --radius:10px;
+  }
+  /* 作者样式里的 display:flex 会盖掉浏览器默认的 [hidden]{display:none}，
+     统一强制一下，避免忘了写 [hidden] 规则导致遮罩/弹窗关不掉。 */
+  [hidden]{display:none !important}
+  *{box-sizing:border-box}
+  body{
+    margin:0;background:var(--bg);color:var(--fg);
+    font:14px/1.55 -apple-system,BlinkMacSystemFont,"Segoe UI","Microsoft YaHei",sans-serif;
+  }
+  a{color:var(--accent)}
+  header{
+    display:flex;align-items:center;gap:14px;flex-wrap:wrap;
+    padding:13px 20px;background:var(--panel);border-bottom:1px solid var(--line);
+    position:sticky;top:0;z-index:20;
+  }
+  header h1{font-size:16px;margin:0;font-weight:600}
+  header .ver{color:var(--dim);font-size:12px}
+  .grow{flex:1}
+  .dot{width:8px;height:8px;border-radius:50%;display:inline-block;background:var(--bad)}
+  .dot.on{background:var(--ok);box-shadow:0 0 8px var(--ok)}
+  main{padding:20px;max-width:1180px;margin:0 auto}
+  .card{background:var(--panel);border:1px solid var(--line);border-radius:var(--radius);
+    padding:16px;margin-bottom:16px}
+  .card>h2{font-size:13px;margin:0 0 14px;font-weight:600;color:var(--dim);
+    text-transform:uppercase;letter-spacing:.7px}
+  button{background:var(--panel2);color:var(--fg);border:1px solid var(--line);
+    border-radius:7px;padding:7px 13px;cursor:pointer;font-size:13px;transition:.15s;
+    font-family:inherit}
+  button:hover:not(:disabled){border-color:var(--accent);color:#fff}
+  button:disabled{opacity:.45;cursor:not-allowed}
+  button.primary{background:var(--accent);border-color:var(--accent);color:#04121f;font-weight:600}
+  button.primary:hover:not(:disabled){filter:brightness(1.12);color:#04121f}
+  button.danger:hover:not(:disabled){border-color:var(--bad);color:var(--bad)}
+  button.mini{padding:4px 9px;font-size:12px}
+  button.link{background:none;border:none;color:var(--accent);padding:2px 4px}
+  input,select{background:var(--bg);color:var(--fg);border:1px solid var(--line);
+    border-radius:7px;padding:7px 10px;font-size:13px;font-family:inherit;max-width:100%}
+  input:focus,select:focus{outline:none;border-color:var(--accent)}
+  input::placeholder{color:#5c6b7e}
+  .row{display:flex;gap:10px;align-items:center;flex-wrap:wrap}
+  .grid{display:grid;gap:10px}
+  .muted{color:var(--dim)}
+  .mono{font-family:Consolas,Monaco,monospace}
+  .hint{font-size:12px;color:var(--dim);line-height:1.65}
+  code{background:var(--bg);padding:2px 6px;border-radius:4px;font-size:12px;
+    font-family:Consolas,Monaco,monospace;border:1px solid var(--line)}
+  .badge{font-size:11px;padding:2px 8px;border-radius:20px;background:var(--bg);
+    border:1px solid var(--line);color:var(--dim);white-space:nowrap}
+  .badge.ok{color:var(--ok);border-color:#1d4029}
+  .badge.bad{color:var(--bad);border-color:#4a2020}
+  .badge.warn{color:var(--warn);border-color:#4a3c14}
+  .badge.blue{color:var(--accent);border-color:#1d3557}
+  .badge.purple{color:#c084fc;border-color:#3d2a55}
+  .empty{color:var(--dim);text-align:center;padding:28px 16px;font-size:13px}
+  .toast{position:fixed;right:20px;bottom:20px;z-index:99;display:flex;
+    flex-direction:column;gap:8px;align-items:flex-end;max-width:min(460px,92vw)}
+  .toast div{background:var(--panel3);border:1px solid var(--line);
+    border-left:3px solid var(--accent);padding:10px 15px;border-radius:7px;font-size:13px;
+    box-shadow:0 6px 22px rgba(0,0,0,.5);animation:in .2s ease;word-break:break-word}
+  .toast div.ok{border-left-color:var(--ok)}
+  .toast div.bad{border-left-color:var(--bad)}
+  @keyframes in{from{opacity:0;transform:translateY(8px)}}
+
+  /* ---------- 上游卡片 ---------- */
+  .up{background:var(--panel2);border:1px solid var(--line);border-radius:var(--radius);
+    padding:13px 14px;margin-bottom:10px}
+  .up.off{opacity:.55}
+  .up.cool{border-color:var(--warn)}
+  .up-head{display:flex;align-items:center;gap:10px;flex-wrap:wrap}
+  .up-name{font-weight:600;font-size:15px}
+  .up-actions{display:flex;gap:7px;align-items:center;flex-wrap:wrap;margin-left:auto}
+  .kv{display:flex;gap:20px;flex-wrap:wrap;margin-top:9px;font-size:12px}
+  .kv .stat{display:flex;flex-direction:column;min-width:52px}
+  .kv .stat b{font-size:15px;font-variant-numeric:tabular-nums}
+  .kv .stat span{color:var(--dim);font-size:11px}
+  .url{color:var(--dim);font-size:12px;font-family:Consolas,Monaco,monospace;
+    overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  .models-wrap{margin-top:10px;display:flex;gap:5px;flex-wrap:wrap;max-height:96px;overflow:auto}
+  .mchip{font-size:11px;padding:2px 8px;border-radius:5px;background:var(--bg);
+    border:1px solid var(--line);color:var(--dim);font-family:Consolas,monospace}
+  .bar{height:5px;background:var(--bg);border-radius:3px;overflow:hidden;margin-top:9px}
+  .bar i{display:block;height:100%;border-radius:3px;transition:width .4s}
+
+  /* ---------- 模型勾选面板 ---------- */
+  .pickpanel{margin-top:12px;border-top:1px solid var(--line);padding-top:12px}
+  .pickpanel-head{display:flex;gap:9px;align-items:center;flex-wrap:wrap;margin-bottom:9px}
+  .picklist{display:grid;grid-template-columns:repeat(auto-fill,minmax(220px,1fr));
+    gap:2px;max-height:280px;overflow:auto;background:var(--bg);border:1px solid var(--line);
+    border-radius:8px;padding:7px}
+  .pickrow{display:flex;align-items:center;gap:8px;padding:5px 7px;border-radius:6px;
+    cursor:pointer;font-size:12.5px}
+  .pickrow:hover{background:var(--panel3)}
+  .pickrow input{cursor:pointer;margin:0;flex:none}
+  .pickrow span{font-family:Consolas,Monaco,monospace;overflow:hidden;
+    text-overflow:ellipsis;white-space:nowrap}
+  .pickrow.on span{color:var(--fg)}
+  .pickrow:not(.on) span{color:var(--dim)}
+  .filterbox{background:var(--bg);border:1px solid var(--line);border-radius:7px;
+    padding:5px 9px;font-size:12px;min-width:150px}
+  /* 勾选后出现的「分组名」输入框 */
+  .groupbox{background:var(--panel3);border:1px solid var(--line);border-radius:6px;
+    padding:3px 7px;font-size:11.5px;width:150px;flex:none}
+  .groupbox::placeholder{color:#5c6b7e;font-size:11px}
+  .groupbox:focus{border-color:var(--accent)}
+  .pickrow{gap:10px}
+
+  /* 分组名下拉（挂在 body 上，用 fixed 定位，免得被列表滚动容器裁掉） */
+  .groupmenu{position:fixed;z-index:300;background:var(--panel3);
+    border:1px solid var(--line);border-radius:8px;padding:4px;
+    box-shadow:0 10px 26px rgba(0,0,0,.55);max-height:210px;overflow:auto}
+  .groupmenu .opt{display:flex;align-items:center;gap:8px;padding:6px 9px;
+    border-radius:6px;cursor:pointer;font-size:12px;font-family:Consolas,Monaco,monospace;
+    color:var(--fg)}
+  .groupmenu .opt:hover{background:var(--panel2);color:#fff}
+  .groupmenu .opt.hover{background:var(--panel2);color:#fff}
+  .groupmenu .opt .n{margin-left:auto;color:var(--dim);font-size:10.5px;
+    font-family:inherit;white-space:nowrap}
+  .groupmenu .opt.cur{color:var(--accent)}
+  .groupmenu .opt.newopt{color:var(--ok)}
+  .groupmenu .tip{padding:7px 9px;color:var(--dim);font-size:11.5px;font-family:inherit}
+
+  /* ---------- 模型列表 ---------- */
+  .mtools{display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin-bottom:12px}
+  .mlist{display:grid;grid-template-columns:repeat(auto-fill,minmax(268px,1fr));gap:9px}
+  .mcard{background:var(--panel2);border:1px solid var(--line);border-radius:9px;
+    padding:11px 13px;cursor:pointer;transition:.15s;position:relative}
+  .mcard:hover{border-color:var(--accent);background:var(--panel3)}
+  .mcard.configured{border-left:3px solid var(--ok)}
+  .mcard.none{border-left:3px solid var(--warn)}
+  .mcard-name{font-weight:600;font-size:13.5px;font-family:Consolas,Monaco,monospace;
+    overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  .mcard-sub{display:flex;gap:6px;align-items:center;flex-wrap:wrap;margin-top:6px}
+  .mcard-order{font-size:11px;color:var(--dim);margin-top:7px;overflow:hidden;
+    text-overflow:ellipsis;white-space:nowrap}
+
+  /* ============ 左侧面板（请求记录 / 统计）============ */
+  #side{
+    position:fixed;left:0;top:0;bottom:0;width:460px;z-index:120;
+    background:var(--panel);border-right:1px solid var(--line);
+    display:flex;flex-direction:column;
+    transform:translateX(0);transition:transform .22s ease;
+    box-shadow:6px 0 26px rgba(0,0,0,.42);
+  }
+  #side.closed{transform:translateX(-100%)}
+  #sideHead{
+    display:flex;align-items:center;gap:9px;padding:11px 13px;
+    border-bottom:1px solid var(--line);flex-wrap:wrap;flex:none;
+  }
+  #sideHead h2{margin:0;font-size:13.5px;font-weight:600}
+  #sideBody{flex:1;overflow:auto;padding:12px 13px}
+  /* 收起状态下的把手（始终可见，便于重新打开） */
+  #sideTab{
+    position:fixed;left:0;top:50%;transform:translateY(-50%);z-index:121;
+    background:var(--panel3);border:1px solid var(--line);border-left:none;
+    border-radius:0 8px 8px 0;padding:11px 7px;cursor:pointer;
+    writing-mode:vertical-rl;letter-spacing:2px;font-size:11.5px;color:var(--dim);
+    transition:.15s;user-select:none;
+  }
+  #sideTab:hover{color:#fff;border-color:var(--accent)}
+  #sideTab.hidden{display:none}
+  /* 面板打开时给主内容让出位置 */
+  body.side-open main{margin-left:472px}
+  @media(max-width:1100px){
+    body.side-open main{margin-left:0}
+    #side{width:min(460px,94vw)}
+  }
+  /* 概览小卡 */
+  .ov{display:grid;grid-template-columns:repeat(auto-fit,minmax(88px,1fr));gap:8px;
+    margin-bottom:12px}
+  .ovc{background:var(--panel2);border:1px solid var(--line);border-radius:8px;
+    padding:9px 10px}
+  .ovc b{display:block;font-size:16px;font-variant-numeric:tabular-nums}
+  .ovc span{font-size:10.5px;color:var(--dim)}
+  /* 分组统计卡 */
+  .gstat{background:var(--panel2);border:1px solid var(--line);border-radius:9px;
+    padding:11px 12px;margin-bottom:9px}
+  .gstat-head{display:flex;align-items:center;gap:8px;flex-wrap:wrap}
+  .gstat-name{font-weight:600;font-size:13.5px;font-family:Consolas,Monaco,monospace}
+  .gstat-nums{display:flex;gap:14px;flex-wrap:wrap;margin-top:8px;font-size:11px}
+  .gstat-nums div{display:flex;flex-direction:column;gap:1px}
+  .gstat-nums b{font-size:13.5px;font-variant-numeric:tabular-nums}
+  .gstat-nums span{color:var(--dim);font-size:10.5px}
+  .upbar{display:flex;align-items:center;gap:7px;margin-top:7px;font-size:11.5px}
+  .upbar .nm{min-width:104px;color:var(--dim);overflow:hidden;
+    text-overflow:ellipsis;white-space:nowrap}
+  .upbar .track{flex:1;height:5px;background:var(--bg);border-radius:3px;overflow:hidden}
+  .upbar .track i{display:block;height:100%;background:var(--accent);border-radius:3px}
+  .upbar .cnt{font-variant-numeric:tabular-nums;min-width:26px;text-align:right}
+  /* 请求行 */
+  .req{background:var(--panel2);border:1px solid var(--line);border-radius:8px;
+    margin-bottom:7px;overflow:hidden}
+  .req-head{display:flex;align-items:center;gap:8px;padding:8px 10px;cursor:pointer;
+    flex-wrap:wrap}
+  .req-head:hover{background:var(--panel3)}
+  .req.open .req-head{background:var(--panel3);border-bottom:1px solid var(--line)}
+  .req-idx{color:var(--dim);font-size:10.5px;font-variant-numeric:tabular-nums;
+    min-width:34px}
+  .req-model{font-family:Consolas,Monaco,monospace;font-size:12px;font-weight:500;
+    overflow:hidden;text-overflow:ellipsis;white-space:nowrap;max-width:150px}
+  .req-body{padding:10px;font-size:11.5px;display:grid;gap:9px}
+  .req-sec{border:1px solid var(--line);border-radius:7px;background:var(--bg);
+    padding:8px 10px}
+  .req-sec h5{margin:0 0 5px;font-size:10.5px;color:var(--dim);font-weight:500;
+    text-transform:uppercase;letter-spacing:.6px}
+  .req-sec pre{margin:0;white-space:pre-wrap;word-break:break-word;
+    font-family:Consolas,Monaco,monospace;font-size:11px;line-height:1.5;
+    max-height:230px;overflow:auto}
+  .tkn{display:flex;gap:13px;flex-wrap:wrap;font-size:11px}
+  .tkn div{display:flex;flex-direction:column;gap:1px}
+  .tkn b{font-size:13px;font-variant-numeric:tabular-nums}
+  .tkn span{color:var(--dim);font-size:10px}
+  .tkn .hl b{color:var(--ok)}
+  .tkn .hl span{color:#6fbf8a}
+
+  /* ---------- 模型编辑弹窗 ---------- */
+  .mask{position:fixed;inset:0;background:rgba(5,8,13,.82);z-index:200;
+    display:flex;align-items:flex-start;justify-content:center;padding:28px 16px;
+    overflow:auto;backdrop-filter:blur(3px)}
+  .modal{background:var(--panel);border:1px solid var(--line);border-radius:12px;
+    width:min(680px,100%);padding:20px}
+  .modal h3{margin:0 0 4px;font-size:17px;font-family:Consolas,Monaco,monospace;
+    word-break:break-all}
+  .seg{display:flex;border:1px solid var(--line);border-radius:7px;overflow:hidden}
+  .seg button{border:none;border-radius:0;background:transparent;padding:7px 12px;font-size:12.5px}
+  .seg button.active{background:var(--accent);color:#04121f;font-weight:600}
+  .seg button.active:hover{color:#04121f}
+  .pick{display:flex;align-items:center;gap:10px;background:var(--panel2);
+    border:1px solid var(--line);border-radius:8px;padding:10px 12px;margin-bottom:7px}
+  .pick.dragging{opacity:.35}
+  .pick.target{border-color:var(--accent);border-style:dashed}
+  .handle{cursor:grab;color:var(--dim);user-select:none;font-size:15px}
+  .handle:active{cursor:grabbing}
+  .seqnum{background:var(--bg);border:1px solid var(--line);color:var(--dim);
+    border-radius:5px;padding:1px 7px;font-size:11px;min-width:24px;text-align:center}
+  .pick-name{font-weight:500}
+  .pick-actions{margin-left:auto;display:flex;gap:6px;align-items:center}
+  .preview{display:flex;gap:5px;flex-wrap:wrap;align-items:center;margin-top:8px;
+    padding:9px 11px;background:var(--bg);border-radius:7px;border:1px solid var(--line)}
+  .preview .t{font-size:11px;padding:2px 8px;border-radius:5px;background:var(--panel3);
+    border:1px solid var(--line);color:var(--dim)}
+  .preview .t.first{color:var(--accent);border-color:var(--accent)}
+  @media(max-width:680px){
+    main{padding:13px}
+    .up-actions{margin-left:0;width:100%}
+    .modal{padding:15px}
+  }
+</style>
+</head>
+<body>
+
+<!-- ============ 左侧面板：请求记录 + 统计 ============ -->
+<div id="sideTab">请求记录</div>
+<aside id="side">
+  <div id="sideHead">
+    <h2>请求记录</h2>
+    <span class="badge" id="sideCount"></span>
+    <div class="grow"></div>
+    <select id="sideFilter" style="font-size:12px;padding:5px 8px">
+      <option value="">全部分组</option>
+    </select>
+    <select id="sideMode" style="font-size:12px;padding:5px 8px">
+      <option value="all">全部请求</option>
+      <option value="req">只看请求</option>
+      <option value="stat">只看统计</option>
+    </select>
+    <button class="mini" id="sideRefresh" title="立即刷新">↻</button>
+    <button class="mini" id="sideClose" title="收起面板">收起</button>
+  </div>
+  <div id="sideBody">
+    <div id="sideStats"></div>
+    <div id="sideReqs"></div>
+  </div>
+</aside>
+
+<header>
+  <span class="dot" id="health"></span>
+  <h1>llm-router 控制台</h1>
+  <span class="ver" id="ver"></span>
+  <div class="grow"></div>
+  <button id="fetchAllBtn">↓ 拉取全部模型</button>
+  <button id="testBtn">⚡ 测速</button>
+  <button id="resetBtn" class="danger">清空统计</button>
+</header>
+
+<main>
+  <!-- ============ 上游 ============ -->
+  <div class="card">
+    <h2>上游来源</h2>
+    <div class="hint" style="margin:-6px 0 12px">
+      只填名字、地址、Key 就行，不用管模型。填好后点「拉取模型」把它们支持的模型抓过来。
+    </div>
+
+    <div class="grid" style="grid-template-columns:1.1fr 2.4fr 1.6fr auto;align-items:end;
+         margin-bottom:14px" id="addForm">
+      <label class="grid" style="gap:5px">
+        <span class="hint">名字</span>
+        <input id="newName" placeholder="DeepSeek 官方">
+      </label>
+      <label class="grid" style="gap:5px">
+        <span class="hint">地址 (base_url)</span>
+        <input id="newUrl" placeholder="https://api.deepseek.com" class="mono">
+      </label>
+      <label class="grid" style="gap:5px">
+        <span class="hint">API Key</span>
+        <input id="newKey" placeholder="sk-..." type="password" autocomplete="off" class="mono">
+      </label>
+      <button class="primary" id="addBtn">添加</button>
+    </div>
+    <div class="hint" style="margin:-8px 0 14px">
+      地址带不带 <code>/v1</code> 都可以，会自动适配。
+    </div>
+
+    <div id="upstreams"></div>
+  </div>
+
+  <!-- ============ 模型路由 ============ -->
+  <div class="card">
+    <h2>模型路由</h2>
+    <div class="hint" style="margin:-6px 0 12px">
+      这里只显示你在上游里<b>勾选过的模型</b>。点模型可以调整多个上游之间的调用顺序。
+    </div>
+
+    <div class="mtools">
+      <input id="mFilter" placeholder="搜索模型…" style="min-width:200px" class="mono">
+      <select id="mFilterMode">
+        <option value="all">全部</option>
+        <option value="configured">只看已配置</option>
+        <option value="unconfigured">只看未配置</option>
+        <option value="multi">只看多个上游选用</option>
+      </select>
+      <span class="muted" style="font-size:12px" id="mCount"></span>
+      <div class="grow"></div>
+      <button id="autoBtn">按上游顺序自动配好</button>
+    </div>
+
+    <div id="models"></div>
+  </div>
+
+  <!-- ============ 接入 ============ -->
+  <div class="card">
+    <h2>接入方式</h2>
+    <div class="hint">
+      <div style="margin-bottom:9px">把客户端的 <code>base_url</code> 指向下面这个地址，其余代码不用改：</div>
+      <div class="row" style="margin-bottom:11px">
+        <code id="baseUrl"></code>
+        <button id="copyBtn" class="mini">复制</button>
+      </div>
+      <div>请求时 <code>model</code> 填「模型路由」里列出的名字即可。
+        配置保存在 <code id="statePath" class="mono"></code>，改配置文件后重启会重新读取。</div>
+    </div>
+  </div>
+</main>
+
+<!-- ============ 模型编辑弹窗 ============ -->
+<div class="mask" id="modal" hidden>
+  <div class="modal">
+    <div class="row" style="align-items:flex-start">
+      <div style="flex:1;min-width:0">
+        <h3 id="mTitle">模型</h3>
+        <div class="hint" id="mSubtitle"></div>
+      </div>
+      <button class="mini" id="mRename" title="改客户端调用的名字；各上游那边的真实模型名不受影响">改调用名</button>
+      <button class="mini" id="mClose">关闭</button>
+    </div>
+
+    <div style="margin:16px 0 6px" class="hint">调用方式</div>
+    <div class="row" style="margin-bottom:4px">
+      <div class="seg" id="mStrategy">
+        <button data-s="priority">按顺序依次调用</button>
+        <button data-s="round_robin">轮流轮询</button>
+        <button data-s="random">随机挑一个</button>
+      </div>
+    </div>
+    <div class="hint" id="mStrategyHint" style="margin-bottom:16px"></div>
+
+    <div class="row" style="margin-bottom:8px">
+      <span class="hint" style="flex:1">参与的上游与顺序（拖 <span class="mono">⠿</span> 调整）</span>
+    </div>
+    <div id="mPicks"></div>
+
+    <div class="preview" id="mPreview"></div>
+
+    <div class="row" style="margin-top:14px">
+      <select id="mAddUpstream" style="flex:1;min-width:180px"></select>
+      <button id="mAddBtn" class="mini">加一个上游</button>
+    </div>
+
+    <div class="row" style="margin-top:18px">
+      <button class="primary" id="mSave">保存</button>
+      <button class="danger" id="mDelete">删除这个模型的路由</button>
+      <div class="grow"></div>
+      <span class="hint" id="mStatus"></span>
+    </div>
+  </div>
+</div>
+
+<div class="mask" id="editModal" hidden>
+  <div class="modal" style="width:min(520px,100%)">
+    <div class="row" style="align-items:flex-start">
+      <h3 style="flex:1;font-family:inherit">编辑上游</h3>
+      <button class="mini" id="eClose">关闭</button>
+    </div>
+    <div class="grid" style="gap:12px;margin-top:16px">
+      <label class="grid" style="gap:5px">
+        <span class="hint">名字</span>
+        <input id="eName">
+      </label>
+      <label class="grid" style="gap:5px">
+        <span class="hint">地址 (base_url)</span>
+        <input id="eUrl" class="mono">
+      </label>
+      <label class="grid" style="gap:5px">
+        <span class="hint">API Key <span id="eKeyHint" class="muted"></span></span>
+        <input id="eKey" class="mono" type="password" autocomplete="off"
+               placeholder="留空表示不改">
+      </label>
+      <label class="row" style="gap:7px;cursor:pointer">
+        <input type="checkbox" id="eEnabled"> <span style="font-size:13px">启用这个上游</span>
+      </label>
+    </div>
+    <div class="row" style="margin-top:18px">
+      <button class="primary" id="eSave">保存</button>
+      <div class="grow"></div>
+      <span class="hint" id="eStatus"></span>
+    </div>
+  </div>
+</div>
+
+<div class="toast" id="toast"></div>
+<!-- 分组名下拉菜单（fixed 定位，挂在 body 上，避免被滚动容器裁剪） -->
+<div class="groupmenu" id="groupMenu" hidden></div>
+
+<script>
+"use strict";
+const $ = s => document.querySelector(s);
+const apiBase = "";
+let state = null;
+let editing = null;      // { name, strategy, picks:[{id,name,hasModel,model,enabled}] }
+let lastTest = {};
+let serverUrl = location.origin;
+// 哪些上游卡片展开了模型勾选面板；以及各面板里输入的筛选词
+const expanded = {};
+const pickFilter = {};
+
+function toast(msg, kind = "") {
+  const el = document.createElement("div");
+  el.className = kind;
+  el.textContent = msg;
+  $("#toast").appendChild(el);
+  const life = kind === "bad" ? 6500 : 3600;
+  setTimeout(() => { el.style.opacity = "0"; setTimeout(() => el.remove(), 250); }, life);
+}
+function esc(s) {
+  return String(s == null ? "" : s).replace(/[&<>"']/g, c =>
+    ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+}
+function fmtLat(v) {
+  if (v == null) return "—";
+  if (v < 1) return Math.round(v * 1000) + " ms";
+  return v.toFixed(2) + " s";
+}
+function latColor(v) {
+  if (v == null) return "var(--dim)";
+  if (v < 1.2) return "var(--ok)";
+  if (v < 3) return "var(--warn)";
+  return "var(--bad)";
+}
+function whenText(ts) {
+  if (!ts) return "从未";
+  const d = Math.floor(Date.now() / 1000 - ts);
+  if (d < 60) return "刚刚";
+  if (d < 3600) return Math.floor(d / 60) + " 分钟前";
+  if (d < 86400) return Math.floor(d / 3600) + " 小时前";
+  return Math.floor(d / 86400) + " 天前";
+}
+
+async function api(path, body, method) {
+  const opts = { method: method || (body === undefined ? "GET" : "POST"), headers: {} };
+  if (body !== undefined) { opts.headers["Content-Type"] = "application/json";
+    opts.body = JSON.stringify(body); }
+  const res = await fetch(apiBase + path, opts);
+  let data = null;
+  try { data = await res.json(); } catch (e) { data = null; }
+  if (!res.ok) {
+    const msg = (data && data.error && (data.error.message || data.error)) || ("HTTP " + res.status);
+    throw new Error(typeof msg === "string" ? msg : JSON.stringify(msg));
+  }
+  return data;
+}
+
+/* ================= 渲染：上游 ================= */
+// 记录上一次渲染出来的 HTML：内容没变就完全不碰 DOM。
+// 否则每 2.5 秒把节点全部重建，用户正好点到一半会被换掉，点击就丢了。
+// 同理，勾选模型也会重渲染，所以要把滚动位置和光标位置一起保住。
+const lastHtml = { upstreams: null, models: null };
+// 各上游勾选面板的滚动位置
+const pickScroll = {};
+
+function applyHtml(key, container, html) {
+  if (lastHtml[key] === html) return false;
+  lastHtml[key] = html;
+  container.innerHTML = html;
+  return true;
+}
+
+// 重渲染后把勾选面板的滚动位置还原回去（模型多的上游会很长）
+function restorePickScroll(root) {
+  root.querySelectorAll(".up").forEach(card => {
+    const list = card.querySelector(".picklist");
+    if (!list) return;
+    const top = pickScroll[card.dataset.id];
+    if (top) list.scrollTop = top;
+    // 滚动时就记下来，供下次重渲染还原
+    list.addEventListener("scroll", () => {
+      pickScroll[card.dataset.id] = list.scrollTop;
+    }, { passive: true });
+  });
+}
+
+function renderUpstreams() {
+  const ups = state.upstreams || [];
+  // 用户正在分组输入框里操作（或下拉开着）时不要重建 DOM，
+  // 否则 2.5 秒一次的自动刷新会把输入框连着他正在打的内容一起换掉
+  const active = document.activeElement;
+  if (groupMenuFor || (active && active.matches && active.matches("input[data-group-for]"))) {
+    return;
+  }
+  if (!ups.length) {
+    applyHtml("upstreams", $("#upstreams"), `<div class="empty">
+      还没有上游来源。<br>在上面填「名字 / 地址 / Key」，点「添加」就行。</div>`);
+    return;
+  }
+  const html = ups.map(u => {
+    const t = lastTest[u.id];
+    const cooling = u.cooldown_remaining_seconds > 0;
+    const cls = ["up", u.enabled ? "" : "off", cooling ? "cool" : ""].join(" ");
+    const nAvail = u.available_count != null ? u.available_count : (u.available_models || []).length;
+    const nSel = u.selected_count != null ? u.selected_count : (u.selected_models || []).length;
+    const lat = u.avg_latency_seconds;
+    const maxLat = Math.max(...ups.map(x => x.avg_latency_seconds || 0), 0.001);
+    const open = expanded[u.id];
+
+    return `
+    <div class="${cls}" data-id="${esc(u.id)}">
+      <div class="up-head">
+        <span class="up-name">${esc(u.name)}</span>
+        ${u.enabled
+          ? (cooling ? `<span class="badge warn">冷却中 ${u.cooldown_remaining_seconds}s</span>`
+                     : `<span class="badge ok">启用</span>`)
+          : `<span class="badge bad">已停用</span>`}
+        <span class="badge">${u.has_key ? esc(u.key_hint) : "无 Key"}</span>
+        ${nAvail
+          ? `<span class="badge ${nSel ? "blue" : "warn"}">已选用 ${nSel} / ${nAvail} 个模型</span>`
+          : `<span class="badge warn">还没拉取模型</span>`}
+        ${u.models_fetched_at ? `<span class="badge">${whenText(u.models_fetched_at)}拉取</span>` : ""}
+        <div class="up-actions">
+          <button class="mini primary" data-act="models" ${nAvail ? "" : "disabled"}>
+            ${open ? "收起模型" : "选模型"}${nAvail ? ` (${nSel}/${nAvail})` : ""}
+          </button>
+          <button class="mini" data-act="fetch">拉取模型</button>
+          <button class="mini" data-act="test">测速</button>
+          <button class="mini" data-act="edit">编辑</button>
+          <button class="mini" data-act="toggle">${u.enabled ? "停用" : "启用"}</button>
+          <button class="mini danger" data-act="del">删除</button>
+        </div>
+      </div>
+      <div class="url" style="margin-top:8px">${esc(u.base_url)}</div>
+      <div class="kv">
+        <div class="stat"><b>${u.requests}</b><span>请求</span></div>
+        <div class="stat"><b style="color:var(--ok)">${u.successes}</b><span>成功</span></div>
+        <div class="stat"><b style="color:${u.failures ? "var(--bad)" : "var(--dim)"}">${u.failures}</b><span>失败</span></div>
+        <div class="stat"><b style="color:${latColor(lat)}">${fmtLat(lat)}</b><span>平均延迟</span></div>
+        ${t ? `<div class="stat"><b style="color:${t.ok ? latColor(t.latency_seconds) : "var(--bad)"}">${
+              t.ok ? fmtLat(t.latency_seconds) : "失败"}</b><span>测速</span></div>` : ""}
+      </div>
+      ${lat ? `<div class="bar"><i style="width:${Math.max(4, Math.round(lat / maxLat * 100))}%;
+              background:${latColor(lat)}"></i></div>` : ""}
+      ${u.models_error ? `<div class="hint" style="color:var(--bad)">拉取失败：${esc(u.models_error)}</div>` : ""}
+      ${u.last_error && !u.models_error ? `<div class="hint">最近错误：${esc(u.last_error)}</div>` : ""}
+      ${open ? renderPickPanel(u) : ""}
+    </div>`;
+  }).join("");
+  if (applyHtml("upstreams", $("#upstreams"), html)) {
+    restorePickScroll($("#upstreams"));
+  }
+}
+
+// ---------------- 分组名下拉：可搜索、可选已有分组、也能新建 ----------------
+//
+// 已有分组从两条来源合并：
+//   1. 别的上游已经起过的分组名（含还没建路由的）
+//   2. 已经建好的模型路由键名
+// 都收集起来去重，用起来就像个带搜索的输入框。
+
+function allGroupNames() {
+  const names = new Map();   // 名字 -> 提示信息
+  (state.upstreams || []).forEach(u => {
+    Object.entries(u.model_groups || {}).forEach(([real, g]) => {
+      if (!g) return;
+      if (!names.has(g)) names.set(g, { count: 0, isCurrent: false });
+      names.get(g).count += 1;
+    });
+  });
+  Object.keys(state.models || {}).forEach(g => {
+    if (!names.has(g)) names.set(g, { count: 0, isCurrent: true });
+    else names.get(g).isCurrent = true;
+  });
+  return names;
+}
+
+function closeGroupMenu() {
+  const m = $("#groupMenu");
+  if (m) { m.hidden = true; m.innerHTML = ""; }
+  groupMenuFor = null;
+}
+
+let groupMenuFor = null;   // 当前展开下拉的那个输入框
+
+function openGroupMenu(input) {
+  const menu = $("#groupMenu");
+  const groups = allGroupNames();
+  const typed = input.value.trim();
+  const all = [...groups.keys()].sort((a, b) => a.localeCompare(b));
+  const matched = typed
+    ? all.filter(g => g.toLowerCase().includes(typed.toLowerCase()))
+    : all;
+
+  let html = "";
+  if (!all.length) {
+    html += `<div class="tip">还没有别的分组。直接在框里打一个新名字，按回车即可。</div>`;
+  } else if (!matched.length) {
+    html += `<div class="tip">没有匹配「${esc(typed)}」的分组</div>`;
+  } else {
+    html += matched.slice(0, 30).map(g => {
+      const info = groups.get(g);
+      const cur = g === (input.dataset.currentGroup || "");
+      return `<div class="opt ${cur ? "cur" : ""}" data-pick="${esc(g)}">
+        ${esc(g)}
+        <span class="n">${info.count ? info.count + " 个上游" : ""}${
+          info.isCurrent ? (info.count ? " · " : "") + "已有路由" : ""
+        }</span>
+      </div>`;
+    }).join("");
+  }
+  // 输入了新名字 → 给一个新建选项
+  if (typed && !all.includes(typed)) {
+    html += `<div class="opt newopt" data-pick="${esc(typed)}">
+      ＋ 新建分组「${esc(typed)}」</div>`;
+  }
+  // 清空映射，回到用真实名
+  html += `<div class="opt" data-pick="" style="color:var(--dim)">
+    用真实模型名（不分组）</div>`;
+
+  menu.innerHTML = html;
+  menu.hidden = false;
+  groupMenuFor = input;
+  positionGroupMenu(input);
+
+  menu.querySelectorAll("[data-pick]").forEach(el => {
+    el.onmousedown = ev => {
+      ev.preventDefault();          // 别让输入框先失焦
+      closeGroupMenu();
+      saveGroup(input.dataset.upstream, input.dataset.groupFor, el.dataset.pick);
+    };
+  });
+}
+
+// 把菜单贴到输入框旁边；下方空间不够就往上翻
+function positionGroupMenu(input) {
+  const menu = $("#groupMenu");
+  if (!input || !menu || menu.hidden) return;
+  const r = input.getBoundingClientRect();
+  const h = Math.min(menu.scrollHeight, 210);
+  const below = window.innerHeight - r.bottom;
+  const flipUp = below < h + 12 && r.top > h + 12;
+  menu.style.left = Math.max(8, Math.min(r.left, window.innerWidth - menu.offsetWidth - 8)) + "px";
+  menu.style.top = (flipUp ? r.top - h - 4 : r.bottom + 4) + "px";
+}
+
+// 每个上游展开后的模型面板：勾选要用的模型 + 给每个模型指定「归到哪个分组」
+//
+// 关键区别：
+//   真实模型名（上游那边叫什么，如 ds1/ds2/ds3/ds4）—— 只读，来自拉取
+//   分组名（客户端统一用什么名字调，如 deepseek）—— 你来选/填，一样的就归到一组
+function renderPickPanel(u) {
+  const avail = u.available_models || [];
+  const selected = new Set(u.selected_models || []);
+  const groups = u.model_groups || {};
+  const q = (pickFilter[u.id] || "").toLowerCase();
+  const shown = q ? avail.filter(m => m.toLowerCase().includes(q)) : avail;
+
+  const rows = shown.map(m => {
+    const on = selected.has(m);
+    const g = groups[m] || "";
+    return `
+    <div class="pickrow ${on ? "on" : ""}">
+      <label class="row" style="gap:8px;cursor:pointer;flex:1;min-width:0">
+        <input type="checkbox" data-model="${esc(m)}" ${on ? "checked" : ""}>
+        <span title="${esc(m)}">${esc(m)}</span>
+      </label>
+      ${on ? `<input class="groupbox mono" data-group-for="${esc(m)}"
+                 data-upstream="${esc(u.id)}" data-current-group="${esc(g)}"
+                 placeholder="分组名 · 可搜索/新建" value="${esc(g)}"
+                 title="点开可选已有分组，也能输入新名字。填同一个分组名，就会和别的上游里的模型合成一个可调用的名字">` : ""}
+    </div>`;
+  }).join("");
+
+  // 这个上游当前的分组情况
+  const gmap = {};
+  selected.forEach(m => {
+    const g = groups[m] || m;
+    (gmap[g] = gmap[g] || []).push(m);
+  });
+  const aliased = Object.entries(gmap).filter(([g, ms]) => ms.length > 1 || g !== ms[0]);
+
+  return `
+  <div class="pickpanel">
+    <div class="pickpanel-head">
+      <span class="hint">勾选要用的模型；右边填<b>分组名</b>，填成一样的就会合成一个名字</span>
+      <div class="grow"></div>
+      <input class="filterbox" data-act="pickfilter" placeholder="筛选模型…"
+             value="${esc(pickFilter[u.id] || "")}">
+      <button class="mini" data-act="pickall">全选</button>
+      <button class="mini" data-act="picknone">全不选</button>
+    </div>
+    ${avail.length
+      ? (shown.length
+          ? `<div class="picklist">${rows}</div>`
+          : `<div class="hint" style="padding:10px">没有匹配「${esc(q)}」的模型</div>`)
+      : `<div class="hint" style="padding:10px">这个上游还没拉到模型，先点「拉取模型」</div>`}
+    <div class="hint" style="margin-top:8px">
+      已选 ${selected.size} 个。
+      ${aliased.length
+        ? `本上游的分组：` + aliased.map(([g, ms]) =>
+            `<span class="badge purple mono">${esc(g)}</span> ← ${ms.map(esc).join(", ")}`).join("　")
+        : ""}
+    </div>
+  </div>`;
+}
+
+// 事件委托：监听器挂在容器上，卡片被重建也不会丢事件
+function bindDelegatedEvents() {
+  $("#upstreams").addEventListener("click", e => {
+    const btn = e.target.closest("button[data-act]");
+    if (!btn || btn.disabled) return;
+    const card = btn.closest(".up");
+    if (!card) return;
+    const id = card.dataset.id;
+    const act = btn.dataset.act;
+    if (act === "models") {
+      expanded[id] = !expanded[id];
+      renderUpstreams();
+    }
+    else if (act === "fetch") fetchModels([id]);
+    else if (act === "test") testUpstream(id);
+    else if (act === "edit") editUpstream(id);
+    else if (act === "pickall") selectModels(id, { all: true });
+    else if (act === "picknone") selectModels(id, { none: true });
+    else if (act === "toggle") {
+      const u = (state.upstreams || []).find(x => x.id === id);
+      if (u) updateUpstream({ id, enabled: !u.enabled }, u.enabled ? "已停用 " : "已启用 ");
+    } else if (act === "del") delUpstream(id);
+  });
+
+  // 勾选框：勾上/取消立刻保存
+  $("#upstreams").addEventListener("change", e => {
+    const cb = e.target.closest('input[type="checkbox"][data-model]');
+    if (!cb) return;
+    const card = cb.closest(".up");
+    if (!card) return;
+    const id = card.dataset.id;
+    const u = (state.upstreams || []).find(x => x.id === id);
+    if (!u) return;
+    const cur = new Set(u.selected_models || []);
+    if (cb.checked) cur.add(cb.dataset.model);
+    else cur.delete(cb.dataset.model);
+    selectModels(id, { models: [...cur] }, { keepPanel: true });
+  });
+
+  // 分组名输入框：改完（失焦或回车）再保存，不要边打字边发请求
+  $("#upstreams").addEventListener("change", e => {
+    const gb = e.target.closest("input[data-group-for]");
+    if (!gb) return;
+    const card = gb.closest(".up");
+    if (!card) return;
+    saveGroup(card.dataset.id, gb.dataset.groupFor, gb.value);
+  });
+  $("#upstreams").addEventListener("keydown", e => {
+    const gb = e.target.closest("input[data-group-for]");
+    if (!gb) return;
+    if (e.key === "Enter") { e.preventDefault(); closeGroupMenu(); gb.blur(); }
+    else if (e.key === "Escape") { closeGroupMenu(); gb.blur(); }
+    // 上下键在候选里走动，回车选中
+    else if (e.key === "ArrowDown" || e.key === "ArrowUp") {
+      e.preventDefault();
+      const menu = $("#groupMenu");
+      if (menu.hidden) { openGroupMenu(gb); return; }
+      const opts = [...menu.querySelectorAll("[data-pick]")];
+      if (!opts.length) return;
+      const cur = opts.findIndex(o => o.classList.contains("hover"));
+      const next = e.key === "ArrowDown"
+        ? (cur + 1) % opts.length
+        : (cur <= 0 ? opts.length - 1 : cur - 1);
+      opts.forEach(o => o.classList.remove("hover"));
+      opts[next].classList.add("hover");
+      gb.value = opts[next].dataset.pick;
+    }
+  });
+  // 点开/输入时弹出候选
+  $("#upstreams").addEventListener("focusin", e => {
+    const gb = e.target.closest("input[data-group-for]");
+    if (gb) openGroupMenu(gb);
+  });
+  $("#upstreams").addEventListener("input", e => {
+    const gb = e.target.closest("input[data-group-for]");
+    if (gb) openGroupMenu(gb);
+  });
+
+  // 面板里的筛选框（只影响显示，不动数据）
+  $("#upstreams").addEventListener("input", e => {
+    const f = e.target.closest('input[data-act="pickfilter"]');
+    if (!f) return;
+    const card = f.closest(".up");
+    if (!card) return;
+    pickFilter[card.dataset.id] = f.value;
+    const pos = f.selectionStart;
+    renderUpstreams();
+    // 重渲染后把光标放回去，否则输一个字符就失焦
+    const again = document.querySelector(
+      `.up[data-id="${card.dataset.id}"] input[data-act="pickfilter"]`);
+    if (again) { again.focus(); try { again.setSelectionRange(pos, pos); } catch (err) {} }
+  });
+
+  $("#models").addEventListener("click", e => {
+    const card = e.target.closest(".mcard");
+    if (card && card.dataset.name) openModel(card.dataset.name);
+  });
+}
+
+/* ================= 渲染：模型 ================= */
+function renderModels() {
+  const cat = state.catalog || [];
+  const configured = state.models || {};
+  const q = $("#mFilter").value.trim().toLowerCase();
+  const mode = $("#mFilterMode").value;
+
+  let list = cat.map(e => ({
+    name: e.name,
+    // 注意：后端字段叫 upstreams（已选用的），不是 ups
+    ups: e.upstreams || [],
+    offeredOn: e.offered_only || [],
+    real_models: e.real_models || [],
+    aliased: !!e.aliased,
+    configured: !!configured[e.name],
+    strategy: configured[e.name] ? configured[e.name].strategy : null,
+    upstream_names: configured[e.name]
+      ? configured[e.name].upstream_names
+      : (e.upstreams || []).map(u => u.name),
+  }));
+
+  // 已配置但拉取列表里没有的（手工维护的），也补进来
+  Object.keys(configured).forEach(name => {
+    if (!list.some(x => x.name === name)) {
+      list.push({ name, ups: [], offeredOn: [], real_models: configured[name].real_models || [],
+                  aliased: (configured[name].real_models || []).some(r => r !== name),
+                  configured: true,
+                  strategy: configured[name].strategy,
+                  upstream_names: configured[name].upstream_names });
+    }
+  });
+
+  // 只显示「至少有一个上游选用」的模型 —— 没勾选的不进路由
+  list = list.filter(x => x.ups.length || x.configured);
+
+  list.sort((a, b) => {
+    if (a.configured !== b.configured) return a.configured ? -1 : 1;
+    if (b.ups.length !== a.ups.length) return b.ups.length - a.ups.length;
+    return a.name.localeCompare(b.name);
+  });
+
+  if (q) list = list.filter(x => x.name.toLowerCase().includes(q));
+  if (mode === "configured") list = list.filter(x => x.configured);
+  else if (mode === "unconfigured") list = list.filter(x => !x.configured);
+  else if (mode === "multi") list = list.filter(x => x.ups.length > 1);
+
+  const nCfg = Object.keys(configured).length;
+  $("#mCount").textContent = `已选用 ${list.length} 个模型，已配置路由 ${nCfg} 个`;
+
+  if (!list.length) {
+    const anyOffered = cat.length > 0;
+    applyHtml("models", $("#models"), `<div class="empty">${
+      anyOffered
+        ? "还没有选用任何模型。<br>到上面「上游来源」里点<b>选模型</b>，勾上你要用的。"
+        : "还没有模型信息。先添加上游，然后点「拉取全部模型」。"}</div>`);
+    return;
+  }
+
+  const STRAT = { priority: "按顺序", round_robin: "轮询", random: "随机" };
+  applyHtml("models", $("#models"), `<div class="mlist">` + list.map(m => {
+    const has = m.ups.filter(u => u.enabled).length;
+    const cls = m.configured ? "configured" : (m.ups.length ? "" : "none");
+    // 展示每个上游用的真实名字，这样「同名分组、各家不同名」一眼可见
+    const order = m.upstream_names
+      ? m.upstream_names.map((n, i) => {
+          const real = (m.real_models || [])[i];
+          return real && real !== m.name ? `${n}(${real})` : n;
+        }).join(" → ")
+      : (m.ups.length ? m.ups.map(u => u.name).join(" · ") : "（没有上游选用它）");
+    return `
+    <div class="mcard ${cls}" data-name="${esc(m.name)}">
+      <div class="mcard-name">${esc(m.name)}</div>
+      <div class="mcard-sub">
+        ${m.configured
+          ? `<span class="badge ok">已配置 · ${STRAT[m.strategy] || m.strategy}</span>`
+          : `<span class="badge">未配置</span>`}
+        ${m.ups.length ? `<span class="badge blue">${m.ups.length} 个上游选用</span>`
+                       : `<span class="badge warn">无上游选用</span>`}
+        ${m.aliased ? `<span class="badge purple">各家名字不同</span>` : ""}
+        ${m.ups.length > has && m.configured ? `<span class="badge warn">${m.ups.length - has} 个已停用</span>` : ""}
+      </div>
+      <div class="mcard-order" title="${esc(order)}">${esc(order)}</div>
+    </div>`;
+  }).join("") + `</div>`);
+}
+
+/* ================= 模型编辑 ================= */
+const STRAT_HINT = {
+  priority: "按顺序依次调用：永远先用排在最上面的上游，它挂了（或限流、额度用尽）才用下一个。",
+  round_robin: "轮流轮询：请求 1 走第一个，请求 2 走第二个……转一圈再从头开始。适合多个账号分摊额度。",
+  random: "随机挑一个：每次从可用上游里随机选一个。",
+};
+
+function openModel(name) {
+  const cfg = (state.models || {})[name];
+  const catEntry = (state.catalog || []).find(e => e.name === name);
+  const catalogUps = catEntry ? catEntry.upstreams : [];
+
+  let picks;
+  if (cfg && (cfg.entries || []).length) {
+    picks = cfg.entries.map(e => {
+      const u = (state.upstreams || []).find(x => x.id === e.upstream);
+      return {
+        id: e.upstream,
+        name: u ? u.name : e.upstream,
+        hasModel: u ? (u.available_models || []).includes(e.model || name) : false,
+        model: e.model || name,
+        enabled: e.enabled !== false,
+      };
+    });
+  } else {
+    // 没配过：把参与这个分组的上游都放进来，用它们各自的真实名字
+    picks = catalogUps.map(u => ({
+      id: u.id, name: u.name, hasModel: true,
+      model: u.model || name, enabled: true,
+    }));
+  }
+
+  editing = {
+    name,
+    strategy: cfg ? cfg.strategy : (state.default_strategy || "priority"),
+    picks,
+  };
+  renderModal();
+  $("#modal").hidden = false;
+}
+
+function renderModal() {
+  if (!editing) return;
+  const { name, strategy, picks } = editing;
+
+  $("#mTitle").textContent = name;
+  const catEntry = (state.catalog || []).find(e => e.name === name);
+  const nUp = catEntry ? catEntry.upstreams.length : picks.length;
+  const aliased = picks.filter(p => p.model && p.model !== name);
+  $("#mSubtitle").innerHTML = nUp
+    ? `客户端统一用 <b class="mono">${esc(name)}</b> 调用，下面 ${nUp} 个上游按顺序试` +
+      (aliased.length
+        ? `<br>注意：${aliased.length} 个上游那边模型名不同，已各自标注`
+        : "")
+    : "还没有上游参与这个分组，可以手动把上游加进来";
+
+  document.querySelectorAll("#mStrategy button").forEach(b =>
+    b.classList.toggle("active", b.dataset.s === strategy));
+  $("#mStrategyHint").textContent = STRAT_HINT[strategy] || "";
+
+  if (!picks.length) {
+    $("#mPicks").innerHTML = `<div class="empty" style="padding:18px">
+      还没有选任何上游。用下面的下拉框加一个。</div>`;
+  } else {
+    $("#mPicks").innerHTML = picks.map((p, i) => `
+      <div class="pick" draggable="true" data-idx="${i}">
+        <span class="handle" title="拖动调整顺序">⠿</span>
+        <span class="seqnum">${i + 1}</span>
+        <span class="pick-name">${esc(p.name)}</span>
+        <div class="pick-actions">
+          ${p.model && p.model !== name
+            ? `<span class="badge purple mono" title="这个上游那边的真实模型名">${esc(p.model)}</span>`
+            : `<span class="badge blue mono">${esc(p.model || name)}</span>`}
+          <label class="hint row" style="gap:4px;cursor:pointer">
+            <input type="checkbox" data-act="enable" ${p.enabled ? "checked" : ""}> 参与
+          </label>
+          <button class="mini danger" data-act="rm">移除</button>
+        </div>
+      </div>`).join("");
+  }
+
+  // 顺序预览（带上各家真实名字，方便确认映射对不对）
+  const active = picks.filter(p => p.enabled);
+  if (active.length) {
+    $("#mPreview").innerHTML = `<span class="hint">${
+      strategy === "round_robin" ? "轮询顺序：" : "首选："}</span>` +
+      active.map((p, i) =>
+        `<span class="t ${i === 0 ? "first" : ""}">${esc(p.name)}${
+          p.model && p.model !== name ? `<span class="muted"> · ${esc(p.model)}</span>` : ""
+        }</span>`).join("") +
+      (active.length > 1 ? `<span class="hint">（失败时依次向后重试）</span>` : "");
+  } else {
+    $("#mPreview").innerHTML = `<span class="hint" style="color:var(--warn)">没有选中任何上游，这个分组会走「自动」模式</span>`;
+  }
+
+  // 可添加的上游
+  const used = new Set(picks.map(p => p.id));
+  const avail = (state.upstreams || []).filter(u => !used.has(u.id));
+  $("#mAddUpstream").innerHTML = avail.length
+    ? avail.map(u => `<option value="${esc(u.id)}">${esc(u.name)}${
+        (u.available_models || []).includes(name) ? " ✓有此模型" : ""}</option>`).join("")
+    : `<option value="">（所有上游都已经在列表里）</option>`;
+  $("#mAddBtn").disabled = !avail.length;
+
+  bindModal();
+}
+
+function bindModal() {
+  document.querySelectorAll("#mPicks .pick").forEach(el => {
+    const i = Number(el.dataset.idx);
+    el.querySelector('[data-act="rm"]').onclick = () => {
+      editing.picks.splice(i, 1); renderModal();
+    };
+    el.querySelector('[data-act="enable"]').onchange = e => {
+      editing.picks[i].enabled = e.target.checked; renderModal();
+    };
+    el.addEventListener("dragstart", e => {
+      dragIdx = i; el.classList.add("dragging"); e.dataTransfer.effectAllowed = "move";
+    });
+    el.addEventListener("dragend", () => {
+      el.classList.remove("dragging");
+      document.querySelectorAll(".pick").forEach(x => x.classList.remove("target"));
+      dragIdx = null;
+    });
+    el.addEventListener("dragover", e => { e.preventDefault(); el.classList.add("target"); });
+    el.addEventListener("dragleave", () => el.classList.remove("target"));
+    el.addEventListener("drop", e => {
+      e.preventDefault(); el.classList.remove("target");
+      if (dragIdx === null || dragIdx === i) return;
+      const moved = editing.picks.splice(dragIdx, 1)[0];
+      editing.picks.splice(i, 0, moved);
+      renderModal();
+    });
+  });
+}
+let dragIdx = null;
+
+/* ================= 操作 ================= */
+// 给某个上游的真实模型指定分组名（留空 = 用真实名本身）
+async function saveGroup(id, realModel, group) {
+  try {
+    const r = await api("/admin/set-group",
+                        { id, mapping: { [realModel]: (group || "").trim() } });
+    const g = (group || "").trim();
+    toast(g ? `「${realModel}」已归到分组「${g}」` : `「${realModel}」已恢复用原名`, "ok");
+    await refresh();
+  } catch (e) { toast("设置分组失败：" + e.message, "bad"); await refresh(); }
+}
+
+async function selectModels(id, body, opts = {}) {
+  try {
+    const r = await api("/admin/select-models", { id, ...body });
+    // 勾选是高频操作，成功时不弹提示，免得刷屏
+    const added = r.added || [], removed = r.removed || [];
+    if (added.length && removed.length) {
+      toast(`已更新：新增 ${added.length} 个、去掉 ${removed.length} 个模型`,
+            "ok");
+    } else if (added.length) {
+      toast(`已选用 ${added.length} 个模型`, "ok");
+    } else if (removed.length) {
+      toast(`已取消 ${removed.length} 个模型`, "");
+    }
+    await refresh();
+    if (!opts.keepPanel) { /* 保持面板展开状态由 expanded 决定 */ }
+  } catch (e) { toast("保存失败：" + e.message, "bad"); await refresh(); }
+}
+
+async function fetchModels(ids) {
+  const label = ids ? "该上游" : "全部上游";
+  toast(`正在拉取${label}的模型列表…`);
+  try {
+    const r = await api("/admin/fetch-models", ids ? { ids } : {});
+    const res = r.results || [];
+    const ok = res.filter(x => x.ok);
+    const bad = res.filter(x => !x.ok);
+    if (ok.length) {
+      toast("拉取完成：" + ok.map(x => `${x.name} ${x.count} 个`).join("，"), "ok");
+    }
+    bad.forEach(x => toast(`${x.name} 拉取失败：${x.error}`, "bad"));
+    // 拉完直接把勾选面板展开，让用户马上挑要用的模型（默认一个都不选）
+    ok.forEach(x => { expanded[x.id] = true; });
+    if (ok.length) {
+      const total = ok.reduce((a, x) => a + x.count, 0);
+      if (total) toast("勾选你要用的模型 —— 已选中的才会参与路由", "") ;
+    }
+    await refresh();
+  } catch (e) { toast("拉取失败：" + e.message, "bad"); }
+}
+
+async function autoConfigure() {
+  try {
+    const r = await api("/admin/auto-configure", {});
+    const n = (r.created || []).length, s = (r.skipped || []).length;
+    toast(n ? `已自动配置 ${n} 个模型${s ? `，跳过已配置的 ${s} 个` : ""}`
+            : (s ? `没有新模型需要配置（${s} 个已配置过）` : "还没有拉到任何模型"), n ? "ok" : "");
+    await refresh();
+  } catch (e) { toast("操作失败：" + e.message, "bad"); }
+}
+
+async function addUpstream() {
+  const name = $("#newName").value.trim();
+  const base_url = $("#newUrl").value.trim();
+  const api_key = $("#newKey").value;
+  if (!base_url) { toast("请填上游地址", "bad"); $("#newUrl").focus(); return; }
+  const btn = $("#addBtn");
+  btn.disabled = true;
+  try {
+    const r = await api("/admin/upstream/add", { name, base_url, api_key });
+    $("#newName").value = ""; $("#newUrl").value = ""; $("#newKey").value = "";
+    toast("已添加，正在拉取它的模型…", "ok");
+    await refresh();
+    // 直接用接口返回的 id，别靠 base_url 回查（state 可能还没来得及刷新）
+    const newId = r.upstream && r.upstream.id;
+    if (newId) await fetchModels([newId]);
+  } catch (e) {
+    toast("添加失败：" + e.message, "bad");
+  }
+  btn.disabled = false;
+}
+
+async function updateUpstream(patch, msg) {
+  try {
+    await api("/admin/upstream/update", patch);
+    if (msg) toast(msg + "成功", "ok");
+    await refresh();
+  } catch (e) { toast("保存失败：" + e.message, "bad"); await refresh(); }
+}
+
+let editId = null;
+
+function editUpstream(id) {
+  const u = (state.upstreams || []).find(x => x.id === id);
+  if (!u) return;
+  editId = id;
+  $("#eName").value = u.name;
+  $("#eUrl").value = u.base_url;
+  $("#eKey").value = "";
+  $("#eKeyHint").textContent = u.has_key ? `（现在：${u.key_hint}）` : "（现在没设）";
+  $("#eEnabled").checked = u.enabled;
+  $("#eStatus").textContent = "";
+  $("#editModal").hidden = false;
+  $("#eName").focus();
+}
+
+async function saveUpstreamEdit() {
+  if (!editId) return;
+  const patch = {
+    id: editId,
+    name: $("#eName").value.trim(),
+    base_url: $("#eUrl").value.trim(),
+    enabled: $("#eEnabled").checked,
+  };
+  const k = $("#eKey").value;
+  if (k !== "") patch.api_key = k;
+  if (!patch.base_url) { toast("地址不能为空", "bad"); return; }
+
+  const btn = $("#eSave");
+  btn.disabled = true;
+  $("#eStatus").textContent = "保存中…";
+  try {
+    await api("/admin/upstream/update", patch);
+    $("#editModal").hidden = true;
+    toast("已保存", "ok");
+    await refresh();
+  } catch (e) {
+    toast("保存失败：" + e.message, "bad");
+    $("#eStatus").textContent = "";
+  }
+  btn.disabled = false;
+}
+
+async function delUpstream(id) {
+  const u = (state.upstreams || []).find(x => x.id === id);
+  if (!u) return;
+  if (!confirm(`删除上游「${u.name}」？\n\n引用它的模型路由也会一并移除。`)) return;
+  try {
+    const r = await api("/admin/upstream/delete", { id });
+    const aff = (r.affected_models || []);
+    toast(`已删除「${r.deleted}」${aff.length ? `，同时影响：${aff.join("、")}` : ""}`, "ok");
+    await refresh();
+  } catch (e) { toast("删除失败：" + e.message, "bad"); }
+}
+
+async function testUpstream(id) {
+  toast("正在测速…");
+  try {
+    const r = await api("/admin/speedtest", { ids: [id] });
+    const one = (r.results || [])[0];
+    if (one) {
+      lastTest[one.id] = one;
+      toast(one.ok ? `${one.name} 正常，延迟 ${fmtLat(one.latency_seconds)}`
+                   : `${one.name} 失败：${one.error || ""}`, one.ok ? "ok" : "bad");
+    }
+  } catch (e) { toast("测速失败：" + e.message, "bad"); }
+  await refresh();
+}
+
+async function saveModel() {
+  if (!editing) return;
+  const entries = editing.picks.filter(p => p.enabled).map(p => ({
+    upstream: p.id, model: p.model || editing.name, enabled: true,
+  }));
+  if (!entries.length) {
+    toast("至少要留一个参与的上游（或者删掉这个模型的路由）", "bad");
+    return;
+  }
+  $("#mSave").disabled = true; $("#mStatus").textContent = "保存中…";
+  try {
+    await api("/admin/model/save", {
+      name: editing.name, strategy: editing.strategy, entries,
+    });
+    $("#modal").hidden = true;
+    toast(`已保存「${editing.name}」的路由`, "ok");
+    await refresh();
+  } catch (e) { toast("保存失败：" + e.message, "bad"); }
+  $("#mSave").disabled = false; $("#mStatus").textContent = "";
+}
+
+async function deleteModel() {
+  if (!editing) return;
+  if (!confirm(`删除「${editing.name}」的路由配置？\n\n删除后这个模型会退回「自动」模式（按已拉取的模型列表挑上游）。`)) return;
+  try {
+    await api("/admin/model/delete", { name: editing.name });
+    $("#modal").hidden = true;
+    toast("已删除路由配置", "ok");
+    await refresh();
+  } catch (e) { toast("删除失败：" + e.message, "bad"); }
+}
+
+/* ================= 左侧面板：请求记录 + 统计 ================= */
+const openReqs = new Set();     // 展开了详情的请求（用 at+序号 当 key）
+let lastSideHash = "";          // 内容没变就不重建，省得把展开状态冲掉
+
+function fmtNum(n) {
+  if (n == null) return "—";
+  if (n >= 1000000) return (n / 1000000).toFixed(n % 1000000 ? 1 : 0) + "M";
+  if (n >= 1000) return (n / 1000).toFixed(n % 1000 ? 1 : 0) + "k";
+  return String(n);
+}
+
+function usageCells(u, withCache) {
+  if (!u || !Object.keys(u).length) {
+    return `<div class="tkn"><div><b>—</b><span>无用量数据</span></div></div>`;
+  }
+  const cells = [
+    ["input", "输入"],
+    ["output", "输出"],
+    ["total", "合计"],
+  ];
+  if (withCache) cells.push(["cache_read", "缓存读"], ["cache_write", "缓存写"]);
+  return `<div class="tkn">` + cells.map(([k, label]) => {
+    const v = u[k];
+    const hl = (k === "cache_read" && v) ? "hl" : "";
+    return `<div class="${hl}"><b>${v == null ? "—" : fmtNum(v)}</b><span>${label}</span></div>`;
+  }).join("") + `</div>`;
+}
+
+function renderSide() {
+  const hist = (state.history || []).slice().reverse();   // 最新的在上面
+  const stats = state.call_stats || {};
+  const totals = stats.totals || {};
+  const filter = $("#sideFilter").value;
+  const mode = $("#sideMode").value;
+
+  // 分组下拉选项：从统计里取
+  const groups = (stats.groups || []).map(g => g.group);
+  const cur = $("#sideFilter").value;
+  if ($("#sideFilter").dataset.opts !== groups.join("|")) {
+    $("#sideFilter").innerHTML = `<option value="">全部分组</option>` +
+      groups.map(g => `<option value="${esc(g)}">${esc(g)}</option>`).join("");
+    $("#sideFilter").value = groups.includes(cur) ? cur : "";
+    $("#sideFilter").dataset.opts = groups.join("|");
+  }
+
+  // 标题计数
+  const shown = filter ? hist.filter(h => h.model === filter) : hist;
+  $("#sideCount").textContent = filter ? `${shown.length} / ${hist.length} 条` : `${hist.length} 条`;
+  $("#sideCount").className = "badge" + (totals.failed ? " warn" : "");
+
+  // ---- 统计区 ----
+  let statHtml = `
+  <div class="ov">
+    <div class="ovc"><b>${fmtNum(totals.calls)}</b><span>总请求</span></div>
+    <div class="ovc"><b style="color:var(--ok)">${fmtNum(totals.ok)}</b><span>成功</span></div>
+    <div class="ovc"><b style="color:${totals.failed ? "var(--bad)" : "var(--dim)"}">${fmtNum(totals.failed)}</b><span>失败</span></div>
+    <div class="ovc"><b>${fmtNum(totals.input)}</b><span>输入 token</span></div>
+    <div class="ovc"><b>${fmtNum(totals.output)}</b><span>输出 token</span></div>
+    <div class="ovc"><b style="color:var(--ok)">${fmtNum(totals.cache_read)}</b><span>缓存读</span></div>
+    <div class="ovc"><b style="color:var(--warn)">${fmtNum(totals.cache_write)}</b><span>缓存写</span></div>
+  </div>`;
+
+  const glist = filter
+    ? (stats.groups || []).filter(g => g.group === filter)
+    : (stats.groups || []);
+  if (!glist.length) {
+    statHtml += `<div class="hint" style="padding:8px 2px">还没有调用记录。请求一次就会有数据。</div>`;
+  } else {
+    statHtml += glist.map(g => {
+      const maxc = Math.max(...g.upstreams.map(u => u.calls), 1);
+      return `
+      <div class="gstat">
+        <div class="gstat-head">
+          <span class="gstat-name">${esc(g.group)}</span>
+          <span class="badge blue">${g.upstream_count} 个上游</span>
+          ${g.failed ? `<span class="badge bad">${g.failed} 失败</span>` : ""}
+          <div class="grow"></div>
+          <span class="hint">均 ${fmtLat(g.avg_elapsed)}</span>
+        </div>
+        <div class="gstat-nums">
+          <div><b>${fmtNum(g.calls)}</b><span>调用次数</span></div>
+          <div><b style="color:var(--ok)">${fmtNum(g.ok)}</b><span>成功</span></div>
+          <div><b style="color:${g.failed ? "var(--bad)" : "var(--dim)"}">${fmtNum(g.failed)}</b><span>失败</span></div>
+          <div><b>${fmtNum(g.usage.input)}</b><span>输入</span></div>
+          <div><b>${fmtNum(g.usage.output)}</b><span>输出</span></div>
+          <div class="tkn"><b style="color:var(--ok);font-size:13.5px">${fmtNum(g.usage.cache_read)}</b><span>缓存读</span></div>
+        </div>
+        ${g.upstreams.map(u => `
+          <div class="upbar">
+            <span class="nm" title="${esc(u.upstream)}">${esc(u.upstream)}</span>
+            <span class="track"><i style="width:${Math.max(3, Math.round(u.calls / maxc * 100))}%${
+              u.failed ? ";background:var(--bad)" : ""}"></i></span>
+            <span class="cnt">${fmtNum(u.calls)}</span>
+          </div>`).join("")}
+      </div>`;
+    }).join("");
+  }
+  $("#sideStats").innerHTML = statHtml;
+  $("#sideStats").hidden = (mode === "req");
+
+  // ---- 请求列表 ----
+  if (mode === "stat") {
+    $("#sideReqs").innerHTML = "";
+    $("#sideReqs").hidden = true;
+    return;
+  }
+  $("#sideReqs").hidden = false;
+
+  if (!shown.length) {
+    $("#sideReqs").innerHTML = `<div class="hint" style="padding:10px 2px">
+      ${hist.length ? "这个分组还没有请求" : "还没有请求记录"}</div>`;
+    return;
+  }
+
+  $("#sideReqs").innerHTML = shown.slice(0, 120).map((h, i) => {
+    const key = `${h.at}-${i}`;
+    const open = openReqs.has(key);
+    const badge = h.ok
+      ? `<span class="badge ok">${h.status}</span>`
+      : `<span class="badge bad">${h.status}</span>`;
+    const use = h.usage || {};
+    return `
+    <div class="req ${open ? "open" : ""}" data-key="${key}">
+      <div class="req-head">
+        <span class="req-idx mono">${esc(h.time)}</span>
+        ${badge}
+        <span class="req-model" title="${esc(h.model)}">${esc(h.model)}</span>
+        <span class="badge">${esc(h.upstream)}</span>
+        <div class="grow"></div>
+        ${use.total != null ? `<span class="badge">${fmtNum(use.total)} tok</span>` : ""}
+        <span class="hint">${fmtLat(h.elapsed_seconds)}</span>
+        ${h.stream ? `<span class="badge blue">流式</span>` : ""}
+      </div>
+      ${open ? `
+      <div class="req-body">
+        <div class="req-sec">
+          <h5>Token 用量</h5>
+          ${usageCells(use, true)}
+        </div>
+        <div class="req-sec">
+          <h5>详情</h5>
+          <div class="hint" style="line-height:1.8">
+            实际发往上游的模型：<code>${esc(h.effective_model || "-")}</code><br>
+            路由来源：${esc(h.route_source || "-")}${h.attempts > 1 ? `　·　试了 ${h.attempts} 个上游` : ""}
+            ${h.error ? `<br><span style="color:var(--bad)">错误：${esc(h.error)}</span>` : ""}
+          </div>
+        </div>
+        ${h.reasoning_text ? `<div class="req-sec">
+          <h5>思考过程（推理模型）</h5><pre style="color:var(--dim)">${esc(h.reasoning_text)}</pre>
+        </div>` : ""}
+        ${h.request_text ? `<div class="req-sec">
+          <h5>输入</h5><pre>${esc(h.request_text)}</pre>
+        </div>` : ""}
+        ${h.response_text ? `<div class="req-sec">
+          <h5>输出</h5><pre>${esc(h.response_text)}</pre>
+        </div>` : ""}
+      </div>` : ""}
+    </div>`;
+  }).join("");
+}
+
+function setSideOpen(open) {
+  $("#side").classList.toggle("closed", !open);
+  $("#sideTab").classList.toggle("hidden", open);
+  document.body.classList.toggle("side-open", open);
+  try { localStorage.setItem("llm-router-side", open ? "1" : "0"); } catch (e) {}
+}
+
+/* ================= 主循环 ================= */
+async function refresh() {
+  try {
+    state = await api("/stats");
+    $("#health").className = "dot on";
+    $("#ver").textContent = "v" + state.version;
+    $("#baseUrl").textContent = serverUrl + "/v1";
+    $("#statePath").textContent = state.state_path || "";
+    renderUpstreams();
+    renderModels();
+    // 左侧面板：统计数字和列表每次都更新，但只在变化时重建 DOM，
+    // 否则用户展开的详情会被刷没
+    const hash = JSON.stringify([
+      (state.history || []).length,
+      state.total_requests,
+      (state.history || []).slice(-1)[0]?.at,
+      $("#sideFilter").value, $("#sideMode").value,
+      (state.call_stats || {}).totals,
+    ]);
+    if (hash !== lastSideHash) {
+      lastSideHash = hash;
+      const scrollTop = $("#sideBody").scrollTop;
+      renderSide();
+      $("#sideBody").scrollTop = scrollTop;
+    }
+    // 模型弹窗开着时不重渲染，否则会打断正在拖拽排序的手感
+  } catch (e) {
+    $("#health").className = "dot off";
+  }
+}
+
+/* ================= 事件绑定 ================= */
+// 左侧面板
+$("#sideClose").onclick = () => setSideOpen(false);
+$("#sideTab").onclick = () => setSideOpen(true);
+$("#sideRefresh").onclick = async () => { lastSideHash = ""; await refresh(); };
+$("#sideFilter").onchange = () => { lastSideHash = ""; renderSide(); };
+$("#sideMode").onchange = () => { lastSideHash = ""; renderSide(); };
+// 点请求行展开/收起详情（事件委托，列表重建也不丢）
+$("#sideReqs").addEventListener("click", e => {
+  const head = e.target.closest(".req-head");
+  if (!head) return;
+  const key = head.parentElement.dataset.key;
+  if (openReqs.has(key)) openReqs.delete(key);
+  else openReqs.add(key);
+  lastSideHash = "";          // 强制重建
+  renderSide();
+});
+
+$("#addBtn").onclick = addUpstream;
+["newName", "newUrl", "newKey"].forEach(id => {
+  $("#" + id).addEventListener("keydown", e => { if (e.key === "Enter") addUpstream(); });
+});
+
+$("#fetchAllBtn").onclick = async () => {
+  if (!(state.upstreams || []).length) { toast("先添加上游", "bad"); return; }
+  await fetchModels(null);
+};
+$("#autoBtn").onclick = autoConfigure;
+
+$("#testBtn").onclick = async () => {
+  const btn = $("#testBtn");
+  btn.disabled = true; btn.textContent = "测速中…";
+  try {
+    const r = await api("/admin/speedtest", {});
+    (r.results || []).forEach(x => { lastTest[x.id] = x; });
+    const ok = (r.results || []).filter(x => x.ok);
+    const fast = ok.length ? ok.reduce((a, b) => a.latency_seconds < b.latency_seconds ? a : b) : null;
+    toast(`测速完成：${ok.length}/${(r.results || []).length} 个正常` +
+          (fast ? `，最快是 ${fast.name}（${fmtLat(fast.latency_seconds)}）` : ""),
+          ok.length ? "ok" : "bad");
+  } catch (e) { toast("测速失败：" + e.message, "bad"); }
+  btn.disabled = false; btn.textContent = "⚡ 测速";
+  await refresh();
+};
+
+$("#resetBtn").onclick = async () => {
+  if (!confirm("清空所有统计数据和冷却状态？")) return;
+  try {
+    await api("/admin/reset", {});
+    lastTest = {};
+    toast("统计已清空", "ok");
+    await refresh();
+  } catch (e) { toast("操作失败：" + e.message, "bad"); }
+};
+
+$("#copyBtn").onclick = async () => {
+  const url = serverUrl + "/v1";
+  try { await navigator.clipboard.writeText(url); toast("已复制：" + url, "ok"); }
+  catch (e) { toast("复制失败，请手动选中：" + url, "bad"); }
+};
+
+$("#mFilter").addEventListener("input", renderModels);
+$("#mFilterMode").addEventListener("change", renderModels);
+$("#mClose").onclick = () => { $("#modal").hidden = true; editing = null; };
+$("#mRename").onclick = async () => {
+  if (!editing) return;
+  const from = editing.name;
+    const to = (prompt(`把客户端调用的名字「${from}」改成什么？\n\n` +
+                       `只改你在客户端里填的 model 名；各上游那边的真实模型名不变，` +
+                       `它们的映射会自动指到新名字上。`, from) || "").trim();
+  if (!to || to === from) return;
+  try {
+    const r = await api("/admin/rename-group", { from, to });
+    $("#modal").hidden = true;
+    editing = null;
+    toast(`分组已改名为「${to}」，涉及 ${r.entries} 个上游模型`, "ok");
+    await refresh();
+  } catch (e) { toast("改名失败：" + e.message, "bad"); }
+};
+$("#modal").addEventListener("click", e => {
+  if (e.target === $("#modal")) { $("#modal").hidden = true; editing = null; }
+});
+$("#eClose").onclick = () => { $("#editModal").hidden = true; editId = null; };
+$("#editModal").addEventListener("click", e => {
+  if (e.target === $("#editModal")) { $("#editModal").hidden = true; editId = null; }
+});
+$("#eSave").onclick = saveUpstreamEdit;
+["eName", "eUrl", "eKey"].forEach(id => {
+  $("#" + id).addEventListener("keydown", e => { if (e.key === "Enter") saveUpstreamEdit(); });
+});
+document.addEventListener("keydown", e => {
+  if (e.key !== "Escape") return;
+  if (!document.getElementById("groupMenu").hidden) { closeGroupMenu(); return; }
+  if (!$("#modal").hidden) { $("#modal").hidden = true; editing = null; }
+  if (!$("#editModal").hidden) { $("#editModal").hidden = true; editId = null; }
+});
+// 点别处、改窗口大小都收起分组下拉
+document.addEventListener("mousedown", e => {
+  if (document.getElementById("groupMenu").hidden) return;
+  if (e.target.closest("#groupMenu") || e.target.closest("input[data-group-for]")) return;
+  closeGroupMenu();
+});
+// 滚动时不要让菜单消失，而是跟着输入框一起移动。
+// （之前用捕获模式直接 close，导致用户为了看到输入框一滚动，菜单就被关掉了）
+window.addEventListener("scroll", () => {
+  if (!groupMenuFor || document.getElementById("groupMenu").hidden) return;
+  // 输入框已经滚出可视区域才收起
+  const r = groupMenuFor.getBoundingClientRect();
+  if (r.bottom < 0 || r.top > window.innerHeight) { closeGroupMenu(); return; }
+  positionGroupMenu(groupMenuFor);
+}, true);
+window.addEventListener("resize", () => {
+  if (!groupMenuFor) return;
+  if (document.getElementById("groupMenu").hidden) return;
+  positionGroupMenu(groupMenuFor);
+});
+document.querySelectorAll("#mStrategy button").forEach(b => {
+  b.onclick = () => { if (editing) { editing.strategy = b.dataset.s; renderModal(); } };
+});
+$("#mSave").onclick = saveModel;
+$("#mDelete").onclick = deleteModel;
+$("#mAddBtn").onclick = () => {
+  const id = $("#mAddUpstream").value;
+  if (!id) return;
+  const u = (state.upstreams || []).find(x => x.id === id);
+  if (!u) return;
+  // 尽量用「这个上游归到该分组」的真实模型名，找不到就用分组名本身
+  const reals = (u.selected_models || []).filter(m => (u.model_groups || {})[m] === editing.name);
+  const real = reals[0]
+    || (u.available_models || []).find(m => (u.model_groups || {})[m] === editing.name)
+    || editing.name;
+  editing.picks.push({
+    id, name: u.name,
+    hasModel: (u.available_models || []).includes(real),
+    model: real, enabled: true,
+  });
+  renderModal();
+};
+
+(async function boot() {
+  serverUrl = location.origin;
+  bindDelegatedEvents();
+  // 左侧面板默认展开，记得上次的状态
+  let saved = null;
+  try { saved = localStorage.getItem("llm-router-side"); } catch (e) {}
+  setSideOpen(saved !== "0");
+  await refresh();
+  setInterval(refresh, 2500);
+})();
+</script>
+</body>
+</html>

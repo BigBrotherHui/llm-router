@@ -1,0 +1,19 @@
+# 你的配置和状态：不要提交
+config.toml
+
+# 状态目录（上游、模型路由、勾选、分组都存这里）
+.llmrouter/
+
+# 旧的扁平状态文件位置（升级前用的，迁移后可删）
+*.state.json
+*.state.json.bak
+
+# 测试产物
+_test_*
+
+# 备份
+_backups/
+
+# Python 缓存
+__pycache__/
+*.pyc
