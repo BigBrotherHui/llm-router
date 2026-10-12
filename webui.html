@@ -113,6 +113,9 @@
     padding:3px 7px;font-size:11.5px;width:150px;flex:none}
   .groupbox::placeholder{color:#5c6b7e;font-size:11px}
   .groupbox:focus{border-color:var(--accent)}
+  /* 已归到某个分组时给个视觉提示，跟「还是空的」区分开 */
+  .groupbox.has-group{border-color:var(--accent);color:var(--accent);
+    background:rgba(79,156,249,.08)}
   .pickrow{gap:10px}
 
   /* 分组名下拉（挂在 body 上，用 fixed 定位，免得被列表滚动容器裁掉） */
@@ -709,7 +712,8 @@ function renderPickPanel(u) {
         <input type="checkbox" data-model="${esc(m)}" ${on ? "checked" : ""}>
         <span title="${esc(m)}">${esc(m)}</span>
       </label>
-      ${on ? `<input class="groupbox mono" data-group-for="${esc(m)}"
+      ${on ? `<input class="groupbox mono ${g ? "has-group" : ""}"
+                 data-group-for="${esc(m)}"
                  data-upstream="${esc(u.id)}" data-current-group="${esc(g)}"
                  placeholder="分组名 · 可搜索/新建" value="${esc(g)}"
                  title="点开可选已有分组，也能输入新名字。填同一个分组名，就会和别的上游里的模型合成一个可调用的名字">` : ""}
@@ -739,7 +743,7 @@ function renderPickPanel(u) {
           ? `<div class="picklist">${rows}</div>`
           : `<div class="hint" style="padding:10px">没有匹配「${esc(q)}」的模型</div>`)
       : `<div class="hint" style="padding:10px">这个上游还没拉到模型，先点「拉取模型」</div>`}
-    <div class="hint" style="margin-top:8px">
+    <div class="hint panel-groups" style="margin-top:8px">
       已选 ${selected.size} 个。
       ${aliased.length
         ? `本上游的分组：` + aliased.map(([g, ms]) =>
@@ -794,12 +798,21 @@ function bindDelegatedEvents() {
     if (!gb) return;
     const card = gb.closest(".up");
     if (!card) return;
+    // 回车已经存过了就不再重复发一次（值没变就跳过）
+    if ((gb.dataset.currentGroup || "") === (gb.value || "").trim()) return;
     saveGroup(card.dataset.id, gb.dataset.groupFor, gb.value);
   });
   $("#upstreams").addEventListener("keydown", e => {
     const gb = e.target.closest("input[data-group-for]");
     if (!gb) return;
-    if (e.key === "Enter") { e.preventDefault(); closeGroupMenu(); gb.blur(); }
+    if (e.key === "Enter") {
+      e.preventDefault();
+      closeGroupMenu();
+      // 手动输入也算一次保存；同步界面后失焦，
+      // 这样即便失焦没触发 change，显示也已经是新值了
+      saveGroup(gb.dataset.upstream, gb.dataset.groupFor, gb.value);
+      gb.blur();
+    }
     else if (e.key === "Escape") { closeGroupMenu(); gb.blur(); }
     // 上下键在候选里走动，回车选中
     else if (e.key === "ArrowDown" || e.key === "ArrowUp") {
@@ -1074,13 +1087,60 @@ let dragIdx = null;
 /* ================= 操作 ================= */
 // 给某个上游的真实模型指定分组名（留空 = 用真实名本身）
 async function saveGroup(id, realModel, group) {
+  const g = (group || "").trim();
+  // 先把界面同步成新值。
+  // 注意：不能指望 refresh() 来更新 —— 输入框此刻还是聚焦状态，
+  // renderUpstreams() 会为了保护正在输入的内容而跳过重建（见那里的守卫），
+  // 所以这里要自己把值和状态一起改掉。
+  syncGroupInput(id, realModel, g);
+
   try {
-    const r = await api("/admin/set-group",
-                        { id, mapping: { [realModel]: (group || "").trim() } });
-    const g = (group || "").trim();
+    await api("/admin/set-group", { id, mapping: { [realModel]: g } });
     toast(g ? `「${realModel}」已归到分组「${g}」` : `「${realModel}」已恢复用原名`, "ok");
     await refresh();
-  } catch (e) { toast("设置分组失败：" + e.message, "bad"); await refresh(); }
+  } catch (e) {
+    toast("设置分组失败：" + e.message, "bad");
+    await refresh();
+  }
+}
+
+// 把某个分组输入框的值、当前分组标记、以及面板下方的汇总一起更新
+function syncGroupInput(upstreamId, realModel, group) {
+  const inputs = [...document.querySelectorAll("#upstreams input[data-group-for]")];
+  const gb = inputs.find(i => i.dataset.groupFor === realModel
+                              && i.dataset.upstream === upstreamId);
+  if (!gb) return;
+  gb.value = group;
+  gb.dataset.currentGroup = group;
+  gb.classList.toggle("has-group", !!group);   // 有分组时给个视觉提示
+  updatePanelGroupsSummary(upstreamId);
+}
+
+  // 更新卡片下方那行「本上游的分组：xxx ← 模型1, 模型2」
+function updatePanelGroupsSummary(upstreamId) {
+  const card = document.querySelector(`#upstreams .up[data-id="${cssEsc(upstreamId)}"]`);
+  if (!card) return;
+  const box = card.querySelector(".panel-groups");
+  if (!box) return;
+
+  const gmap = {};
+  card.querySelectorAll("input[data-group-for]").forEach(i => {
+    const real = i.dataset.groupFor;
+    const g = (i.value || "").trim();
+    (gmap[g] = gmap[g] || []).push(real);
+  });
+  // 空分组名表示「用真实名」，不算别名，不用展示
+  const aliased = Object.entries(gmap).filter(([g, ms]) => g && (ms.length > 1 || g !== ms[0]));
+  const total = card.querySelectorAll("input[data-group-for]").length;
+  box.innerHTML = `已选 ${total} 个。` + (aliased.length
+    ? `本上游的分组：` + aliased.map(([g, ms]) =>
+        `<span class="badge purple mono">${esc(g)}</span> ← ${ms.map(esc).join(", ")}`).join("　")
+    : "");
+}
+
+// 选择器里转义特殊字符（模型名里可能有冒号、斜杠、点号等）
+function cssEsc(s) {
+  return String(s).replace(/["\\]/g, "\\$&");
 }
 
 async function selectModels(id, body, opts = {}) {
