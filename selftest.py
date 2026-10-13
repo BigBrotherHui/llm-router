@@ -928,6 +928,31 @@ def main():
         one = (r.get("results") or [{}])[0]
         check("坏上游测速报告失败", one.get("ok") is False and one.get("error"), str(one))
         behavior["b"] = "ok"
+
+        # 连通性结果要持久化：stats 里带 last_check，且重启后还在
+        st, snap = get("/stats")
+        by = {u["id"]: u for u in snap["upstreams"]}
+        check("stats 带出 last_check 字段", "last_check" in by["a1"], str(by["a1"].keys()))
+        check("a1 的 last_check 标记为可用",
+              bool(by["a1"]["last_check"]) and by["a1"]["last_check"]["ok"] is True,
+              str(by["a1"].get("last_check")))
+        check("last_check 带延迟",
+              by["a1"]["last_check"].get("latency_seconds") is not None,
+              str(by["a1"].get("last_check")))
+        check("b1 的 last_check 标记为不可用",
+              bool(by["b1"]["last_check"]) and by["b1"]["last_check"]["ok"] is False,
+              str(by["b1"].get("last_check")))
+    finally:
+        stop_router(p)
+
+    # 重启后 last_check 仍在(持久化生效)
+    p = start_router(cfg)
+    try:
+        st, snap = get("/stats")
+        by = {u["id"]: u for u in snap["upstreams"]}
+        check("重启后 last_check 仍保留",
+              bool(by["a1"].get("last_check")),
+              str(by["a1"].get("last_check")))
     finally:
         stop_router(p)
 

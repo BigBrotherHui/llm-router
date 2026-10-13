@@ -1,5 +1,28 @@
 # NOTES
 
+## 2026-10-13 上游连通性一列（持久化）
+
+需求：需要知道一个上游「冷却完了到底能不能用」还是「彻底挂了」，以及真实延迟。
+
+后端 `router.py`（2.3.4）
+
+- `Upstream.last_check: Optional[dict]`：最近一次连通性测试结果
+  （`at/ok/status/latency_seconds/error/rate_limited/model`），随状态持久化。
+- `ping（）` 成功和失败两条路径都调 `_remember_check（）` 记下来。
+- `snapshot（）` / `state（）` 都带 `last_check`；`/admin/speedtest` 跑完
+  `_save_state（）`，所以重启后仍在。
+- 冷却结束（`available` 为 True）**不等于**可用 —— 只有真测过才有结论。
+
+前端 `webui.html`
+
+- 卡片 kv 区新增「连通性」一列 `connectivityCell（）`：
+  可用/不可用/限流 三态着色 + 实测延迟 + 「测于 N 分钟前」+ 冷却剩余秒数。
+- 优先显示本次会话刚测的（`lastTest`），否则用持久化的 `u.last_check`。
+- 卡片按钮「测速」改名「连通性测试」。
+
+验证：selftest 第 14 组新增 5 项（含重启后仍保留），全量 **359 项全过**；
+线上实测健康上游 `ok:true latency 2.159s`、故障上游 `ok:false status 502`。
+
 ## 2026-10-13 v2.3.4：取消勾选「参与」不再删除该条路由
 
 现象：按 checkbox 把某个上游的「参与」取消后保存，再打开弹窗这条就没了。

@@ -675,6 +675,47 @@ function restorePickScroll(root) {
   });
 }
 
+// 连通性一列：冷却结束≠能用，只有真测过才知道。
+// 显示「上次测试」的结果 + 距现在多久；冷却中/从未测过也各说明白。
+function whenAgo(ts) {
+  if (!ts) return "从未";
+  const d = Math.floor(Date.now() / 1000 - ts);
+  if (d < 5) return "刚刚";
+  if (d < 60) return d + " 秒前";
+  if (d < 3600) return Math.floor(d / 60) + " 分钟前";
+  if (d < 86400) return Math.floor(d / 3600) + " 小时前";
+  return Math.floor(d / 86400) + " 天前";
+}
+function connectivityCell(u, t) {
+  // 优先用刚测出来的(本次会话)，否则用持久化的上次结果
+  const c = t || u.last_check;
+  const cooling = u.cooldown_remaining_seconds > 0;
+  let label, color, note;
+  if (c) {
+    if (c.rate_limited) { label = "限流"; color = "var(--warn)"; }
+    else if (c.ok) { label = "可用"; color = "var(--ok)"; }
+    else { label = "不可用"; color = "var(--bad)"; }
+    note = "测于 " + whenAgo(c.at);
+  } else if (cooling) {
+    label = "冷却中"; color = "var(--warn)"; note = "还没测过";
+  } else {
+    label = "未测"; color = "var(--dim)"; note = "点「连通性测试」";
+  }
+  // 实测延迟单独一行(就是这次 ping 的真实往返时间)
+  const latTag = (c && c.ok && c.latency_seconds != null)
+    ? `<span style="font-size:10px;color:${latColor(c.latency_seconds)}">${fmtLat(c.latency_seconds)}</span>`
+    : "";
+  // 冷却剩余时间单独标出来：冷却完不代表可用，得再测
+  const coolTag = cooling
+    ? `<div class="hint" style="color:var(--warn);font-size:10px">冷却剩 ${u.cooldown_remaining_seconds}s</div>` : "";
+  return `<div class="stat" title="${esc((c && c.error) || "")}">`
+    + `<b style="color:${color}">${esc(label)}</b>`
+    + `<span>连通性</span>`
+    + latTag
+    + `<span style="font-size:10px">${esc(note)}</span>`
+    + coolTag
+    + `</div>`;
+}
 function renderUpstreams() {
   const ups = state.upstreams || [];
   // 用户正在分组输入框里操作（或下拉开着）时不要重建 DOM，
@@ -733,7 +774,7 @@ function renderUpstreams() {
             ${open ? "收起模型" : "选模型"}${nAvail ? ` (${nSel}/${nAvail})` : ""}
           </button>
           <button class="mini" data-act="fetch">拉取模型</button>
-          <button class="mini" data-act="test">测速</button>
+          <button class="mini" data-act="test" title="发一个最小请求，测连通性和延迟">连通性测试</button>
           <button class="mini" data-act="edit">编辑</button>
           <button class="mini" data-act="toggle">${u.enabled ? "停用" : "启用"}</button>
           <button class="mini danger" data-act="del">删除</button>
@@ -745,12 +786,7 @@ function renderUpstreams() {
         <div class="stat"><b style="color:var(--ok)">${u.successes}</b><span>成功</span></div>
         <div class="stat"><b style="color:${u.failures ? "var(--bad)" : "var(--dim)"}">${u.failures}</b><span>失败</span></div>
         <div class="stat"><b style="color:${latColor(lat)}">${fmtLat(lat)}</b><span>平均延迟</span></div>
-        ${t ? `<div class="stat"><b style="color:${
-              t.ok ? latColor(t.latency_seconds)
-                   : (t.rate_limited ? "var(--warn)" : "var(--bad)")}">${
-              t.ok ? fmtLat(t.latency_seconds)
-                   : (t.rate_limited ? "限流" : "失败")}</b><span>测速${
-              t.rate_limited ? `　${esc((t.error || "").slice(0, 18))}` : ""}</span></div>` : ""}
+        ${connectivityCell(u, t)}
       </div>
       ${lat ? `<div class="bar"><i style="width:${Math.max(4, Math.round(lat / maxLat * 100))}%;
               background:${latColor(lat)}"></i></div>` : ""}

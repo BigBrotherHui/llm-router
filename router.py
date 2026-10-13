@@ -355,6 +355,8 @@ class Upstream:
         self.available_models: list[str] = [str(m) for m in raw_models]
         self.models_fetched_at: float = float(cfg.get("models_fetched_at") or 0.0)
         self.models_error: Optional[str] = cfg.get("models_error")
+        # 最近一次连通性测试结果(持久化，重启后还在)
+        self.last_check: Optional[dict] = cfg.get("last_check")
 
         # 用户勾选了哪些模型要用（存的是上游这边的真实模型名）。
         # None 表示「状态文件里没这个字段」（升级前的老状态），
@@ -495,6 +497,19 @@ class Upstream:
             self.total_latency = 0.0
             self.latency_samples = 0
 
+    def _remember_check(self, result: dict) -> None:
+        """记下最近一次连通性测试结果，随状态持久化。"""
+        with self._lock:
+            self.last_check = {
+                "at": result.get("at") or time.time(),
+                "ok": bool(result.get("ok")),
+                "status": result.get("status"),
+                "latency_seconds": result.get("latency_seconds"),
+                "error": result.get("error"),
+                "rate_limited": bool(result.get("rate_limited")),
+                "model": result.get("model"),
+            }
+
     def snapshot(self) -> dict:
         with self._lock:
             avg = (self.total_latency / self.latency_samples) if self.latency_samples else 0.0
@@ -523,6 +538,7 @@ class Upstream:
                 "last_error": self.last_error,
                 "avg_latency_seconds": round(avg, 3),
                 "last_used": self.last_used or None,
+                "last_check": self.last_check,
             }
 
     def state(self) -> dict:
@@ -538,6 +554,7 @@ class Upstream:
             "model_groups": dict(self.model_groups),
             "models_fetched_at": self.models_fetched_at,
             "models_error": self.models_error,
+            "last_check": self.last_check,
         }
 
     # ---- 请求上游 ----
@@ -702,13 +719,17 @@ class Upstream:
                 rate_limited = resp.status == 429 or any(
                     k in blob for k in ("rate limit", "ratelimit", "tpm", "rpm",
                                         "rps", "quota", "exceed"))
-            return {"id": self.id, "name": self.name, "ok": ok, "status": resp.status,
-                    "latency_seconds": round(latency, 3), "model": target,
-                    "error": error, "rate_limited": rate_limited}
+            result = {"id": self.id, "name": self.name, "ok": ok, "status": resp.status,
+                      "latency_seconds": round(latency, 3), "model": target,
+                      "error": error, "rate_limited": rate_limited, "at": time.time()}
+            self._remember_check(result)
+            return result
         except Exception as exc:  # noqa: BLE001
-            return {"id": self.id, "name": self.name, "ok": False, "latency_seconds": None,
-                    "model": target, "error": f"{type(exc).__name__}: {exc}",
-                    "rate_limited": False}
+            result = {"id": self.id, "name": self.name, "ok": False, "latency_seconds": None,
+                      "model": target, "error": f"{type(exc).__name__}: {exc}",
+                      "rate_limited": False, "at": time.time()}
+            self._remember_check(result)
+            return result
         finally:
             self._close(conn)
 
@@ -3517,6 +3538,8 @@ class Handler(BaseHTTPRequestHandler):
                         results.append({"ok": False, "error": str(exc), "latency_seconds": None})
             order = {u.id: i for i, u in enumerate(self.router.upstreams)}
             results.sort(key=lambda r: order.get(r.get("id", ""), 999))
+            # 连通性结果要持久化(重启后仍能看到上次测试)
+            self.router._save_state()
             return {"ok": True, "results": results}
         status, out = self._result(go)
         self._send_json(status, out)
