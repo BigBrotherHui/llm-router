@@ -929,6 +929,17 @@ def main():
         check("坏上游测速报告失败", one.get("ok") is False and one.get("error"), str(one))
         behavior["b"] = "ok"
 
+        # 精确测某个上游上的某个模型(模型路由弹窗每行的「测试」按钮)
+        st, r = admin("/admin/speedtest", {"tests": [{"id": "a1", "model": "glm-4.6"}]})
+        res2 = r.get("results") or []
+        check("tests 精确测一个模型", len(res2) == 1 and res2[0].get("ok"), str(res2))
+        check("tests 回带被测的模型名", res2 and res2[0].get("model") == "glm-4.6", str(res2))
+        behavior["b"] = "fail500"
+        st, r = admin("/admin/speedtest", {"tests": [{"id": "b1", "model": "glm-4.6"}]})
+        res3 = r.get("results") or []
+        check("tests 精确测坏上游报失败", res3 and res3[0].get("ok") is False, str(res3))
+        behavior["b"] = "ok"
+
         # 连通性结果要持久化：stats 里带 last_check，且重启后还在
         st, snap = get("/stats")
         by = {u["id"]: u for u in snap["upstreams"]}

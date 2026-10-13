@@ -3520,6 +3520,28 @@ class Handler(BaseHTTPRequestHandler):
     def _h_speedtest(self) -> None:
         def go():
             payload = self._read_json_body()
+            # tests: [{"id": 上游, "model": 该上游上的真实模型名}] —— 精确测某个模型
+            # 模型路由弹窗里每行一个「测试」按钮走这条路径。
+            tests = payload.get("tests")
+            if tests is not None:
+                if not isinstance(tests, list):
+                    raise ValueError("tests 必须是数组")
+                results: list[dict] = []
+                for item in tests:
+                    if not isinstance(item, dict):
+                        continue
+                    up = self.router.find_upstream(str(item.get("id") or ""))
+                    if up is None:
+                        continue
+                    model = item.get("model")
+                    try:
+                        results.append(up.ping(str(model) if model else None))
+                    except Exception as exc:  # noqa: BLE001
+                        results.append({"id": up.id, "name": up.name, "ok": False,
+                                        "latency_seconds": None,
+                                        "error": f"{type(exc).__name__}: {exc}"})
+                self.router._save_state()
+                return {"ok": True, "results": results}
             ids = payload.get("ids")
             if ids is not None and not isinstance(ids, list):
                 raise ValueError("ids 必须是数组")

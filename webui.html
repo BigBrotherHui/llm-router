@@ -675,47 +675,6 @@ function restorePickScroll(root) {
   });
 }
 
-// 连通性一列：冷却结束≠能用，只有真测过才知道。
-// 显示「上次测试」的结果 + 距现在多久；冷却中/从未测过也各说明白。
-function whenAgo(ts) {
-  if (!ts) return "从未";
-  const d = Math.floor(Date.now() / 1000 - ts);
-  if (d < 5) return "刚刚";
-  if (d < 60) return d + " 秒前";
-  if (d < 3600) return Math.floor(d / 60) + " 分钟前";
-  if (d < 86400) return Math.floor(d / 3600) + " 小时前";
-  return Math.floor(d / 86400) + " 天前";
-}
-function connectivityCell(u, t) {
-  // 优先用刚测出来的(本次会话)，否则用持久化的上次结果
-  const c = t || u.last_check;
-  const cooling = u.cooldown_remaining_seconds > 0;
-  let label, color, note;
-  if (c) {
-    if (c.rate_limited) { label = "限流"; color = "var(--warn)"; }
-    else if (c.ok) { label = "可用"; color = "var(--ok)"; }
-    else { label = "不可用"; color = "var(--bad)"; }
-    note = "测于 " + whenAgo(c.at);
-  } else if (cooling) {
-    label = "冷却中"; color = "var(--warn)"; note = "还没测过";
-  } else {
-    label = "未测"; color = "var(--dim)"; note = "点「连通性测试」";
-  }
-  // 实测延迟单独一行(就是这次 ping 的真实往返时间)
-  const latTag = (c && c.ok && c.latency_seconds != null)
-    ? `<span style="font-size:10px;color:${latColor(c.latency_seconds)}">${fmtLat(c.latency_seconds)}</span>`
-    : "";
-  // 冷却剩余时间单独标出来：冷却完不代表可用，得再测
-  const coolTag = cooling
-    ? `<div class="hint" style="color:var(--warn);font-size:10px">冷却剩 ${u.cooldown_remaining_seconds}s</div>` : "";
-  return `<div class="stat" title="${esc((c && c.error) || "")}">`
-    + `<b style="color:${color}">${esc(label)}</b>`
-    + `<span>连通性</span>`
-    + latTag
-    + `<span style="font-size:10px">${esc(note)}</span>`
-    + coolTag
-    + `</div>`;
-}
 function renderUpstreams() {
   const ups = state.upstreams || [];
   // 用户正在分组输入框里操作（或下拉开着）时不要重建 DOM，
@@ -774,7 +733,7 @@ function renderUpstreams() {
             ${open ? "收起模型" : "选模型"}${nAvail ? ` (${nSel}/${nAvail})` : ""}
           </button>
           <button class="mini" data-act="fetch">拉取模型</button>
-          <button class="mini" data-act="test" title="发一个最小请求，测连通性和延迟">连通性测试</button>
+          <button class="mini" data-act="test">测速</button>
           <button class="mini" data-act="edit">编辑</button>
           <button class="mini" data-act="toggle">${u.enabled ? "停用" : "启用"}</button>
           <button class="mini danger" data-act="del">删除</button>
@@ -786,7 +745,6 @@ function renderUpstreams() {
         <div class="stat"><b style="color:var(--ok)">${u.successes}</b><span>成功</span></div>
         <div class="stat"><b style="color:${u.failures ? "var(--bad)" : "var(--dim)"}">${u.failures}</b><span>失败</span></div>
         <div class="stat"><b style="color:${latColor(lat)}">${fmtLat(lat)}</b><span>平均延迟</span></div>
-        ${connectivityCell(u, t)}
       </div>
       ${lat ? `<div class="bar"><i style="width:${Math.max(4, Math.round(lat / maxLat * 100))}%;
               background:${latColor(lat)}"></i></div>` : ""}
@@ -1236,6 +1194,18 @@ function toggleCollapsible(btn) {
   body.hidden = expanded;
 }
 
+// 一行「测试」按钮的结果：可用/不可用/限流 + 实测延迟，测的是这一行的那个模型
+function pickTestBadge(p) {
+  const t = p && p.test;
+  if (!t) return "";
+  let label, color;
+  if (t.rate_limited) { label = "限流"; color = "var(--warn)"; }
+  else if (t.ok) { label = "可用"; color = "var(--ok)"; }
+  else { label = "不可用"; color = "var(--bad)"; }
+  const lat = (t.ok && t.latency_seconds != null) ? " " + fmtLat(t.latency_seconds) : "";
+  const tip = t.error ? esc(t.error) : "";
+  return `<span class="badge mono" style="color:${color};border-color:currentColor" title="${tip}">${label}${lat}</span>`;
+}
 function renderModal() {
   if (!editing) return;
   const { name, strategy, picks } = editing;
@@ -1276,6 +1246,9 @@ function renderModal() {
                    placeholder="不限量" value="${p.quota === "" || p.quota == null ? "" : p.quota}">
             ${p.quota === 0 ? `<span class="badge bad">不调用</span>` : ""}
           </label>
+          <button class="mini" data-act="test" data-idx="${i}"
+                  title="给这家发一个最小请求，测的就是这一行那个模型">测试</button>
+          ${pickTestBadge(p)}
           <button class="mini danger" data-act="rm">移除</button>
         </div>
       </div>`).join("");
@@ -1393,6 +1366,11 @@ function bindModal() {
     });
   });
 
+  // 「测试」按钮：精确测这一行的那个模型
+  document.querySelectorAll('#mPicks button[data-act="test"]').forEach(btn => {
+    btn.onclick = () => testPick(Number(btn.dataset.idx), btn);
+  });
+
   // 额度输入：改完（回车或失焦）就记进 editing，顺带更新「不调用」标记
   document.querySelectorAll("#mPicks input[data-quota]").forEach(inp => {
     const commit = () => {
@@ -1432,6 +1410,28 @@ function renderQuotaHint() {
 let dragIdx = null;
 
 /* ================= 操作 ================= */
+// 测试某一行(某上游 + 它的那个真实模型)的连通性。
+// 不重建整个弹窗 —— 只更新这一行按钮旁的结果，免得打断输入。
+async function testPick(i, btn) {
+  if (!editing) return;
+  const p = editing.picks[i];
+  if (!p) return;
+  const model = p.model || editing.name;
+  const old = btn.textContent;
+  btn.disabled = true; btn.textContent = "测试中…";
+  try {
+    const r = await api("/admin/speedtest", { tests: [{ id: p.id, model }] });
+    const one = (r.results || [])[0] || { ok: false, error: "没有返回结果" };
+    p.test = one;
+    if (one.rate_limited) toast(`${p.name} · ${model} 限流：${one.error || ""}`, "warn");
+    else if (one.ok) toast(`${p.name} · ${model} 可用，延迟 ${fmtLat(one.latency_seconds)}`, "ok");
+    else toast(`${p.name} · ${model} 不可用：${one.error || ""}`, "bad");
+  } catch (e) {
+    toast("测试失败：" + e.message, "bad");
+  }
+  btn.disabled = false; btn.textContent = old;
+  renderModal();
+}
 // 只更新本地预览：把输入框的值同步到 dataset.currentGroup 和 has-group 样式
 // 不触发 API 调用 —— 真正的提交由 commitGroupChanges 负责
 function updateLocalGroupPreview(gb) {
