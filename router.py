@@ -37,7 +37,7 @@ import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any, Optional
 
-__version__ = "2.3.4"
+__version__ = "2.3.5"
 
 WEBUI_FILENAME = "webui.html"
 
@@ -175,14 +175,18 @@ def messages_to_text(payload: Any) -> str:
     return ""
 
 
-def response_to_text(body: bytes) -> tuple[str, dict]:
-    """从非流式响应里取出回复文本和 token 用量。"""
+def response_to_text(body: bytes) -> tuple[str, dict, str]:
+    """从非流式响应里取出回复文本、token 用量和推理内容。
+
+    返回元数必须和调用方的解包一致（三个）。上游返回非 JSON 内容时
+    少给一个，会把本来正常的请求打成 500。
+    """
     try:
         obj = json.loads(body)
     except Exception:
-        return "", {}
+        return "", {}, ""
     if not isinstance(obj, dict):
-        return "", {}
+        return "", {}, ""
 
     usage = extract_usage(obj)
     text = ""

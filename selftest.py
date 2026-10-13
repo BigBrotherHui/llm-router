@@ -150,6 +150,16 @@ class UpstreamServer(BaseHTTPRequestHandler):
             self.wfile.write(b"0\r\n\r\n")
             self.wfile.flush()
             return
+        if behave == "bad_json":
+            # 2xx + 非流式 + 响应体不是 JSON 对象：网关吐 HTML 错误页那种。
+            # 这种响应必须能正常透传，不能因为解析失败把请求打成 500。
+            payload = b"<html><body>502 Bad Gateway</body></html>"
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html")
+            self.send_header("Content-Length", str(len(payload)))
+            self.end_headers()
+            self.wfile.write(payload)
+            return
 
         if self.path.endswith("/stream"):
             self.send_response(200)
@@ -704,6 +714,22 @@ def main():
         reset_hits()
         st, body, hdr = post(path="/v1/chat/completions/stream")
         check("空流会切换到下一个上游", hdr.get("X-Upstream") == "up-b", str(hdr.get("X-Upstream")))
+    finally:
+        stop_router(p)
+        behavior["a"] = "ok"
+
+    # 上游回 200 但响应体不是 JSON（例如网关吐 HTML 错误页）。
+    # 回归：response_to_text 的返回元数跟调用方对不上时，这里会 500 + ValueError。
+    cleanup()
+    behavior["a"] = "bad_json"
+    p = start_router(write_config(with_routes=True))
+    try:
+        reset_hits()
+        st, body, hdr = post()
+        check("上游 200 但响应不是 JSON 时不报 500", st == 200, str(st))
+        check("解析不了的内容原样透传", b"Bad Gateway" in body, str(body[:80]))
+        check("没有误切到下一个上游", hdr.get("X-Upstream") == "up-a",
+              str(hdr.get("X-Upstream")))
     finally:
         stop_router(p)
         behavior["a"] = "ok"
