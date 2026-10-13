@@ -17,3 +17,20 @@ _backups/
 # Python 缓存
 __pycache__/
 *.pyc
+
+# 运维脚本（含本机路径，不进仓库）
+_restart.py
+_restart.log
+_merge_history.py
+_restore_gpt.py
+
+# 诊断 / 探针产物（含运行时快照，_live.json 里可能有 Key）
+_cfg.json
+_live.json
+_fresh.json
+_p.json
+_probe.json
+_recover_before.json
+_sel.json
+_probe/
+_*.py

@@ -37,9 +37,19 @@ import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any, Optional
 
-__version__ = "2.0.0"
+__version__ = "2.3.4"
 
 WEBUI_FILENAME = "webui.html"
+
+# 状态文件的历史版本保留份数（每次保存都会轮转出一份带时间戳的快照）。
+# 之前只有单份 .bak，结果「最后一次写入」会把上一版好配置挤掉，
+# 出了事就没有退路，所以改成留多份。
+STATE_BACKUP_KEEP = 20
+
+# 管理接口的审计记录：谁在什么时候改了什么，写到
+# .llmrouter/<配置名>.admin.log（跟着配置文件名走，多份配置不会混在一起）。
+# 配置被莫名改动时，靠这个能查出是哪次操作、来自哪个地址。
+ADMIN_LOG_SUFFIX = ".admin.log"
 
 # 上游返回这些状态码时，认为「这个上游有问题」，换下一个
 DEFAULT_RETRY_STATUS = {401, 403, 408, 409, 425, 429, 500, 502, 503, 504, 520, 521, 522, 523, 524}
@@ -651,6 +661,12 @@ class Upstream:
 
     # ---- 测速 ----
     def ping(self, model: Optional[str] = None) -> dict:
+        """给上游发一个最小请求测延迟。
+
+        不是「能连上」就叫成功：429/限流这类是**临时**状态 ——
+        Key 是好的、地址也对，只是这会儿不让调。这种情况单独标成
+        rate_limited，界面上和「真挂了」区分开，免得把限流误当成配置错误。
+        """
         target = model or (self.available_models[0] if self.available_models else None)
         if not target:
             return {"id": self.id, "name": self.name, "ok": False,
@@ -668,6 +684,7 @@ class Upstream:
             body = resp.read()
             ok = resp.status < 400
             error = None
+            rate_limited = False
             if not ok:
                 try:
                     parsed = json.loads(body)
@@ -680,11 +697,18 @@ class Upstream:
                     pass
                 if error is None:
                     error = f"HTTP {resp.status}"
+                # 429、或错误体里点了配额/限流的名，都算「暂时调不了」
+                blob = f"{error} {body[:400].decode('utf-8', 'replace')}".lower()
+                rate_limited = resp.status == 429 or any(
+                    k in blob for k in ("rate limit", "ratelimit", "tpm", "rpm",
+                                        "rps", "quota", "exceed"))
             return {"id": self.id, "name": self.name, "ok": ok, "status": resp.status,
-                    "latency_seconds": round(latency, 3), "model": target, "error": error}
+                    "latency_seconds": round(latency, 3), "model": target,
+                    "error": error, "rate_limited": rate_limited}
         except Exception as exc:  # noqa: BLE001
             return {"id": self.id, "name": self.name, "ok": False, "latency_seconds": None,
-                    "model": target, "error": f"{type(exc).__name__}: {exc}"}
+                    "model": target, "error": f"{type(exc).__name__}: {exc}",
+                    "rate_limited": False}
         finally:
             self._close(conn)
 
@@ -743,6 +767,9 @@ class RouteEntry:
     分组名（客户端调用的名字）和这里的 model（上游真实名字）是两回事：
         deepseek 这个分组 →  A 上游叫 ds1，B 上游叫 ds2，C 上游叫 ds3
     数组顺序 = 调用顺序。
+
+    quota 是「这个分组里允许这家上游被调用」的额度：
+    不填 = 不限量；0 = 这家不用（调用时直接跳过、排序时沉到最后）。
     """
 
     def __init__(self, cfg: dict):
@@ -751,12 +778,37 @@ class RouteEntry:
         self.model: str = str(cfg.get("model") or "")
         self.enabled: bool = bool(cfg.get("enabled", True))
 
+        # None / 不填 = 不限量；0 = 不用它。
+        raw_quota = cfg.get("quota")
+        if raw_quota is None or raw_quota == "":
+            self.quota: Optional[int] = None
+        else:
+            try:
+                q = int(raw_quota)
+            except (TypeError, ValueError):
+                q = None
+            # 负数没意义，当成「不限量」；0 是有意义的值，必须保留
+            self.quota = q if q is not None and q >= 0 else None
+
+    def skipped(self) -> bool:
+        """额度为 0 = 这家不调用。"""
+        return self.quota == 0
+
     def state(self) -> dict:
-        return {"upstream": self.upstream_id, "model": self.model, "enabled": self.enabled}
+        out = {"upstream": self.upstream_id, "model": self.model, "enabled": self.enabled}
+        # 只在设过额度时才写进状态文件，保持老状态文件干净
+        if self.quota is not None:
+            out["quota"] = self.quota
+        return out
 
 
 class ModelRoute:
-    """一个分组：客户端可见的名字 → 若干上游（各用自己那边的真实名字）。"""
+    """一个分组：客户端可见的名字 → 若干上游（各用自己那边的真实名字）。
+
+    entries 是「当前生效的顺序」，也就是原始排序。
+    orderings 是保存下来的多套具名排序（比如「按测速」），
+    切来切去不会弄丢原始顺序 —— 这就是「支持多个排序、设置排序名字」。
+    """
 
     def __init__(self, name: str, cfg: Optional[dict] = None):
         cfg = cfg or {}
@@ -764,6 +816,60 @@ class ModelRoute:
         strategy = str(cfg.get("strategy") or "priority").lower()
         self.strategy = strategy if strategy in VALID_STRATEGIES else "priority"
         self.entries: list[RouteEntry] = [RouteEntry(e) for e in (cfg.get("entries") or [])]
+
+        # 具名排序：名字 → 成员顺序。名字「原始」留给启动时的初始顺序，
+        # 用户滚动保存测速结果时用「按测速」这类名字。
+        raw_orderings = cfg.get("orderings") or {}
+        self.orderings: dict[str, list[tuple[str, str]]] = {}
+        if isinstance(raw_orderings, dict):
+            for label, members in raw_orderings.items():
+                key = str(label or "").strip()
+                if not key or not isinstance(members, list):
+                    continue
+                parsed: list[tuple[str, str]] = []
+                for m in members:
+                    if isinstance(m, dict):
+                        parsed.append((str(m.get("upstream") or ""),
+                                       str(m.get("model") or "")))
+                    elif isinstance(m, (list, tuple)) and len(m) == 2:
+                        parsed.append((str(m[0]), str(m[1])))
+                self.orderings[key] = parsed
+
+    # ---- 排序 ----
+    def entry_keys(self) -> list[tuple[str, str]]:
+        return [(e.upstream_id, e.model) for e in self.entries]
+
+    def apply_order(self, keys: list[tuple[str, str]]) -> bool:
+        """按给定的 (上游, 真实模型名) 顺序重排 entries。
+
+        只认当前确实存在的成员；顺序里没提到的（比如新勾选进来的）留在末尾，
+        多出来的（已经不参与的了）忽略。返回是否真的变了。
+        """
+        by_key = {(e.upstream_id, e.model): e for e in self.entries}
+        new_entries: list[RouteEntry] = []
+        used: set[tuple[str, str]] = set()
+        for k in keys:
+            if k in by_key and k not in used:
+                used.add(k)
+                new_entries.append(by_key[k])
+        if not new_entries:
+            return False
+        new_entries += [e for e in self.entries
+                        if (e.upstream_id, e.model) not in used]
+        if [e.state() for e in new_entries] == [e.state() for e in self.entries]:
+            return False
+        self.entries = new_entries
+        return True
+
+    def save_ordering(self, label: str, keys: Optional[list[tuple[str, str]]] = None) -> None:
+        """把当前顺序（或给定的顺序）存成一套具名排序。"""
+        name = str(label or "").strip()
+        if not name:
+            return
+        self.orderings[name] = list(keys) if keys is not None else self.entry_keys()
+
+    def drop_ordering(self, label: str) -> bool:
+        return self.orderings.pop(str(label or "").strip(), None) is not None
 
     def entry_for(self, upstream_id: str, model: str) -> Optional[RouteEntry]:
         for e in self.entries:
@@ -778,10 +884,750 @@ class ModelRoute:
         return len(self.entries) != before
 
     def state(self) -> dict:
-        return {
+        out = {
             "strategy": self.strategy,
             "entries": [e.state() for e in self.entries],
         }
+        # 没有具名排序就不写这个字段，老状态文件不受影响
+        if self.orderings:
+            out["orderings"] = {
+                label: [{"upstream": u, "model": m} for u, m in keys]
+                for label, keys in self.orderings.items()
+            }
+        return out
+
+
+# ---------------------------------------------------------------------------
+# 请求统计的持久化（跨重启）
+# ---------------------------------------------------------------------------
+
+USAGE_KEYS = ("input", "output", "total", "cache_read", "cache_write")
+
+
+class StatsStore:
+    """把请求统计落到磁盘，重启后还能看。
+
+    两个文件，都在 .llmrouter/ 下、跟着配置文件名走：
+    - <stem>.stats.json   聚合结果（总量 + 按天），每来一个请求就原子写一次
+    - <stem>.history.jsonl 请求流水（追加写，含输入输出）
+
+    流水是**只增不减**的：没有删除入口，也不因为「明细上限」把已有行裁掉。
+    内存里只保留最近 max_entries 条用于界面展示（_recent），文件则一直往后追加。
+    当前文件攒到 rotate_at 行就改名成 <stem>.history.<时间戳>.jsonl 归档，
+    然后另起一份接着写；归档文件不删，所以任何时候都能把历史翻回来。
+
+    聚合口径和 call_stats() 一致（请求层面 + 尝试层面 + token 用量），
+    它不会随重启清零，也不会因为内存明细轮换而缩水。
+    """
+
+    MAX_ENTRIES = 500        # 内存里保留的明细条数（只影响展示，不影响文件）
+    JOURNAL_ROTATE_AT = 10000  # 当前流水攒到这么多行就轮转归档（约几十 MB 一份）
+
+    def __init__(self, dir_path: str, stem: str,
+                 max_entries: Optional[int] = None, rotate_at: Optional[int] = None):
+        self.path = os.path.join(dir_path, f"{stem}.stats.json")
+        self.history_path = os.path.join(dir_path, f"{stem}.history.jsonl")
+        # 明细上限可配（[router] history_limit），只影响内存展示，不影响流水落盘
+        try:
+            self.max_entries = max(1, int(max_entries or self.MAX_ENTRIES))
+        except (TypeError, ValueError):
+            self.max_entries = self.MAX_ENTRIES
+        try:
+            self.rotate_at = max(self.max_entries + 1,
+                                 int(rotate_at or self.JOURNAL_ROTATE_AT))
+        except (TypeError, ValueError):
+            self.rotate_at = self.JOURNAL_ROTATE_AT
+        self._lock = threading.Lock()
+        self.totals = self._fresh()
+        self.days: dict[str, dict] = {}
+        self._recent: list[dict] = []
+        self._journal_lines = 0
+        self._loaded = False
+
+    @classmethod
+    def _fresh(cls) -> dict:
+        return {"calls": 0, "ok": 0, "failed": 0, "attempts": 0, "elapsed": 0.0,
+                "input": 0, "output": 0, "total": 0, "cache_read": 0, "cache_write": 0,
+                "upstreams": {}, "models": {}}
+
+    @classmethod
+    def _fresh_sub(cls) -> dict:
+        return {"calls": 0, "ok": 0, "failed": 0, "attempts": 0, "elapsed": 0.0,
+                "input": 0, "output": 0, "total": 0, "cache_read": 0, "cache_write": 0}
+
+    @classmethod
+    def _normalize(cls, raw: dict) -> dict:
+        """把磁盘上的桶补齐成当前结构，老文件缺字段也能读。"""
+        bucket = cls._fresh()
+        for key, value in raw.items():
+            if key in ("upstreams", "models") and isinstance(value, dict):
+                for name, sub in value.items():
+                    if isinstance(sub, dict):
+                        bucket[key][str(name)] = cls._normalize(sub)
+            elif key == "elapsed" and isinstance(value, (int, float)):
+                bucket["elapsed"] = float(value)
+            elif key in bucket and isinstance(value, (int, float)):
+                bucket[key] = int(value)
+        return bucket
+
+    def _apply(self, bucket: dict, entry: dict) -> None:
+        ok = bool(entry.get("ok"))
+        elapsed = float(entry.get("elapsed_seconds") or 0)
+        bucket["calls"] += 1
+        bucket["ok" if ok else "failed"] += 1
+        bucket["elapsed"] += elapsed
+
+        trail = entry.get("trail")
+        if not isinstance(trail, list) or not trail:
+            trail = [{"upstream": entry.get("upstream") or "-",
+                      "upstream_id": entry.get("upstream_id"),
+                      "ok": ok,
+                      "model": entry.get("effective_model"),
+                      "status": entry.get("status")}]
+
+        model_name = entry.get("model") or "-"
+        model = bucket["models"].setdefault(model_name, self._fresh())
+        model["calls"] += 1
+        model["ok" if ok else "failed"] += 1
+        model["elapsed"] += elapsed
+
+        usage_counted = False
+        for step in trail:
+            if not isinstance(step, dict):
+                continue
+            up_name = step.get("upstream") or "-"
+            for owner in (bucket, model):
+                u = owner["upstreams"].setdefault(up_name, self._fresh_sub())
+                u["calls"] += 1
+                u["ok" if step.get("ok") else "failed"] += 1
+            bucket["attempts"] += 1
+            model["attempts"] += 1
+            # token 用量只算一次（算在实际处理成功的那一步），不然会重复计数
+            if not usage_counted and step.get("ok"):
+                usage_counted = True
+                usage = entry.get("usage") or {}
+                self._add_usage(bucket, usage)
+                self._add_usage(model, usage)
+                self._add_usage(bucket["upstreams"][up_name], usage)
+                self._add_usage(model["upstreams"][up_name], usage)
+
+    @staticmethod
+    def _add_usage(bucket: dict, usage: dict) -> None:
+        for key in USAGE_KEYS:
+            value = usage.get(key)
+            if isinstance(value, (int, float)):
+                bucket[key] += int(value)
+
+    @classmethod
+    def _merge(cls, dst: dict, src: dict) -> None:
+        for key in ("calls", "ok", "failed", "attempts", "input", "output",
+                    "total", "cache_read", "cache_write"):
+            value = src.get(key)
+            if isinstance(value, (int, float)):
+                dst[key] += int(value)
+        elapsed = src.get("elapsed")
+        if isinstance(elapsed, (int, float)):
+            dst["elapsed"] += float(elapsed)
+        for nest in ("upstreams", "models"):
+            for name, sub in (src.get(nest) or {}).items():
+                if isinstance(sub, dict):
+                    cls._merge(dst[nest].setdefault(str(name), cls._fresh()), sub)
+
+    def record(self, entry: dict) -> None:
+        at = entry.get("at")
+        date = time.strftime("%Y-%m-%d", time.localtime(float(at) if at else time.time()))
+        with self._lock:
+            self._apply(self.totals, entry)
+            self._apply(self.days.setdefault(date, self._fresh()), entry)
+            self._append(entry)
+            self._save()
+
+    def _append(self, entry: dict) -> None:
+        try:
+            os.makedirs(os.path.dirname(self.history_path), exist_ok=True)
+            with open(self.history_path, "a", encoding="utf-8") as fh:
+                fh.write(json.dumps(entry, ensure_ascii=False, separators=(",", ":")) + "\n")
+            self._journal_lines += 1
+            if self._journal_lines >= self.rotate_at:
+                self._rotate_journal()
+        except Exception as exc:  # noqa: BLE001
+            sys.stderr.write(f"[warn] 写历史流水失败: {exc}\n")
+
+    def _rotate_journal(self, force: bool = False) -> Optional[str]:
+        """把当前流水改名归档，另起一份新的接着写。
+
+        只改名、不删行 —— 这是「流水不可清除」的关键：以前是重写成
+        「最近 N 条」，等于把老记录真删了。改名后归档文件永久保留。
+
+        force=True 时忽略行数阈值（手动归档用）。
+        """
+        if not os.path.exists(self.history_path):
+            return None
+        if not force and self._journal_lines < self.rotate_at:
+            return None
+        try:
+            stamp = time.strftime("%Y%m%d-%H%M%S")
+            directory = os.path.dirname(self.history_path)
+            stem = os.path.splitext(os.path.basename(self.history_path))[0]
+            archived = os.path.join(directory, f"{stem}.{stamp}.jsonl")
+            seq = 1
+            while os.path.exists(archived):
+                archived = os.path.join(directory, f"{stem}.{stamp}-{seq}.jsonl")
+                seq += 1
+            os.replace(self.history_path, archived)
+            self._journal_lines = 0
+            return archived
+        except Exception as exc:  # noqa: BLE001
+            sys.stderr.write(f"[warn] 归档历史流水失败: {exc}\n")
+            return None
+
+    def journal_files(self) -> list[str]:
+        """当前流水 + 全部归档，按文件名（即时间）排序。"""
+        directory = os.path.dirname(self.history_path)
+        stem = os.path.splitext(os.path.basename(self.history_path))[0]
+        out: list[str] = []
+        try:
+            for name in sorted(os.listdir(directory)):
+                if not name.endswith(".jsonl"):
+                    continue
+                if name == os.path.basename(self.history_path) or name.startswith(stem + "."):
+                    out.append(os.path.join(directory, name))
+        except OSError:
+            pass
+        return out
+
+    def rotate_journal_now(self) -> Optional[str]:
+        """手动归档当前流水（界面/接口用），不管有没有到自动轮转阈值。"""
+        with self._lock:
+            return self._rotate_journal(force=True)
+
+    def journal_info(self) -> dict:
+        """流水文件概况：当前行数、归档份数、合计大小。"""
+        files = self.journal_files()
+        total = 0
+        for p in files:
+            try:
+                total += os.path.getsize(p)
+            except OSError:
+                pass
+        return {
+            "current_lines": self._journal_lines,
+            "files": len(files),
+            "bytes": total,
+            "rotate_at": self.rotate_at,
+        }
+
+    def _save(self) -> None:
+        try:
+            os.makedirs(os.path.dirname(self.path), exist_ok=True)
+            tmp = self.path + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as fh:
+                json.dump({"version": 1, "totals": self.totals, "days": self.days},
+                          fh, ensure_ascii=False, separators=(",", ":"))
+            os.replace(tmp, self.path)
+        except Exception as exc:  # noqa: BLE001
+            sys.stderr.write(f"[warn] 保存统计失败: {exc}\n")
+
+    def load(self) -> None:
+        self._load_journal()
+        try:
+            with open(self.path, "r", encoding="utf-8") as fh:
+                data = json.load(fh)
+        except FileNotFoundError:
+            data = None
+        except Exception as exc:  # noqa: BLE001
+            sys.stderr.write(f"[warn] 统计文件读不了，稍后按流水重建: {exc}\n")
+            data = None
+        if isinstance(data, dict):
+            totals = data.get("totals")
+            days = data.get("days")
+            if isinstance(totals, dict) and isinstance(days, dict):
+                self.totals = self._normalize(totals)
+                for date, bucket in days.items():
+                    if isinstance(bucket, dict):
+                        self.days[str(date)] = self._normalize(bucket)
+                self._loaded = bool(self.totals.get("calls"))
+        # 聚合值可能比流水「慢一步」：记账是写响应之后做的，
+        # 进程在两者之间被杀就会漏掉最后几条。流水是权威记录，
+        # 所以启动时对一次账，落后就按流水补上（只增不减）。
+        self.reconcile_from_journal()
+
+    def journal_entries(self) -> list[dict]:
+        """把当前流水和全部归档里的记录按时间顺序读出来。"""
+        out: list[dict] = []
+        for path in self.journal_files():
+            try:
+                with open(path, "r", encoding="utf-8") as fh:
+                    for line in fh:
+                        line = line.strip()
+                        if not line:
+                            continue
+                        try:
+                            item = json.loads(line)
+                        except Exception:  # noqa: BLE001
+                            continue   # 断电时最后一行可能是半条，跳过
+                        if isinstance(item, dict):
+                            out.append(item)
+            except OSError:
+                continue
+        return out
+
+    def _journal_line_count(self) -> int:
+        """数一遍流水总共多少行（含归档），不解析 JSON —— 启动时要快。"""
+        total = 0
+        for path in self.journal_files():
+            try:
+                with open(path, "r", encoding="utf-8") as fh:
+                    for _ in fh:
+                        total += 1
+            except OSError:
+                continue
+        return total
+
+    def reconcile_from_journal(self, max_gap: int = 0) -> bool:
+        """启动时按流水校正聚合统计。
+
+        流水是**唯一权威记录**：聚合只是它的缓存。所以只要聚合条数和
+        流水里实际条数对不上，就以流水为准重算。
+
+        早先的版本是「只在差一点点时才补，差得多就不动」，结果出了一个
+        长期对不上的现象：左边按聚合显示 375、右边按内存计数显示 188，
+        而流水里其实是 1219 条 —— 谁都不对。现在统一以流水为口径，
+        启动时对平，界面上的数字从此只有这一个来源。
+        """
+        journal_lines = self._journal_line_count()
+        aggregate = self.totals.get("calls", 0)
+        if journal_lines == aggregate:
+            return False
+        if journal_lines == 0:
+            return False       # 还没有流水，保留现有聚合（可能是配置里带的）
+
+        if max_gap and (journal_lines - aggregate) > max_gap:
+            sys.stderr.write(
+                f"[info] 流水 {journal_lines} 条、聚合 {aggregate} 条，"
+                f"相差 {journal_lines - aggregate} 条，超出阈值未自动重算\n")
+            return False
+
+        result = self.rebuild_stats_from_journal()
+        sys.stderr.write(
+            "[info] 启动校正：聚合 %d 条 -> 按流水 %d 条重算（%s）\n" % (
+                aggregate, result.get("calls", 0),
+                ", ".join(result.get("days") or [])))
+        return True
+
+    def rebuild_stats_from_journal(self) -> dict:
+        """以流水为唯一依据重建全部聚合统计（总量 + 按天 + 按模型）。
+
+        与 reconcile_from_journal 的区别：那个是保守补记（只在差一点点时动），
+        这个是**彻底重算** —— 用在「聚合明显落后于流水」这种真出问题的时候，
+        由运维显式触发（/admin/stats/rebuild），不自动跑。
+        """
+        entries = self.journal_entries()
+        with self._lock:
+            self.totals = self._fresh()
+            self.days = {}
+            for entry in entries:
+                at = entry.get("at")
+                date = time.strftime("%Y-%m-%d",
+                                     time.localtime(float(at) if at else time.time()))
+                self._apply(self.totals, entry)
+                self._apply(self.days.setdefault(date, self._fresh()), entry)
+            self._loaded = True
+            self._save()
+        return {
+            "ok": True,
+            "entries": len(entries),
+            "calls": self.totals["calls"],
+            "days": sorted(self.days.keys()),
+        }
+
+    # ---- 全量流水查询（列表和统计都以流水为准）----
+    #
+    # 之前列表读的是内存里那 500 条 `_recent`，所以白天/昨天的记录翻不到，
+    # 而汇总数字走的是落盘聚合 —— 两个口径必然对不上。
+    # 这里统一从流水读，支持按天/按月/按分组筛，并给出该筛选下的真实条数。
+
+    @staticmethod
+    def _entry_day(entry: dict) -> str:
+        at = entry.get("at")
+        return time.strftime("%Y-%m-%d",
+                             time.localtime(float(at) if at else time.time()))
+
+    @staticmethod
+    def _entry_group(entry: dict) -> str:
+        """这条记录属于哪个分组。客户端请求的 model 就是分组名。"""
+        return str(entry.get("model") or "-")
+
+    @staticmethod
+    def _entry_trail(entry: dict) -> list[dict]:
+        """这条记录依次试过的上游（每次尝试一步）。
+
+        「上游」字段只记最终成功的那一家；请求中途换过家时，被跳过的那几家
+        失败只留在 trail 里。老记录没有 trail，就按最终上游合成一步。
+        """
+        trail = entry.get("trail")
+        if isinstance(trail, list) and trail:
+            return [s for s in trail if isinstance(s, dict)]
+        return [{"upstream": entry.get("upstream") or "-",
+                 "upstream_id": entry.get("upstream_id"),
+                 "ok": bool(entry.get("ok")),
+                 "model": entry.get("effective_model"),
+                 "status": entry.get("status"),
+                 "reason": entry.get("error")}]
+
+    def query_journal(self, day: str = "", month: str = "", group: str = "",
+                      upstream: str = "", offset: int = 0, limit: int = 100,
+                      with_text: bool = False) -> dict:
+        """按条件翻流水。返回 {entries, total, offset, limit, days, groups, upstreams}。
+
+        - day:   "YYYY-MM-DD"，只看这一天
+        - month: "YYYY-MM"，只看这一个月
+        - group: 模型分组名，只看它
+        - upstream: 上游名，只看**试过**这个上游的请求（含中途失败后换家的那些）
+        - offset/limit: 分页；entries 按时间**倒序**（最新在前）
+        - with_text: 是否带 request_text/response_text 这类大字段
+          （列表页不需要，一直传全量会很卡，展开某条时再单独取）
+
+        同时回传 days / groups / upstreams 各维度的计数，前端用来做下拉和筛选提示。
+        upstreams 按**每次尝试**统计（和右侧卡片同一口径），不是按最终上游。
+        """
+        entries = self.journal_entries()
+        # 过滤
+        keep: list[tuple[str, dict]] = []
+        day_counts: dict[str, int] = {}
+        group_counts: dict[str, int] = {}
+        # upstream 计数在「天/月/分组」筛选之后、上游筛选之前统计：
+        # 下拉里只列当前分组真正用过的上游，并带失败数，方便一眼找到坏上游。
+        up_counts: dict[str, list[int]] = {}
+        for e in entries:
+            d = self._entry_day(e)
+            g = self._entry_group(e)
+            day_counts[d] = day_counts.get(d, 0) + 1
+            group_counts[g] = group_counts.get(g, 0) + 1
+            if day:
+                if d != day:
+                    continue
+            if month:
+                if not d.startswith(month):
+                    continue
+            if group:
+                if g != group:
+                    continue
+            steps = self._entry_trail(e)
+            names = set()
+            for s in steps:
+                su = str(s.get("upstream") or "-")
+                names.add(su)
+                slot = up_counts.setdefault(su, [0, 0])
+                slot[0] += 1
+                if not s.get("ok"):
+                    slot[1] += 1
+            # 按上游筛选时匹配「这次请求试过的任意一家」，而不是只看最终上游：
+            # 否则换家过程中失败的上游永远筛不出来（请求后来在别家成功了）。
+            if upstream:
+                if upstream not in names:
+                    continue
+            keep.append((d, e))
+
+        total = len(keep)
+        # 最新在前
+        keep.sort(key=lambda pair: float(pair[1].get("at") or 0), reverse=True)
+        try:
+            offset = max(0, int(offset))
+        except (TypeError, ValueError):
+            offset = 0
+        try:
+            limit = max(1, min(1000, int(limit)))
+        except (TypeError, ValueError):
+            limit = 100
+        page = keep[offset:offset + limit]
+
+        out_entries: list[dict] = []
+        for _, e in page:
+            if with_text:
+                out_entries.append(e)
+            else:
+                # 只挑列表要用的字段，避免把几十 MB 的正文一起发出去
+                out_entries.append({
+                    k: e.get(k) for k in
+                    ("at", "time", "upstream_id", "upstream", "model",
+                     "effective_model", "status", "elapsed_seconds", "ok",
+                     "stream", "attempts", "route_source", "error", "usage",
+                     "trail")
+                })
+        return {
+            "entries": out_entries,
+            "total": total,
+            "offset": offset,
+            "limit": limit,
+            "days": dict(sorted(day_counts.items(), reverse=True)),
+            "groups": dict(sorted(group_counts.items(), key=lambda kv: -kv[1])),
+            "upstreams": [
+                {"key": k, "calls": v[0], "failed": v[1]}
+                for k, v in sorted(up_counts.items(),
+                                   key=lambda kv: (-kv[1][1], -kv[1][0]))
+            ],
+            "filter": {"day": day, "month": month, "group": group,
+                       "upstream": upstream},
+            "journal": self.journal_info(),
+        }
+
+    def find_journal_entry(self, at: float, upstream: str = "",
+                           status: Optional[int] = None) -> Optional[dict]:
+        """按时间戳（+上游/状态辅助定位）取回**含正文**的那一条记录。
+
+        列表接口不带 request_text/response_text（几十 MB 发出去太慢），
+        所以用户点开某条详情时，用这个按需取回完整内容。
+
+        时间戳是浮点数，经 URL 传一圈会有末位精度损失，所以按 0.1 秒
+        比对（和列表页的 key 规则一致）；同一 0.1 秒里有多条时，
+        再用上游名/状态挑最匹配的那条。
+        """
+        try:
+            target = float(at)
+        except (TypeError, ValueError):
+            return None
+        # 优先精确命中：高并发时几条记录可能落在同一个 0.1 秒里，
+        # 只按 0.1 秒窗匹配会取回「同一格里的另一条」，正文就对不上了。
+        loose = None
+        for path in reversed(self.journal_files()):
+            try:
+                with open(path, "r", encoding="utf-8") as fh:
+                    for line in fh:
+                        line = line.strip()
+                        if not line:
+                            continue
+                        try:
+                            item = json.loads(line)
+                        except Exception:  # noqa: BLE001
+                            continue
+                        if not isinstance(item, dict) or not item.get("at"):
+                            continue
+                        try:
+                            value = float(item["at"])
+                        except (TypeError, ValueError):
+                            continue
+                        if upstream and str(item.get("upstream") or "") != upstream:
+                            continue
+                        if status is not None and item.get("status") != status:
+                            continue
+                        if value == target:
+                            return item          # 精确命中，直接用它
+                        if abs(value - target) < 0.1 and loose is None:
+                            loose = item          # 兜底：同一 0.1 秒窗内
+            except OSError:
+                continue
+        return loose
+
+    def journal_retention(self) -> dict:
+        """流水保留情况：多少天、共多少条、最早最晚。"""
+        entries = self.journal_entries()
+        if not entries:
+            return {"entries": 0, "days": 0, "first": None, "last": None}
+        ts = [float(e["at"]) for e in entries if e.get("at")]
+        if not ts:
+            return {"entries": len(entries), "days": 0, "first": None, "last": None}
+        day_counts = {}
+        for t in ts:
+            d = time.strftime("%Y-%m-%d", time.localtime(t))
+            day_counts[d] = day_counts.get(d, 0) + 1
+        return {
+            "entries": len(entries),
+            "days": len(day_counts),
+            "first": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(min(ts))),
+            "last": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(max(ts))),
+            "by_day": dict(sorted(day_counts.items(), reverse=True)),
+        }
+
+    def journal_index(self) -> dict:
+        """流水里出现过的日期 / 月份 / 分组，以及各自条数。
+
+        前端用它生成筛选下拉 —— 只列真有过请求的那几天，不给空选项。
+        结果按文件（名字+大小+修改时间）缓存，避免每次开页面都全量扫。
+        """
+        files = self.journal_files()
+        try:
+            stamp = tuple((os.path.basename(p), os.path.getsize(p), os.path.getmtime(p))
+                          for p in files if os.path.exists(p))
+        except OSError:
+            stamp = ()
+
+        cache = getattr(self, "_journal_index_cache", None)
+        if cache is not None and cache.get("stamp") == stamp:
+            return cache["value"]
+
+        days: dict[str, int] = {}
+        months: dict[str, int] = {}
+        groups: dict[str, int] = {}
+        total = 0
+        for path in files:
+            try:
+                with open(path, "r", encoding="utf-8") as fh:
+                    for line in fh:
+                        line = line.strip()
+                        if not line:
+                            continue
+                        try:
+                            item = json.loads(line)
+                        except Exception:  # noqa: BLE001
+                            continue
+                        if not isinstance(item, dict):
+                            continue
+                        total += 1
+                        at = item.get("at")
+                        if at:
+                            try:
+                                st = time.localtime(float(at))
+                                d = time.strftime("%Y-%m-%d", st)
+                                days[d] = days.get(d, 0) + 1
+                                mo = time.strftime("%Y-%m", st)
+                                months[mo] = months.get(mo, 0) + 1
+                            except (TypeError, ValueError, OSError):
+                                pass
+                        g = self._entry_group(item)
+                        groups[g] = groups.get(g, 0) + 1
+            except OSError:
+                continue
+
+        value = {
+            "total": total,
+            "days": [{"key": k, "calls": v}
+                     for k, v in sorted(days.items(), reverse=True)],
+            "months": [{"key": k, "calls": v}
+                       for k, v in sorted(months.items(), reverse=True)],
+            "groups": [{"key": k, "calls": v}
+                       for k, v in sorted(groups.items(), key=lambda kv: -kv[1])],
+        }
+        self._journal_index_cache = {"stamp": stamp, "value": value}
+        return value
+
+    def _load_journal(self) -> None:
+        try:
+            with open(self.history_path, "r", encoding="utf-8") as fh:
+                lines = fh.readlines()
+        except FileNotFoundError:
+            return
+        except Exception as exc:  # noqa: BLE001
+            sys.stderr.write(f"[warn] 历史明细读不了: {exc}\n")
+            return
+        self._journal_lines = len(lines)
+        for line in lines[-self.max_entries:]:
+            try:
+                item = json.loads(line)
+            except Exception:  # noqa: BLE001
+                continue     # 断电时最后一行可能是半条，跳过
+            if isinstance(item, dict):
+                self._recent.append(item)
+        # 当前流水太大就归档（改名保留，不删行）
+        if self._journal_lines >= self.rotate_at:
+            self._rotate_journal()
+
+    def recent_entries(self) -> list[dict]:
+        return list(self._recent)
+
+    def has_data(self) -> bool:
+        return self._loaded or self.totals["calls"] > 0
+
+    def reindex(self, entries: list[dict]) -> None:
+        """统计文件丢了（或被删）时，用明细重新累计一遍。"""
+        with self._lock:
+            for entry in entries:
+                at = entry.get("at")
+                date = time.strftime("%Y-%m-%d",
+                                     time.localtime(float(at) if at else time.time()))
+                self._apply(self.totals, entry)
+                self._apply(self.days.setdefault(date, self._fresh()), entry)
+            self._loaded = True
+            if entries:
+                self._save()
+
+    def clear(self) -> None:
+        """已停用：流水和统计都不允许被清除。
+
+        以前这个方法会删掉流水文件和聚合文件，界面上一个「清空统计」按钮
+        就能把它们全抹掉 —— 误点一下就没有了。现在统计只会往上加。
+        留着这个函数（而不是删掉）是为了让误调用报错看得懂。
+        """
+        raise RuntimeError(
+            "统计与请求流水不可清除（流水是只增不减的记录）。"
+            "如需重新开始，请改用另一份配置文件。")
+
+    def meta(self) -> dict:
+        with self._lock:
+            return {
+                "days": sorted(self.days.keys(), reverse=True),
+                "months": sorted({d[:7] for d in self.days}, reverse=True),
+                "totals": self._light(self.totals),
+            }
+
+    def snap_range(self, key: str) -> dict:
+        """按范围聚合，结构对齐 call_stats()，前端可以直接复用渲染。"""
+        with self._lock:
+            bucket = self._range_bucket(key)
+            return self._render(bucket, key or "all", self.max_entries)
+
+    def _range_bucket(self, key: str) -> dict:
+        key = (key or "all").strip()
+        if key.startswith("day:"):
+            bucket = self.days.get(key[4:])
+            return self._clone(bucket) if bucket else self._fresh()
+        if key.startswith("month:"):
+            prefix = key[6:]
+            merged = self._fresh()
+            for date, bucket in self.days.items():
+                if date.startswith(prefix):
+                    self._merge(merged, bucket)
+            return merged
+        return self._clone(self.totals)
+
+    @classmethod
+    def _clone(cls, bucket: dict) -> dict:
+        return cls._normalize(bucket)
+
+    @classmethod
+    def _light(cls, bucket: dict) -> dict:
+        return {k: int(bucket.get(k, 0) or 0) for k in
+                ("calls", "ok", "failed", "attempts",
+                 "input", "output", "total", "cache_read", "cache_write")}
+
+    @classmethod
+    def _render(cls, bucket: dict, key: str, history_limit: int = MAX_ENTRIES) -> dict:
+        groups = []
+        for name, m in bucket.get("models", {}).items():
+            ups = sorted(
+                [{"upstream": un, "calls": int(u.get("calls", 0)),
+                  "ok": int(u.get("ok", 0)), "failed": int(u.get("failed", 0)),
+                  "usage": cls._usage_of(u)}
+                 for un, u in (m.get("upstreams") or {}).items()],
+                key=lambda x: -x["calls"])
+            calls = int(m.get("calls", 0))
+            groups.append({
+                "group": name,
+                "calls": calls, "ok": int(m.get("ok", 0)),
+                "failed": int(m.get("failed", 0)),
+                "attempts": int(m.get("attempts", 0)),
+                "avg_elapsed": round(float(m.get("elapsed", 0.0)) / calls, 3)
+                               if calls else 0,
+                "usage": cls._usage_of(m),
+                "upstreams": ups, "upstream_count": len(ups),
+            })
+        groups.sort(key=lambda x: -x["calls"])
+        ups = sorted(
+            [{"upstream": n, "calls": int(u.get("calls", 0)), "ok": int(u.get("ok", 0)),
+              "failed": int(u.get("failed", 0))}
+             for n, u in bucket.get("upstreams", {}).items()],
+            key=lambda x: -x["calls"])
+        return {"groups": groups, "totals": cls._light(bucket),
+                "upstreams": ups, "history_limit": history_limit, "range": key}
+
+    @staticmethod
+    def _usage_of(bucket: dict) -> dict:
+        out = {}
+        for key in USAGE_KEYS:
+            value = bucket.get(key)
+            if value:
+                out[key] = int(value)
+        return out
 
 
 # ---------------------------------------------------------------------------
@@ -793,9 +1639,26 @@ class Router:
         self.config_path = config_path
         self.lock = threading.Lock()
         self.rr_counters: dict[str, int] = {}
-        self.history: collections.deque = collections.deque(maxlen=200)
         self.started_at = time.time()
         self.total_requests = 0
+
+        # 明细上限只影响「列表能看到多少条」，累计统计是全量的（见 StatsStore）
+        router_cfg_pre = cfg.get("router") or {}
+        try:
+            hist_limit = int(router_cfg_pre.get("history_limit") or 0)
+        except (TypeError, ValueError):
+            hist_limit = 0
+            sys.stderr.write("[warn] history_limit 不是数字，按默认值处理\n")
+        self.history: collections.deque = collections.deque(
+            maxlen=hist_limit if hist_limit > 0 else StatsStore.MAX_ENTRIES)
+
+        # 统计要跨重启：先把上次的明细找回来，再按需重建聚合
+        self.stats = StatsStore(self._state_dir(), self._state_stem(),
+                                max_entries=self.history.maxlen)
+        self.stats.load()
+        self.history.extend(self.stats.recent_entries())
+        if not self.stats.has_data() and self.history:
+            self.stats.reindex(list(self.history))
 
         server_cfg = cfg.get("server") or {}
         self.host = str(server_cfg.get("host", "127.0.0.1"))
@@ -813,6 +1676,9 @@ class Router:
 
         self.upstreams: list[Upstream] = []
         self.models: dict[str, ModelRoute] = {}
+        # 用户显式删掉的路由：sync_routes 不许按「勾选+分组」把它再建回来，
+        # 直到用户重新保存这个路由 / 手动分组 / 自动配好为止。
+        self.suppressed_models: set[str] = set()
 
         seed = self._seed_from_config(cfg)
         saved = self._load_state()
@@ -844,9 +1710,11 @@ class Router:
                 "strategy": mcfg.get("strategy", "priority"),
                 "entries": [
                     {"upstream": e.get("upstream"), "model": e.get("model") or name,
-                     "enabled": e.get("enabled", True)}
+                     "enabled": e.get("enabled", True),
+                     "quota": e.get("quota")}
                     for e in (mcfg.get("entries") or [])
                 ],
+                "orderings": mcfg.get("orderings") or {},
             }
         return {"upstreams": ups, "models": models_out}
 
@@ -864,6 +1732,9 @@ class Router:
             route = ModelRoute(str(name), mcfg)
             route.entries = [e for e in route.entries if e.upstream_id]
             self.models[str(name)] = route
+
+        raw_suppressed = data.get("suppressed_models")
+        self.suppressed_models = {str(x) for x in raw_suppressed} if isinstance(raw_suppressed, list) else set()
 
         # 老状态文件没有 selected_models：按「已经在模型路由里用到的」推断勾选。
         # 不能简单地全选——上游动辄上百个模型，全勾上会把路由列表塞满；
@@ -890,13 +1761,21 @@ class Router:
     # 状态文件（上游、模型路由、勾选、分组）统一放进配置同目录下的 .llmrouter/
     # 子目录，不跟普通文件混在一起。
     # 这样任何「按扩展名清理项目根目录」的操作（比如 rm *.state.json）都碰不到它。
-    # 另外每次保存前会把上一版留成 .bak，reset 时也不是删除而是移进 trash/。
+    #
+    # 每次保存前会把当前版本轮转进 versions/ 留成带时间戳的快照（保留最近
+    # STATE_BACKUP_KEEP 份），reset 时也不是删除而是移进 trash/。
+    # 早先只留单份 .bak，坑在于：最后一次写入会把上一版好配置挤掉 ——
+    # 一旦配置被误删，.bak 里已经是被删之后的状态，等于没有退路。
 
     STATE_DIRNAME = ".llmrouter"
+    VERSIONS_DIRNAME = "versions"
 
     def _state_dir(self) -> str:
         directory = os.path.dirname(os.path.abspath(self.config_path))
         return os.path.join(directory, self.STATE_DIRNAME)
+
+    def _versions_dir(self) -> str:
+        return os.path.join(self._state_dir(), self.VERSIONS_DIRNAME)
 
     def _state_stem(self) -> str:
         return os.path.splitext(os.path.basename(self.config_path))[0]
@@ -914,6 +1793,99 @@ class Router:
         os.makedirs(trash, exist_ok=True)
         stamp = time.strftime("%Y%m%d-%H%M%S")
         return os.path.join(trash, f"{self._state_stem()}.{suffix}.{stamp}.json")
+
+    def _snapshot_state(self, path: str) -> None:
+        """把即将被覆盖的状态存一份带时间戳的快照，并只保留最近若干份。
+
+        时间戳精确到秒，同一秒内连改两次会撞名 —— 撞上就补一个序号，
+        宁可多留一份也不覆盖（快照的作用就是「还能回退」）。
+        """
+        versions = self._versions_dir()
+        try:
+            os.makedirs(versions, exist_ok=True)
+            stem = f"{self._state_stem()}.state.{time.strftime('%Y%m%d-%H%M%S')}"
+            target = os.path.join(versions, stem + ".json")
+            seq = 1
+            while os.path.exists(target):
+                target = os.path.join(versions, f"{stem}-{seq}.json")
+                seq += 1
+            shutil.copyfile(path, target)
+
+            # 只保留最近 N 份，按文件名排序即按时间排序
+            olds = sorted(f for f in os.listdir(versions)
+                          if f.startswith(f"{self._state_stem()}.state.")
+                          and f.endswith(".json"))
+            for name in olds[:-STATE_BACKUP_KEEP]:
+                try:
+                    os.remove(os.path.join(versions, name))
+                except OSError:
+                    pass
+        except Exception as exc:  # noqa: BLE001
+            sys.stderr.write(f"[warn] 状态快照失败（不影响本次保存）: {exc}\n")
+
+    def list_state_versions(self) -> list[dict]:
+        """列出可回退的状态快照，最新的在前。"""
+        versions = self._versions_dir()
+        if not os.path.isdir(versions):
+            return []
+        out: list[dict] = []
+        prefix = f"{self._state_stem()}.state."
+        for name in sorted(os.listdir(versions), reverse=True):
+            if not (name.startswith(prefix) and name.endswith(".json")):
+                continue
+            full = os.path.join(versions, name)
+            try:
+                st = os.stat(full)
+            except OSError:
+                continue
+            item: dict[str, Any] = {
+                "file": name,
+                "size": st.st_size,
+                "mtime": st.st_mtime,
+            }
+            try:
+                with open(full, "r", encoding="utf-8") as fh:
+                    data = json.load(fh)
+                if isinstance(data, dict):
+                    models = data.get("models")
+                    item["upstreams"] = len(data.get("upstreams") or [])
+                    item["models"] = len(models) if isinstance(models, dict) else 0
+            except Exception:  # noqa: BLE001
+                pass
+            out.append(item)
+        return out
+
+    def restore_state_version(self, name: str) -> dict:
+        """按快照文件名回退状态（回退前先把当前状态也存一份，可再退回来）。"""
+        # 只认文件名，挡掉 ../ 这种越界路径
+        base = os.path.basename(str(name or ""))
+        if not base or base != str(name) or not base.endswith(".json"):
+            raise ValueError("快照文件名不合法")
+        versions = self._versions_dir()
+        src = os.path.join(versions, base)
+        if not os.path.isfile(src):
+            raise KeyError(f"找不到快照 {base!r}")
+        try:
+            with open(src, "r", encoding="utf-8") as fh:
+                data = json.load(fh)
+        except Exception as exc:  # noqa: BLE001
+            raise ValueError(f"快照读不了: {exc}") from exc
+        if not isinstance(data, dict) or not isinstance(data.get("upstreams"), list):
+            raise ValueError("快照内容不像是状态文件")
+
+        # 先把「现在」存一份，这样回退本身也是可撤销的
+        current = self._state_path()
+        if os.path.exists(current):
+            self._snapshot_state(current)
+
+        self._apply_state(data)
+        self._save_state()
+        return {
+            "ok": True,
+            "restored_from": base,
+            "upstreams": len(self.upstreams),
+            "models": len(self.models),
+        }
 
     def _load_state(self) -> Optional[dict]:
         path = self._state_path()
@@ -948,13 +1920,16 @@ class Router:
             "version": 2,
             "upstreams": [u.state() for u in self.upstreams],
             "models": {name: r.state() for name, r in self.models.items()},
+            "suppressed_models": sorted(self.suppressed_models),
         }
         path = self._state_path()
         try:
             os.makedirs(self._state_dir(), exist_ok=True)
 
-            # 覆盖前先把上一版留成 .bak，这样万一写坏/误删还能回退一步
+            # 覆盖前轮转出一份带时间戳的快照（versions/ 下保留最近若干份）。
+            # 同时照旧留一份同名 .bak —— 老用户和 README 里都认这个名字。
             if os.path.exists(path):
+                self._snapshot_state(path)
                 try:
                     shutil.copyfile(path, path + ".bak")
                 except Exception:  # noqa: BLE001
@@ -967,6 +1942,57 @@ class Router:
             os.replace(tmp, path)
         except Exception as exc:  # noqa: BLE001
             sys.stderr.write(f"[warn] 保存状态失败（不影响本次运行）: {exc}\n")
+
+    # ---- 管理操作审计 ----
+    #
+    # 每个改配置的管理接口都往 .llmrouter/admin.log 追加一行（JSON Lines）。
+    # 起因：配置在没人操作的时间点被改过两次，却查不出是谁干的 ——
+    # 上游增删、路由改动这类操作必须留下痕迹。
+
+    def _admin_log_path(self) -> str:
+        return os.path.join(self._state_dir(),
+                            f"{self._state_stem()}{ADMIN_LOG_SUFFIX}")
+
+    def admin_log(self, op: str, detail: Optional[dict] = None,
+                  actor: str = "", ok: bool = True) -> None:
+        entry = {
+            "at": time.time(),
+            "time": time.strftime("%Y-%m-%d %H:%M:%S"),
+            "op": op,
+            "ok": bool(ok),
+            "actor": actor or "-",
+            "detail": detail or {},
+        }
+        try:
+            path = self._admin_log_path()
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            with self.lock:
+                with open(path, "a", encoding="utf-8") as fh:
+                    fh.write(json.dumps(entry, ensure_ascii=False,
+                                        separators=(",", ":")) + "\n")
+        except Exception as exc:  # noqa: BLE001
+            sys.stderr.write(f"[warn] 写审计日志失败: {exc}\n")
+
+    def read_admin_log(self, limit: int = 200) -> list[dict]:
+        """读最近的管理操作记录，最新的在前。"""
+        path = self._admin_log_path()
+        try:
+            with open(path, "r", encoding="utf-8") as fh:
+                lines = fh.readlines()
+        except FileNotFoundError:
+            return []
+        except Exception as exc:  # noqa: BLE001
+            sys.stderr.write(f"[warn] 审计日志读不了: {exc}\n")
+            return []
+        out: list[dict] = []
+        for line in reversed(lines[-max(1, int(limit)):]):
+            try:
+                item = json.loads(line)
+            except Exception:  # noqa: BLE001
+                continue
+            if isinstance(item, dict):
+                out.append(item)
+        return out
 
     def reset_to_config(self) -> dict:
         """按 config.toml 重置：状态文件移进 trash/ 留底，而不是删掉。"""
@@ -1087,7 +2113,11 @@ class Router:
         target: dict[str, list[tuple[str, str]]] = {}
         for up in self.upstreams:
             for real in up.selected():
-                target.setdefault(up.group_of(real), []).append((up.id, real))
+                group = up.group_of(real)
+                # 用户显式删过这个名称的路由，就别再自动建回来
+                if group in self.suppressed_models:
+                    continue
+                target.setdefault(group, []).append((up.id, real))
 
         created: list[str] = []
         removed: list[str] = []
@@ -1168,6 +2198,10 @@ class Router:
                 up.available_models.append(real)
                 up.available_models.sort()
             up.set_group(real, str(group) if group is not None else "")
+            g = str(group or "").strip()
+            if g:
+                # 用户主动把模型归到这个分组名下 → 说明要这个路由，撤销删除抑制
+                self.suppressed_models.discard(g)
             touched.append(real)
         sync = self.sync_routes()
         return {
@@ -1204,6 +2238,11 @@ class Router:
         if route is not None:
             route.name = new
             self.models[new] = route
+
+        # 删除抑制跟着一起改名；改名本身是用户主动操作，新名字不再抑制
+        if old in self.suppressed_models:
+            self.suppressed_models.discard(old)
+            self.suppressed_models.add(new)
 
         sync = self.sync_routes()
         return {"ok": True, "renamed": old, "to": new, "entries": n,
@@ -1275,19 +2314,247 @@ class Router:
                 "upstream": uid,
                 "model": real,
                 "enabled": e.get("enabled", True),
+                "quota": e.get("quota"),
             }))
         if not entries:
             raise ValueError("至少要给这个分组选一个上游模型")
 
-        self.models[name] = ModelRoute(name, {"strategy": strategy,
-                                             "entries": [e.state() for e in entries]})
+        # 保存路由时保留原来的具名排序（比如「原始」「按测速」）。
+        # 这里一个都不能动 —— 尤其「原始」记的是用户最初的顺序，
+        # 要是跟着当前顺序走，切回去就回不到真正的原样了。
+        old = self.models.get(name)
+        orderings = dict(old.orderings) if old is not None else {}
+
+        route = ModelRoute(name, {"strategy": strategy,
+                                  "entries": [e.state() for e in entries],
+                                  "orderings": {
+                                      label: [{"upstream": u, "model": m} for u, m in keys]
+                                      for label, keys in orderings.items()
+                                  }})
+        self.models[name] = route
+        # 手动保存 = 明确要这个路由，撤销之前的删除抑制
+        self.suppressed_models.discard(name)
         self._save_state()
-        return self.models[name]
+        return route
+
+    # ---- 排序：多套具名排序（保存 / 切换 / 按测速重排）----
+    ORDERING_ORIGINAL = "原始"
+
+    @classmethod
+    def _check_label(cls, label: str) -> None:
+        """「原始」是自动留底的名字，不让用户拿去命名，免得把回溯点覆盖掉。"""
+        if label == cls.ORDERING_ORIGINAL:
+            raise ValueError(f"「{cls.ORDERING_ORIGINAL}」是自动留底用的名字，"
+                             f"换个名字吧（它已经存在，直接切过去就行）")
+
+    def _route_or_raise(self, name: str) -> ModelRoute:
+        route = self.models.get(str(name or ""))
+        if route is None:
+            raise KeyError(f"没有配置模型 {name!r}")
+        return route
+
+    def list_orderings(self, name: str) -> dict:
+        """列出某个分组的所有具名排序。"""
+        route = self._route_or_raise(name)
+        return {
+            "ok": True,
+            "name": route.name,
+            "active": (self._active_ordering(route) or ""),
+            "orderings": [
+                {"label": label,
+                 "members": [{"upstream": u, "model": m} for u, m in keys]}
+                for label, keys in route.orderings.items()
+            ],
+            "entries": [{"upstream": e.upstream_id, "model": e.model,
+                         "enabled": e.enabled, "quota": e.quota}
+                        for e in route.entries],
+        }
+
+    @staticmethod
+    def _active_ordering(route: ModelRoute) -> Optional[str]:
+        """当前 entries 顺序正好等于哪一套具名排序（没有就返回 None）。"""
+        keys = route.entry_keys()
+        for label, saved in route.orderings.items():
+            if saved == keys:
+                return label
+        return None
+
+    def save_ordering(self, name: str, label: str,
+                      order: Optional[list] = None) -> dict:
+        """把一套顺序存成具名排序。
+
+        - 不传 order：存「当前顺序」。
+        - 传 order（[{"upstream":..., "model":...}]）：先应用这套顺序再存。
+
+        无论哪种，第一次存排序时都会先把此刻的顺序留成一套「原始」，
+        这样以后随时能切回去。
+        """
+        route = self._route_or_raise(name)
+        label = str(label or "").strip()
+        if not label:
+            raise ValueError("排序名字不能为空")
+        self._check_label(label)
+
+        if self.ORDERING_ORIGINAL not in route.orderings:
+            # 先留底，再动顺序 —— 顺序反了「原始」就记成新顺序了
+            route.orderings[self.ORDERING_ORIGINAL] = route.entry_keys()
+        keys = self._parse_order_keys(order) if isinstance(order, list) else None
+        if keys:
+            route.apply_order(keys)
+        route.save_ordering(label)
+        self._save_state()
+        return {"ok": True, "name": route.name, "label": label,
+                "active": self._active_ordering(route) or "",
+                "entries": [{"upstream": e.upstream_id, "model": e.model,
+                             "enabled": e.enabled, "quota": e.quota}
+                            for e in route.entries]}
+
+    @staticmethod
+    def _parse_order_keys(order: list) -> Optional[list[tuple[str, str]]]:
+        """把 [{"upstream":..,"model":..}] 解析成 [(上游, 真实模型名)]。"""
+        keys: list[tuple[str, str]] = []
+        for o in order:
+            if not isinstance(o, dict):
+                continue
+            uid = str(o.get("upstream") or "")
+            mid = str(o.get("model") or "")
+            if uid and mid:
+                keys.append((uid, mid))
+        return keys or None
+
+    def apply_ordering(self, name: str, label: str) -> dict:
+        """切换到某一套已经存过的排序。"""
+        route = self._route_or_raise(name)
+        label = str(label or "").strip()
+        if label and label not in route.orderings:
+            raise KeyError(f"没有名为 {label!r} 的排序")
+        if label:
+            route.apply_order(route.orderings[label])
+            self._save_state()
+        return {"ok": True, "name": route.name, "label": label,
+                "active": self._active_ordering(route) or "",
+                "entries": [{"upstream": e.upstream_id, "model": e.model,
+                             "enabled": e.enabled, "quota": e.quota}
+                            for e in route.entries]}
+
+    def delete_ordering(self, name: str, label: str) -> dict:
+        """删掉一套具名排序。当前顺序不变，只是这个名字没了。"""
+        route = self._route_or_raise(name)
+        label = str(label or "").strip()
+        if label == self.ORDERING_ORIGINAL:
+            raise ValueError("「原始」排序是回溯用的，不能删")
+        if not route.drop_ordering(label):
+            raise KeyError(f"没有名为 {label!r} 的排序")
+        self._save_state()
+        return {"ok": True, "name": route.name, "label": label,
+                "active": self._active_ordering(route) or ""}
+
+    def reorder_by_speed(self, name: str, label: str = "按测速",
+                         results: Optional[list[dict]] = None) -> dict:
+        """按测速结果给某一个分组重排，并存成一套具名排序（原顺序不丢）。
+
+        results 里每一项形如 {"upstream": "u1", "latency_seconds": 0.4}，
+        没测到、测失败的排到最后。额度为 0（不调用）的也一律沉到最后——
+        它本来就不参与调用，不该占别人的位置。
+        """
+        route = self._route_or_raise(name)
+        label = str(label or "按测速").strip() or "按测速"
+        if not isinstance(results, list) or not results:
+            raise ValueError("缺少测速结果，先点「测速」再重排")
+        self._check_label(label)
+
+        lat: dict[str, Optional[float]] = {}
+        for r in results:
+            if not isinstance(r, dict):
+                continue
+            uid = str(r.get("upstream") or r.get("id") or "")
+            if not uid:
+                continue
+            v = r.get("latency_seconds")
+            ok = r.get("ok", v is not None)
+            lat[uid] = float(v) if (ok and isinstance(v, (int, float))) else None
+
+        def sort_key(idx_entry: tuple[int, RouteEntry]):
+            idx, e = idx_entry
+            if e.skipped():
+                return (2, 0.0, idx)          # 额度 0：直接放最后
+            v = lat.get(e.upstream_id)
+            # 没结果的、失败的：排到（非 0 额度里的）最后，内部保持原相对顺序
+            return (0 if v is not None else 1, v if v is not None else 0.0, idx)
+
+        ordered = [e for _, e in sorted(enumerate(route.entries), key=sort_key)]
+        keys = [(e.upstream_id, e.model) for e in ordered]
+
+        if self.ORDERING_ORIGINAL not in route.orderings:
+            route.orderings[self.ORDERING_ORIGINAL] = route.entry_keys()
+        route.apply_order(keys)
+        route.save_ordering(label, keys)
+        self._save_state()
+        return {"ok": True, "name": route.name, "label": label,
+                "active": self._active_ordering(route) or "",
+                "order": [{"upstream": u, "model": m} for u, m in keys],
+                "entries": [{"upstream": e.upstream_id, "model": e.model,
+                             "enabled": e.enabled, "quota": e.quota}
+                            for e in route.entries]}
+
+    def set_quota(self, name: str, items: list[dict]) -> dict:
+        """设置某个分组里各上游的调用额度。
+
+        items 里每一项形如 {"upstream": "u1", "model": "ds1", "quota": 0}。
+        model 省略时匹配这个上游在该分组里的任意成员。
+        quota 为 null / 空 = 不限量；0 = 不调用它（调用时跳过、排序时沉到最后）。
+        """
+        route = self._route_or_raise(name)
+        if not isinstance(items, list) or not items:
+            raise ValueError("没有要设置的额度")
+
+        applied: list[dict] = []
+        for it in items:
+            if not isinstance(it, dict):
+                continue
+            uid = str(it.get("upstream") or "")
+            mid = it.get("model")
+            mid = str(mid) if mid not in (None, "") else None
+            raw = it.get("quota")
+            if raw == "":
+                raw = None
+            try:
+                quota = None if raw is None else int(raw)
+            except (TypeError, ValueError):
+                raise ValueError(f"额度必须是整数或留空: {raw!r}")
+            # 负数没意义，当「不限量」
+            if quota is not None and quota < 0:
+                quota = None
+
+            hit = None
+            for e in route.entries:
+                if e.upstream_id != uid:
+                    continue
+                if mid is not None and e.model != mid:
+                    continue
+                hit = e
+                break
+            if hit is None:
+                continue            # 这个上游不在该分组里，跳过
+            hit.quota = quota
+            applied.append({"upstream": hit.upstream_id, "model": hit.model,
+                            "quota": quota, "skipped": quota == 0})
+
+        if not applied:
+            raise KeyError("这个分组里没有匹配的上游")
+        self._save_state()
+        return {"ok": True, "name": route.name, "applied": applied,
+                "entries": [{"upstream": e.upstream_id, "model": e.model,
+                             "enabled": e.enabled, "quota": e.quota}
+                            for e in route.entries]}
 
     def delete_model(self, name: str) -> dict:
         if name not in self.models:
             raise KeyError(f"没有配置模型 {name!r}")
         del self.models[name]
+        # 记一笔：这是用户明确删的。sync_routes 是按「勾选+分组」自动重建路由的，
+        # 不记住删除，下一次任何勾选变化都会把它建回来（删了又冒出来）。
+        self.suppressed_models.add(name)
         self._save_state()
         return {"ok": True, "deleted": name}
 
@@ -1317,6 +2584,8 @@ class Router:
             entries = [{"upstream": u.id, "model": real, "enabled": True}
                        for u, real in by_group[group]]
             self.models[group] = ModelRoute(group, {"strategy": strat, "entries": entries})
+            # 「自动配好」是用户点名要配的，撤销此前的删除抑制
+            self.suppressed_models.discard(group)
             created.append(group)
         self._save_state()
         return {"ok": True, "created": created, "skipped": skipped}
@@ -1400,6 +2669,9 @@ class Router:
             for e in route.entries:
                 if not e.enabled:
                     continue
+                # 额度设成 0 = 这家不用，调用时直接跳过
+                if e.skipped():
+                    continue
                 up = self.find_upstream(e.upstream_id)
                 if up is None or not up.enabled:
                     continue
@@ -1407,7 +2679,7 @@ class Router:
             source = "配置"
             if pairs:
                 return self._order(pairs, route.strategy, model), source
-            # 配了但全被停用/删光，退回自动
+            # 配了但全被停用/删光/额度为 0，退回自动
             source = "配置为空，自动"
 
         # 没配过分组：先看有没有上游把这个名字当分组名（勾选过的），
@@ -1456,8 +2728,18 @@ class Router:
     def call_stats(self) -> dict:
         """按分组、以及分组×上游 汇总调用次数和 token 用量。
 
-        数据来源是 history（最近 200 条），好处是重启后清空、
-        不会和历史记录对不上；坏处是只反映最近这些请求。
+        分两个层面统计，和界面上的两处数字严格对应：
+
+        - 请求层面（calls/ok/failed）：一次客户端请求算一次，
+          只看最终结果。和左上角「总请求 / 成功 / 失败」一致。
+        - 尝试层面（attempts，以及每个上游的 calls/ok/failed）：
+          请求发给上游算一次，失败换下一个也算。**和右上角上游卡片
+          的「请求 / 成功 / 失败」是同一口径**，这样一处失败不会只出现在一边。
+
+        数据来源是 history（内存里最近 maxlen 条明细），只反映最近这些请求。
+        它只用来给「刚发生、还没落进聚合」的几条补显示；
+        界面上的统计数字一律走 stats_range（今天/本月/全部），
+        那是全量累计、跨重启保留的，明细被裁剪不会让它缩水。
         """
         with self.lock:
             hist = list(self.history)
@@ -1467,7 +2749,8 @@ class Router:
             name = h.get("model") or "-"
             g = groups.setdefault(name, {
                 "group": name,
-                "calls": 0, "ok": 0, "failed": 0,
+                "calls": 0, "ok": 0, "failed": 0,      # 请求层面
+                "attempts": 0,                          # 尝试层面
                 "upstreams": {},
                 "usage": {},          # 合计
                 "total_elapsed": 0.0,
@@ -1479,21 +2762,41 @@ class Router:
                 g["failed"] += 1
             g["total_elapsed"] += float(h.get("elapsed_seconds") or 0)
 
-            up_name = h.get("upstream") or "-"
-            u = g["upstreams"].setdefault(up_name, {
-                "upstream": up_name, "calls": 0, "ok": 0, "failed": 0, "usage": {},
-            })
-            u["calls"] += 1
-            if h.get("ok"):
-                u["ok"] += 1
-            else:
-                u["failed"] += 1
+            # 这次请求依次试过的上游。老记录没有 trail 字段，
+            # 就退回用「最后落到的那家 + 本次结果」补一条，保证旧数据也能统计。
+            trail = h.get("trail")
+            if not trail:
+                trail = [{"upstream": h.get("upstream") or "-",
+                          "upstream_id": h.get("upstream_id"),
+                          "ok": bool(h.get("ok")),
+                          "model": h.get("effective_model"),
+                          "status": h.get("status")}]
 
-            use = h.get("usage") or {}
-            for key in ("input", "output", "total", "cache_read", "cache_write"):
-                if use.get(key) is not None:
-                    g["usage"][key] = g["usage"].get(key, 0) + int(use[key])
-                    u["usage"][key] = u["usage"].get(key, 0) + int(use[key])
+            usage_counted = False
+            for step in trail:
+                if not isinstance(step, dict):
+                    continue
+                up_name = step.get("upstream") or "-"
+                u = g["upstreams"].setdefault(up_name, {
+                    "upstream": up_name,
+                    "upstream_id": step.get("upstream_id"),
+                    "calls": 0, "ok": 0, "failed": 0, "usage": {},
+                })
+                u["calls"] += 1
+                g["attempts"] += 1
+                if step.get("ok"):
+                    u["ok"] += 1
+                else:
+                    u["failed"] += 1
+                # token 用量只算一次（算在实际处理成功的那一步上），
+                # 不然一次请求试了三家会把用量记三遍
+                if not usage_counted and step.get("ok"):
+                    usage_counted = True
+                    use = h.get("usage") or {}
+                    for key in ("input", "output", "total", "cache_read", "cache_write"):
+                        if use.get(key) is not None:
+                            g["usage"][key] = g["usage"].get(key, 0) + int(use[key])
+                            u["usage"][key] = u["usage"].get(key, 0) + int(use[key])
 
         out: list[dict] = []
         for name, g in groups.items():
@@ -1503,6 +2806,7 @@ class Router:
                 "calls": g["calls"],
                 "ok": g["ok"],
                 "failed": g["failed"],
+                "attempts": g["attempts"],
                 "avg_elapsed": round(g["total_elapsed"] / g["calls"], 3) if g["calls"] else 0,
                 "usage": g["usage"],
                 "upstreams": ups,
@@ -1510,8 +2814,8 @@ class Router:
             })
         out.sort(key=lambda x: -x["calls"])
 
-        # 总量
-        totals = {"calls": len(hist), "ok": 0, "failed": 0,
+        # 总量（请求层面 + 尝试层面，两个口径都给）
+        totals = {"calls": len(hist), "ok": 0, "failed": 0, "attempts": 0,
                   "input": 0, "output": 0, "total": 0,
                   "cache_read": 0, "cache_write": 0}
         for h in hist:
@@ -1519,32 +2823,75 @@ class Router:
                 totals["ok"] += 1
             else:
                 totals["failed"] += 1
+            trail = h.get("trail") or []
+            totals["attempts"] += len(trail) if trail else 1
             use = h.get("usage") or {}
             for key in ("input", "output", "total", "cache_read", "cache_write"):
                 if use.get(key) is not None:
                     totals[key] += int(use[key])
 
-        return {"groups": out, "totals": totals, "history_limit": self.history.maxlen}
+        # 各上游的尝试汇总（跨分组），和右上角卡片同口径，方便一眼对照
+        per_upstream: dict[str, dict] = {}
+        for g in out:
+            for u in g["upstreams"]:
+                agg = per_upstream.setdefault(u["upstream"], {
+                    "upstream": u["upstream"], "calls": 0, "ok": 0, "failed": 0})
+                agg["calls"] += u["calls"]
+                agg["ok"] += u["ok"]
+                agg["failed"] += u["failed"]
+        upstreams = sorted(per_upstream.values(), key=lambda x: -x["calls"])
+
+        return {"groups": out, "totals": totals, "upstreams": upstreams,
+                "history_limit": self.history.maxlen,
+                "history_count": len(hist)}
 
     # ---- 快照 ----
     def snapshot(self) -> dict:
         with self.lock:
             history = list(self.history)
+
+        # 上游卡片上的「请求/成功/失败」改用**落盘聚合**的数字（跨重启不归零）。
+        # 以前用 Upstream.requests 这种内存计数，重启就回零，于是
+        # 左侧说 375、右侧说 188 —— 两个口径必然打架。
+        per_up = {}
+        for name, sub in (self.stats.totals.get("upstreams") or {}).items():
+            if isinstance(sub, dict):
+                per_up[name] = {
+                    "requests": sub.get("calls", 0),
+                    "successes": sub.get("ok", 0),
+                    "failures": sub.get("failed", 0),
+                }
+
+        ups_out = []
+        for u in self.upstreams:
+            snap = u.snapshot()
+            persistent = per_up.get(u.name)
+            if persistent is not None:
+                snap["requests"] = persistent["requests"]
+                snap["successes"] = persistent["successes"]
+                snap["failures"] = persistent["failures"]
+                snap["counters_persistent"] = True
+            else:
+                snap["counters_persistent"] = False
+            ups_out.append(snap)
+
         return {
             "version": __version__,
             "config_path": os.path.abspath(self.config_path),
             "state_path": os.path.abspath(self._state_path()),
+            "journal": self.stats.journal_info(),
             "uptime_seconds": round(time.time() - self.started_at, 1),
             "total_requests": self.total_requests,
             "failure_threshold": self.failure_threshold,
             "cooldown_seconds": self.cooldown_default,
             "default_strategy": self.default_strategy,
             "history": history,
-            "upstreams": [u.snapshot() for u in self.upstreams],
+            "suppressed_models": sorted(self.suppressed_models),
+            "upstreams": ups_out,
             "models": {
                 name: {
                     **route.state(),
-                    # 每个成员：上游名 + 那边用的真实模型名
+                    # 每个成员：上游名 + 那边用的真实模型名 + 额度
                     "members": [
                         {
                             "upstream": e.upstream_id,
@@ -1553,6 +2900,7 @@ class Router:
                             "model": e.model,
                             "renamed": e.model != name,
                             "enabled": e.enabled,
+                            "quota": e.quota,
                         }
                         for e in route.entries
                     ],
@@ -1563,8 +2911,11 @@ class Router:
                     "real_models": sorted({e.model for e in route.entries}),
                     "resolved_count": len([
                         e for e in route.entries
-                        if e.enabled and (u := self.find_upstream(e.upstream_id)) and u.enabled
+                        if e.enabled and not e.skipped()
+                        and (u := self.find_upstream(e.upstream_id)) and u.enabled
                     ]),
+                    # 当前顺序对应哪套具名排序
+                    "active_ordering": self._active_ordering(route),
                 }
                 for name, route in self.models.items()
             },
@@ -1645,8 +2996,14 @@ class Handler(BaseHTTPRequestHandler):
     def router(self) -> Router:
         return self.server.router  # type: ignore[attr-defined]
 
+    # 请求体缓存：审计要先读一次，业务逻辑还要再读 —— HTTP 流只能读一次
+    _body_cache: Optional[bytes] = None
+    _audit_body: Optional[bytes] = None
+
     def setup(self) -> None:
         super().setup()
+        self._body_cache = None
+        self._audit_body = None
         try:
             self.connection.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
         except OSError:
@@ -1661,7 +3018,16 @@ class Handler(BaseHTTPRequestHandler):
         super().send_header(keyword, header_value(value))
 
     def handle_one_request(self) -> None:
-        """把客户端断开当成正常事件，别刷一堆 traceback。"""
+        """把客户端断开当成正常事件，别刷一堆 traceback。
+
+        另外：HTTP/1.1 长连接下，同一个 handler 实例会连续处理多条请求，
+        请求体缓存 _body_cache / _audit_body 必须在每条请求开头清空。
+        只在 setup 里清是不够的 —— setup 每条连接只跑一次，
+        第二条请求会读到上一条缓存的 body，表现为「点了没反应 / 要点很多次」，
+        而且真正的 body 还留在 socket 里，会把下一条请求也搞坏。
+        """
+        self._body_cache = None
+        self._audit_body = None
         try:
             super().handle_one_request()
         except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
@@ -1703,9 +3069,54 @@ class Handler(BaseHTTPRequestHandler):
                 return
 
             if path in ("/stats", "/admin/stats"):
-                return self._send_json(200, self.router.snapshot())
+                query = urllib.parse.parse_qs(urllib.parse.urlsplit(self.path).query)
+                rng = (query.get("range") or [""])[0]
+                out = self.router.snapshot()
+                if rng:
+                    # 跨重启的聚合统计（今天 / 本月 / 全部），不会随进程清零
+                    out["stats"] = self.router.stats.meta()
+                    out["stats_range"] = self.router.stats.snap_range(rng)
+                return self._send_json(200, out)
             if path == "/admin/history":
                 return self._send_json(200, {"history": list(self.router.history)})
+            if path == "/admin/admin-log":
+                query = urllib.parse.parse_qs(urllib.parse.urlsplit(self.path).query)
+                try:
+                    limit = int((query.get("limit") or ["200"])[0])
+                except (TypeError, ValueError):
+                    limit = 200
+                return self._send_json(200, {"log": self.router.read_admin_log(limit)})
+            if path == "/admin/journal/files":
+                return self._send_json(200, {"files": [
+                    {"path": os.path.basename(p),
+                     "size": (os.path.getsize(p) if os.path.exists(p) else 0)}
+                    for p in self.router.stats.journal_files()]})
+            if path == "/admin/journal/entry":
+                # 单条完整记录（含输入输出正文），用户展开详情时才取
+                q = urllib.parse.parse_qs(urllib.parse.urlsplit(self.path).query)
+                at = (q.get("at") or [""])[0]
+                upstream = (q.get("upstream") or [""])[0]
+                entry = self.router.stats.find_journal_entry(at, upstream)
+                if entry is None:
+                    return self._send_json(404, {"error": {"message": "找不到这条记录"}})
+                return self._send_json(200, {"entry": entry})
+            if path == "/admin/journal/index":
+                # 流水里有数据的日期/月/分组以及各自条数（前端做筛选下拉）
+                return self._send_json(200, self.router.stats.journal_index())
+            if path == "/admin/journal":
+                # 全量流水翻页：按天/月/分组筛，条件是查询参数
+                q = urllib.parse.parse_qs(urllib.parse.urlsplit(self.path).query)
+
+                def one(key, default=""):
+                    return (q.get(key) or [default])[0]
+
+                return self._send_json(200, self.router.stats.query_journal(
+                    day=one("day"), month=one("month"), group=one("group"),
+                    upstream=one("upstream"),
+                    offset=one("offset", "0"), limit=one("limit", "100"),
+                    with_text=one("with_text", "") in ("1", "true", "yes")))
+            if path == "/admin/state/versions":
+                return self._send_json(200, {"versions": self.router.list_state_versions()})
 
             handlers = {
                 "/admin/upstream/add": self._h_upstream_add,
@@ -1717,14 +3128,25 @@ class Handler(BaseHTTPRequestHandler):
                 "/admin/rename-group": self._h_rename_group,
                 "/admin/model/save": self._h_model_save,
                 "/admin/model/delete": self._h_model_delete,
+                "/admin/model/orderings": self._h_model_orderings,
+                "/admin/model/order/save": self._h_order_save,
+                "/admin/model/order/apply": self._h_order_apply,
+                "/admin/model/order/delete": self._h_order_delete,
+                "/admin/model/reorder-by-speed": self._h_reorder_by_speed,
+                "/admin/model/quota": self._h_model_quota,
                 "/admin/auto-configure": self._h_auto_configure,
                 "/admin/speedtest": self._h_speedtest,
                 "/admin/reset": self._h_reset,
                 "/admin/reset-to-config": self._h_reset_to_config,
+                "/admin/state/restore": self._h_state_restore,
+                "/admin/journal/rotate": self._h_journal_rotate,
+                "/admin/stats/rebuild": self._h_stats_rebuild,
             }
             if path in handlers:
                 if method != "POST":
                     return self._send_json(405, {"error": {"message": f"{path} 需要 POST"}})
+                # 改配置的操作都要留痕：谁、什么时候、来自哪里、改成了什么
+                self._audit(path)
                 return handlers[path]()
 
             if path.startswith("/v1/"):
@@ -1747,6 +3169,35 @@ class Handler(BaseHTTPRequestHandler):
             self.send_header("Access-Control-Allow-Origin", "*")
             self.send_header("Access-Control-Allow-Headers", "*")
             self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+
+    # 哪些管理接口前后会改变状态，值得记一笔审计
+    AUDIT_DETAIL_KEYS = ("id", "name", "upstream", "model", "models", "from", "to",
+                         "enabled", "mapping", "entries", "label", "strategy")
+
+    def _audit(self, path: str) -> None:
+        """把这次管理调用记进审计日志（读 body 前先缓存，免得流被消费掉）。"""
+        if self._audit_body is None:
+            try:
+                raw = self._read_body()
+            except Exception:  # noqa: BLE001
+                raw = b""
+            self._audit_body = raw
+        detail: dict = {}
+        try:
+            if self._audit_body:
+                parsed = json.loads(self._audit_body)
+                if isinstance(parsed, dict):
+                    for key in self.AUDIT_DETAIL_KEYS:
+                        if key in parsed:
+                            value = parsed[key]
+                            # 密钥只留提示，别把真 Key 写进日志
+                            if key == "api_key":
+                                value = mask_key(str(value))
+                            detail[key] = value
+        except Exception:  # noqa: BLE001
+            pass
+        self.router.admin_log(path, detail, actor=self.client_address[0]
+                              if self.client_address else "-")
 
     def _send_json(self, status: int, obj: Any) -> None:
         body = json.dumps(obj, ensure_ascii=False, indent=2).encode("utf-8")
@@ -1774,6 +3225,13 @@ class Handler(BaseHTTPRequestHandler):
 
     # ---- 读请求体 ----
     def _read_body(self) -> bytes:
+        # 审计需要先读一次 body（HTTP 流只能读一次），缓存起来给业务逻辑复用
+        if self._body_cache is not None:
+            return self._body_cache
+        self._body_cache = self._read_body_raw()
+        return self._body_cache
+
+    def _read_body_raw(self) -> bytes:
         limit = int(self.router.max_body_mb * 1024 * 1024)
         te = (self.headers.get("Transfer-Encoding") or "").lower()
         if "chunked" in te:
@@ -1919,6 +3377,79 @@ class Handler(BaseHTTPRequestHandler):
         status, out = self._result(go)
         self._send_json(status, out)
 
+    def _h_model_orderings(self) -> None:
+        """列出某个分组的所有具名排序。"""
+        def go():
+            payload = self._read_json_body()
+            return self.router.list_orderings(str(payload.get("name") or ""))
+        status, out = self._result(go)
+        self._send_json(status, out)
+
+    def _h_order_save(self) -> None:
+        """把一套顺序存成具名排序；body 里带 order 就顺带把它应用上去。"""
+        def go():
+            payload = self._read_json_body()
+            order = payload.get("order")
+            if order is not None and not isinstance(order, list):
+                raise ValueError("order 必须是数组")
+            return self.router.save_ordering(
+                str(payload.get("name") or ""), str(payload.get("label") or ""), order)
+        status, out = self._result(go)
+        self._send_json(status, out)
+
+    def _h_order_apply(self) -> None:
+        """切换到某套已保存的排序。"""
+        def go():
+            payload = self._read_json_body()
+            return self.router.apply_ordering(
+                str(payload.get("name") or ""), str(payload.get("label") or ""))
+        status, out = self._result(go)
+        self._send_json(status, out)
+
+    def _h_order_delete(self) -> None:
+        def go():
+            payload = self._read_json_body()
+            return self.router.delete_ordering(
+                str(payload.get("name") or ""), str(payload.get("label") or ""))
+        status, out = self._result(go)
+        self._send_json(status, out)
+
+    def _h_reorder_by_speed(self) -> None:
+        """按测速结果重排某个分组，并保存成一套具名排序。"""
+        def go():
+            payload = self._read_json_body()
+            name = str(payload.get("name") or "")
+            label = str(payload.get("label") or "按测速")
+            results = payload.get("results")
+            return self.router.reorder_by_speed(name, label, results)
+        status, out = self._result(go)
+        self._send_json(status, out)
+
+    def _h_model_quota(self) -> None:
+        """设置某个分组里各上游的调用额度（0 = 不调用它）。
+
+        两种写法都认：
+          {"name":"deepseek","upstream":"u1","model":"ds1","quota":0}     单条
+          {"name":"deepseek","entries":[{"upstream":"u1","quota":0}, ...]} 批量
+        """
+        def go():
+            payload = self._read_json_body()
+            name = str(payload.get("name") or "")
+            raw_entries = payload.get("entries")
+            if raw_entries is not None and not isinstance(raw_entries, list):
+                raise ValueError("entries 必须是数组")
+            if raw_entries is not None and not raw_entries:
+                raise ValueError("entries 不能为空")
+            items = [e for e in (raw_entries or []) if isinstance(e, dict)]
+            if not items:
+                # 单条写法：把整份 payload 当成一条
+                items = [{"upstream": payload.get("upstream"),
+                          "model": payload.get("model"),
+                          "quota": payload.get("quota")}]
+            return self.router.set_quota(name, items)
+        status, out = self._result(go)
+        self._send_json(status, out)
+
     def _h_auto_configure(self) -> None:
         def go():
             payload = self._read_json_body()
@@ -1991,16 +3522,41 @@ class Handler(BaseHTTPRequestHandler):
         self._send_json(status, out)
 
     def _h_reset(self) -> None:
+        """已停用：不再清除统计和流水。
+
+        只允许「冷却复位」这种不丢数据的操作（上游失败计数归零，
+        让它立刻重新参与路由）—— 统计和请求流水一律保留。
+        """
         for u in self.router.upstreams:
             u.reset_stats()
-        with self.router.lock:
-            self.router.history.clear()
-            self.router.total_requests = 0
-            self.router.rr_counters.clear()
-        self._send_json(200, {"ok": True, "message": "统计与冷却已清零"})
+        self.router.rr_counters.clear()
+        self.router.admin_log("reset-cooldown-only", {"note": "仅复位冷却，不动统计"})
+        self._send_json(200, {"ok": True, "message": "冷却与失败计数已复位（统计和流水保留）"})
 
     def _h_reset_to_config(self) -> None:
         status, out = self._result(self.router.reset_to_config)
+        self._send_json(status, out)
+
+    def _h_state_restore(self) -> None:
+        """按快照文件名回退状态（回退前会先把当前状态存成快照，可再退回来）。"""
+        def go():
+            payload = self._read_json_body()
+            return self.router.restore_state_version(str(payload.get("file") or ""))
+        status, out = self._result(go)
+        self._send_json(status, out)
+
+    def _h_journal_rotate(self) -> None:
+        """把当前流水归档（改名保留），立刻另起一份空的接着写。"""
+        def go():
+            archived = self.router.stats.rotate_journal_now()
+            return {"ok": True, "archived": os.path.basename(archived) if archived else None,
+                    "note": "归档文件保留，不会被删除"}
+        status, out = self._result(go)
+        self._send_json(status, out)
+
+    def _h_stats_rebuild(self) -> None:
+        """以流水为准，彻底重算累计统计（聚合落后于流水时用）。"""
+        status, out = self._result(self.router.stats.rebuild_stats_from_journal)
         self._send_json(status, out)
 
     # ---- 历史记录 ----
@@ -2011,7 +3567,8 @@ class Handler(BaseHTTPRequestHandler):
                         usage: Optional[dict] = None,
                         request_text: Optional[str] = None,
                         response_text: Optional[str] = None,
-                        reasoning_text: Optional[str] = None) -> None:
+                        reasoning_text: Optional[str] = None,
+                        trail: Optional[list[dict]] = None) -> None:
         entry = {
             "at": time.time(),
             "time": time.strftime("%H:%M:%S"),
@@ -2033,10 +3590,16 @@ class Handler(BaseHTTPRequestHandler):
             "response_text": (response_text or "")[:HISTORY_TEXT_LIMIT] or None,
             # 推理模型的思考过程（DeepSeek-R1 这类会单独吐 reasoning_content）
             "reasoning_text": (reasoning_text or "")[:HISTORY_TEXT_LIMIT] or None,
+            # 这次请求依次试过的每个上游和各自结果。
+            # 「上游」「ok」只是最后一家，中间失败的靠这个才看得见 ——
+            # 右侧卡片记的是「每次尝试」，左侧统计要能对上就得留这份轨迹。
+            "trail": trail or [],
         }
         with self.router.lock:
             self.router.history.append(entry)
             self.router.total_requests += 1
+        # 落盘放在锁外，磁盘写不拖住并发的请求
+        self.router.stats.record(entry)
 
     # ---- 核心代理 ----
     def _proxy(self, method: str, path: str) -> None:
@@ -2065,14 +3628,21 @@ class Handler(BaseHTTPRequestHandler):
         t_start = time.time()
         last: Optional[Retryable] = None
         attempts_log: list[tuple[Upstream, str]] = []
+        # 这次请求试过谁、结果如何。失败的上游也记进来，
+        # 左侧统计靠它才能和右侧卡片的「请求/成功/失败」对上。
+        trail: list[dict] = []
         for i, (up, eff_model) in enumerate(pairs):
             try:
                 self._try_upstream(up, eff_model, method, path, payload, raw_body,
-                                   requested_model, route_source, attempts=len(pairs))
+                                   requested_model, route_source, attempts=len(pairs),
+                                   trail=trail)
                 return
             except Retryable as exc:
                 last = exc
                 attempts_log.append((up, exc.reason))
+                trail.append({"upstream": up.name, "upstream_id": up.id, "ok": False,
+                              "model": eff_model, "status": exc.status,
+                              "reason": exc.reason})
                 remaining = len(pairs) - i - 1
                 if remaining > 0:
                     self.log_message("上游 %s 失败(%s)，换下一个（还剩 %d 个）",
@@ -2082,7 +3652,8 @@ class Handler(BaseHTTPRequestHandler):
         if last is not None:
             self._record_history(last.upstream, requested_model, "-", last.status,
                                  time.time() - t_start, last.reason,
-                                 attempts=len(pairs), route_source=route_source)
+                                 attempts=len(pairs), route_source=route_source,
+                                 trail=trail)
             self.close_connection = False
             body = last.body
             try:
@@ -2107,7 +3678,8 @@ class Handler(BaseHTTPRequestHandler):
     def _try_upstream(self, up: Upstream, eff_model: str, method: str, path: str,
                       payload: Optional[dict], raw_body: bytes,
                       requested_model: Optional[str], route_source: str,
-                      attempts: int) -> None:
+                      attempts: int, trail: Optional[list[dict]] = None) -> None:
+        trail = trail if trail is not None else []
         data = raw_body or None
         if payload is not None and requested_model and eff_model != requested_model:
             new_payload = dict(payload)
@@ -2153,15 +3725,19 @@ class Handler(BaseHTTPRequestHandler):
             up._close(conn)
             up.record_neutral(f"HTTP {status}")
             self._relay_json(status, resp, body, up.name, time.time() - t0)
+            trail.append({"upstream": up.name, "upstream_id": up.id, "ok": False,
+                          "model": eff_model, "status": status, "client_error": True,
+                          "reason": f"客户端错误 HTTP {status}"})
             self._record_history(up, requested_model, eff_model or "-", status,
                                  time.time() - t0, f"客户端错误 HTTP {status}",
-                                 attempts=attempts, route_source=route_source)
+                                 attempts=attempts, route_source=route_source,
+                                 trail=trail)
             return
 
         # 3) 流式
         if "text/event-stream" in ctype:
             self._relay_stream(conn, resp, up, requested_model, eff_model, t0,
-                               route_source, attempts, payload)
+                               route_source, attempts, payload, trail)
             return
 
         # 4) 非流式
@@ -2181,12 +3757,15 @@ class Handler(BaseHTTPRequestHandler):
         resp_text, usage, reasoning = response_to_text(body)
         up.record_success(latency)
         self._relay_json(status, resp, body, up.name, latency=latency, effective=eff_model)
+        trail.append({"upstream": up.name, "upstream_id": up.id, "ok": True,
+                      "model": eff_model, "status": status, "reason": ""})
         self._record_history(up, requested_model, eff_model or "-", status, latency,
                              attempts=attempts, route_source=route_source,
                              usage=usage,
                              request_text=messages_to_text(payload),
                              response_text=resp_text,
-                             reasoning_text=reasoning)
+                             reasoning_text=reasoning,
+                             trail=trail)
 
     def _relay_json(self, status: int, resp, body: bytes, upstream_name: str,
                     latency: float = 0.0, effective: Optional[str] = None) -> None:
@@ -2206,7 +3785,9 @@ class Handler(BaseHTTPRequestHandler):
 
     def _relay_stream(self, conn, resp, up: Upstream, requested_model: Optional[str],
                       eff_model: Optional[str], t0: float, route_source: str,
-                      attempts: int, payload: Optional[dict] = None) -> None:
+                      attempts: int, payload: Optional[dict] = None,
+                      trail: Optional[list[dict]] = None) -> None:
+        trail = trail if trail is not None else []
         headers_sent = False
         acc = make_sse_collector()      # 边转发边攒文本和 token 用量
         try:
@@ -2262,13 +3843,16 @@ class Handler(BaseHTTPRequestHandler):
 
             latency = first_byte_at - t0
             up.record_success(latency)
+            trail.append({"upstream": up.name, "upstream_id": up.id, "ok": True,
+                          "model": eff_model, "status": resp.status, "reason": ""})
             self._record_history(up, requested_model, eff_model or "-", resp.status,
                                  latency, stream=True, attempts=attempts,
                                  route_source=route_source,
                                  usage=acc["usage"],
                                  request_text=messages_to_text(payload),
                                  response_text="".join(acc["text"]),
-                                 reasoning_text="".join(acc["reasoning"]))
+                                 reasoning_text="".join(acc["reasoning"]),
+                                 trail=trail)
             self.log_message("流式：上游=%s 首字节=%.2fs 模型=%s",
                              up.name, latency, eff_model or requested_model)
         except Retryable:
@@ -2277,11 +3861,23 @@ class Handler(BaseHTTPRequestHandler):
             up.record_neutral("客户端提前断开")
             self.close_connection = True
         except Exception as exc:  # noqa: BLE001
-            up.record_failure(f"流中断: {type(exc).__name__}: {exc}",
-                              self.router.failure_threshold, up.cooldown)
+            reason = f"流中断: {type(exc).__name__}: {exc}"
+            up.record_failure(reason, self.router.failure_threshold, up.cooldown)
             self.close_connection = True
             if not headers_sent:
                 raise Retryable(up, 502, b"", f"流式响应失败: {exc}") from exc
+            # 响应头已经发出去了，没法再换上游，但这个失败也要留在记录里，
+            # 否则右侧卡片记了失败、左侧统计却没有，两边又对不上
+            trail.append({"upstream": up.name, "upstream_id": up.id, "ok": False,
+                          "model": eff_model, "status": 502, "reason": reason})
+            self._record_history(up, requested_model, eff_model or "-", 502,
+                                 time.time() - t0, reason, stream=True,
+                                 attempts=attempts, route_source=route_source,
+                                 usage=acc["usage"],
+                                 request_text=messages_to_text(payload),
+                                 response_text="".join(acc["text"]),
+                                 reasoning_text="".join(acc["reasoning"]),
+                                 trail=trail)
         finally:
             up._close(conn)
 

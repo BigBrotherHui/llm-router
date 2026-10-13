@@ -23,6 +23,8 @@ UP_PORTS = {"a": 18721, "b": 18722, "c": 18723, "d": 18724}
 
 hits: dict[str, list] = {"a": [], "b": [], "c": [], "d": []}
 behavior: dict[str, str] = {"a": "ok", "b": "ok", "c": "ok", "d": "ok"}
+# 每个假上游的人工延迟（秒），用来让「按测速重排」的结果可预测
+delay: dict[str, float] = {"a": 0.0, "b": 0.0, "c": 0.0, "d": 0.0}
 last_error_payload: dict[str, bytes] = {}
 lock = threading.Lock()
 
@@ -119,6 +121,9 @@ class UpstreamServer(BaseHTTPRequestHandler):
         with lock:
             hits[self.tag].append(model)
             behave = behavior[self.tag]
+            wait = delay.get(self.tag, 0.0)
+        if wait:
+            time.sleep(wait)
 
         if behave == "fail500":
             return self._json(500, {"error": {"message": f"{self.tag} 挂了"}})
@@ -236,6 +241,29 @@ entries = [
 ]
 """
 
+# 配置文件里预写额度（quota）和具名排序（orderings）—— 验证这两项也认配置文件
+CONFIG_WITH_QUOTA_AND_ORDERINGS = CONFIG_TMPL + """
+[models."deepseek-chat"]
+strategy = "priority"
+entries = [
+  {{ upstream = "a1", model = "deepseek-chat" }},
+  {{ upstream = "b1", model = "deepseek-chat", quota = 0 }},
+  {{ upstream = "c1", model = "deepseek-chat" }},
+]
+
+[models."deepseek-chat".orderings]
+"原始" = [
+  {{ upstream = "a1", model = "deepseek-chat" }},
+  {{ upstream = "b1", model = "deepseek-chat" }},
+  {{ upstream = "c1", model = "deepseek-chat" }},
+]
+"快的先" = [
+  {{ upstream = "c1", model = "deepseek-chat" }},
+  {{ upstream = "a1", model = "deepseek-chat" }},
+  {{ upstream = "b1", model = "deepseek-chat" }},
+]
+"""
+
 # ABCD 四个上游，同一家的 deepseek 分别叫 ds1/ds2/ds3/ds4
 # —— 用来验证「统一分组名 + 各家不同真实名」
 CONFIG_FOUR = """
@@ -277,13 +305,18 @@ api_key = "key-d"
 _counter = [0]
 
 
-def write_config(name_a="up-a", with_routes=False):
+def write_config(name_a="up-a", with_routes=False, history_limit=None):
     _counter[0] += 1
     path = os.path.join(HERE, f"_test_cfg{_counter[0]}.toml")
     tmpl = CONFIG_WITH_ROUTES if with_routes else CONFIG_TMPL
+    body = tmpl.format(port=PORT, pa=UP_PORTS["a"], pb=UP_PORTS["b"],
+                       pc=UP_PORTS["c"], name_a=name_a)
+    if history_limit:
+        # 加在 [router] 段里：明细上限可配，方便验证「截断但统计不缩水」
+        body = body.replace("[router]\n",
+                            f"[router]\nhistory_limit = {int(history_limit)}\n", 1)
     with open(path, "w", encoding="utf-8") as fh:
-        fh.write(tmpl.format(port=PORT, pa=UP_PORTS["a"], pb=UP_PORTS["b"],
-                             pc=UP_PORTS["c"], name_a=name_a))
+        fh.write(body)
     return path
 
 
@@ -294,6 +327,17 @@ def write_config_four():
     with open(path, "w", encoding="utf-8") as fh:
         fh.write(CONFIG_FOUR.format(port=PORT, pa=UP_PORTS["a"], pb=UP_PORTS["b"],
                                     pc=UP_PORTS["c"], pd=UP_PORTS["d"]))
+    return path
+
+
+def write_config_quota():
+    """配置里预写 quota 和 orderings 的配置。"""
+    _counter[0] += 1
+    path = os.path.join(HERE, f"_test_quota{_counter[0]}.toml")
+    with open(path, "w", encoding="utf-8") as fh:
+        fh.write(CONFIG_WITH_QUOTA_AND_ORDERINGS.format(
+            port=PORT, pa=UP_PORTS["a"], pb=UP_PORTS["b"], pc=UP_PORTS["c"],
+            name_a="up-a"))
     return path
 
 
@@ -386,6 +430,15 @@ def cleanup():
                     os.remove(os.path.join(state_dir, f))
                 except OSError:
                     pass
+        # 快照目录同理：只删 _test_ 派生的那些
+        versions = os.path.join(state_dir, "versions")
+        if os.path.isdir(versions):
+            for f in os.listdir(versions):
+                if f.startswith("_test_"):
+                    try:
+                        os.remove(os.path.join(versions, f))
+                    except OSError:
+                        pass
 
 
 def main():
@@ -499,6 +552,28 @@ def main():
 
         st, r = admin("/admin/model/save", {"name": "x", "strategy": "priority", "entries": []})
         check("空 entries 被拒绝", st == 400, str(r)[:160])
+
+        # 禁用式路由：把某条 entry 的 enabled 设为 false 再保存；
+        # 该条依然留在配置里（下次重新勾上就能恢复），调用时跳过它
+        admin("/admin/model/save", {
+            "name": "deepseek-chat", "strategy": "priority",
+            "entries": [
+                {"upstream": "a1", "model": "deepseek-chat", "enabled": True},
+                {"upstream": "c1", "model": "deepseek-chat", "enabled": False},
+            ]})
+        reset_hits()
+        st, body, hdr = post()
+        check("禁用条目仍留在配置里但调用被跳过",
+              st == 200 and hdr.get("X-Upstream") == "up-a",
+              f"status={st} up={hdr.get('X-Upstream')} hits={hits}")
+        st, snap = get("/stats")
+        check("禁用条目仍存在于 snap 中",
+              len(snap["models"]["deepseek-chat"]["entries"]) == 2,
+              str(snap["models"]["deepseek-chat"]["entries"]))
+        c1 = next(e for e in snap["models"]["deepseek-chat"]["entries"]
+                  if e["upstream"] == "c1")
+        check("该条在 snap 里保持 enabled=false", c1.get("enabled") is False,
+              str(c1))
 
         st, r = admin("/admin/model/delete", {"name": "glm-4.6"})
         check("删除模型路由成功", st == 200 and r.get("ok"), str(r)[:160])
@@ -872,11 +947,14 @@ def main():
     cfg = write_config(with_routes=True)
     p = start_router(cfg)
     try:
-        admin("/admin/reset")
+        # 统计与流水不再提供清除入口（cleanup() 已经清掉上一轮的测试状态文件），
+        # 所以这里直接用差量断言，不再依赖 /admin/reset 归零。
+        st, raw = get("/admin/history")
+        base = len(raw.get("history") or [])
         post()
         post(path="/v1/chat/completions/stream")
         st, raw = get("/admin/history")
-        hist = raw.get("history") or []
+        hist = (raw.get("history") or [])[base:]
         check("记录了 2 条", len(hist) == 2, str(len(hist)))
         check("记录了上游名和状态",
               all(h.get("upstream") and h.get("status") for h in hist), str(hist)[:200])
@@ -1183,6 +1261,14 @@ def main():
         check("保存时自动留下 .bak 备份", os.path.exists(test_state + ".bak"),
               test_state + ".bak")
 
+        # 多版本快照：单份 .bak 会被下一次保存挤掉，所以另外留带时间戳的多份
+        versions_dir = os.path.join(HERE, ".llmrouter", "versions")
+        snaps = [f for f in os.listdir(versions_dir)] if os.path.isdir(versions_dir) else []
+        check("保存时轮转出多份带时间戳的快照", len(snaps) >= 2,
+              f"count={len(snaps)} {snaps[:5]}")
+        check("快照文件名带 .state. 前缀",
+              all(".state." in f for f in snaps[:5]), str(snaps[:5]))
+
         st, r = admin("/admin/reset-to-config")
         trash = os.path.join(HERE, ".llmrouter", "trash")
         trashed = [f for f in os.listdir(trash)] if os.path.isdir(trash) else []
@@ -1210,7 +1296,6 @@ def main():
         st, snap = get("/stats")
         check("分组已建立（三家合并成 deepseek）",
               "deepseek" in (snap.get("models") or {}), str(list((snap.get("models") or {}))))
-        admin("/admin/reset")
 
         # 非流式请求：应记录 usage 和输入输出
         st, body, hdr = post(body={"model": "deepseek",
@@ -1294,6 +1379,917 @@ def main():
         h = (raw.get("history") or [])[-1]
         n = len(h.get("request_text") or "")
         check("超长输入被截断保存", 0 < n <= 4000, str(n))
+    finally:
+        stop_router(p)
+
+    # ================= 21. 具名排序（原始顺序不丢）=================
+    print("\n[21] 具名排序：按测速重排，原顺序留着，可切回")
+    cleanup()
+    UP_MODELS.update(UP_MODELS_ABCD)          # 四家各叫 ds1..ds4
+    cfg = write_config_four()
+    p = start_router(cfg)
+    try:
+        admin("/admin/fetch-models")
+        for uid, real in [("a1", "ds1"), ("b1", "ds2"), ("c1", "ds3"), ("d1", "ds4")]:
+            admin("/admin/select-models", {"id": uid, "models": [real]})
+            admin("/admin/set-group", {"id": uid, "mapping": {real: "deepseek"}})
+
+        st, snap = get("/stats")
+        original = [e["upstream"] for e in snap["models"]["deepseek"]["entries"]]
+        check("初始顺序是 a→b→c→d", original == ["a1", "b1", "c1", "d1"], str(original))
+
+        # 还没保存过任何排序时，列表是空的
+        st, r = admin("/admin/model/orderings", {"name": "deepseek"})
+        check("未保存过排序时列表为空", st == 200 and r.get("orderings") == [], str(r)[:160])
+
+        # 让 d 最快、c 次之、b 再次、a 最慢
+        delay.update({"a": 0.30, "b": 0.20, "c": 0.10, "d": 0.0})
+        st, sp = admin("/admin/speedtest")
+        results = sp.get("results") or []
+        check("测速拿到四个上游的延迟",
+              len(results) == 4 and all(x.get("latency_seconds") is not None for x in results),
+              str([(x.get("id"), x.get("latency_seconds")) for x in results]))
+        delay.update({"a": 0.0, "b": 0.0, "c": 0.0, "d": 0.0})
+
+        # 按测速重排并存成一套具名排序
+        payload = [{"upstream": x["id"], "id": x["id"], "ok": x["ok"],
+                    "latency_seconds": x["latency_seconds"]} for x in results]
+        st, r = admin("/admin/model/reorder-by-speed",
+                      {"name": "deepseek", "label": "按测速", "results": payload})
+        check("按测速重排成功", st == 200 and r.get("label") == "按测速", str(r)[:200])
+        order = [o["upstream"] for o in r.get("order") or []]
+        check("快的排前面（d→c→b→a）", order == ["d1", "c1", "b1", "a1"], str(order))
+
+        st, snap = get("/stats")
+        entries = [e["upstream"] for e in snap["models"]["deepseek"]["entries"]]
+        check("重排后调用顺序就是测速顺序", entries == ["d1", "c1", "b1", "a1"], str(entries))
+        check("「原始」被自动记住", snap["models"]["deepseek"]["orderings"]["原始"]
+              == [{"upstream": u, "model": m} for u, m in
+                  [("a1", "ds1"), ("b1", "ds2"), ("c1", "ds3"), ("d1", "ds4")]],
+              str(snap["models"]["deepseek"]["orderings"].get("原始")))
+        check("stats 标出当前生效的排序",
+              snap["models"]["deepseek"]["active_ordering"] == "按测速",
+              str(snap["models"]["deepseek"].get("active_ordering")))
+
+        # 真的按新顺序调用
+        reset_hits()
+        st, body, hdr = post(body={"model": "deepseek", "messages": []})
+        check("重排后首选是最快的那家", st == 200 and hits["d"] == ["ds4"], str(hits))
+
+        # 再存一套：把顺序换成 c→b→a→d 并起个名字
+        st, r = admin("/admin/model/order/save", {
+            "name": "deepseek", "label": "手动排的",
+            "order": [{"upstream": "c1", "model": "ds3"},
+                      {"upstream": "b1", "model": "ds2"},
+                      {"upstream": "a1", "model": "ds1"},
+                      {"upstream": "d1", "model": "ds4"}]})
+        check("第二套排序保存成功", st == 200 and r.get("active") == "手动排的", str(r)[:200])
+        reset_hits()
+        st, body, hdr = post(body={"model": "deepseek", "messages": []})
+        check("第二套排序立即生效", hits["c"] == ["ds3"], str(hits))
+
+        st, r = admin("/admin/model/orderings", {"name": "deepseek"})
+        labels = set(o["label"] for o in r.get("orderings") or [])
+        check("三套排序都在（原始/按测速/手动排的）",
+              labels == {"原始", "按测速", "手动排的"}, str(labels))
+
+        # 切回「原始」：第一套顺序应完全恢复
+        st, r = admin("/admin/model/order/apply", {"name": "deepseek", "label": "原始"})
+        check("切回原始排序成功", st == 200 and r.get("active") == "原始", str(r)[:200])
+        st, snap = get("/stats")
+        back = [e["upstream"] for e in snap["models"]["deepseek"]["entries"]]
+        check("原始顺序完整恢复（a→b→c→d）", back == original, str(back))
+        reset_hits()
+        st, body, hdr = post(body={"model": "deepseek", "messages": []})
+        check("切回后按原始顺序走", hits["a"] == ["ds1"], str(hits))
+
+        # 切到「按测速」
+        st, r = admin("/admin/model/order/apply", {"name": "deepseek", "label": "按测速"})
+        check("切到按测速成功", st == 200 and r.get("active") == "按测速", str(r)[:200])
+        reset_hits()
+        st, body, hdr = post(body={"model": "deepseek", "messages": []})
+        check("按测速这套也是最快的先走", hits["d"] == ["ds4"], str(hits))
+
+        # 删掉一套：当前顺序不动
+        st, r = admin("/admin/model/order/delete", {"name": "deepseek", "label": "手动排的"})
+        check("删除一套排序成功", st == 200 and r.get("label") == "手动排的", str(r)[:200])
+        st, snap = get("/stats")
+        check("删排序不影响当前顺序",
+              [e["upstream"] for e in snap["models"]["deepseek"]["entries"]] == ["d1", "c1", "b1", "a1"],
+              str([e["upstream"] for e in snap["models"]["deepseek"]["entries"]]))
+
+        st, r = admin("/admin/model/order/delete", {"name": "deepseek", "label": "原始"})
+        check("拒绝删除「原始」", st == 400, str(r)[:160])
+        st, r = admin("/admin/model/order/apply", {"name": "deepseek", "label": "不存在的"})
+        check("切换不存在的排序返回 404", st == 404, str(st))
+        st, r = admin("/admin/model/order/save", {"name": "deepseek", "label": ""})
+        check("空排序名被拒绝", st == 400, str(r)[:160])
+        st, r = admin("/admin/model/order/save", {"name": "deepseek", "label": "原始"})
+        check("不允许用「原始」当新排序的名字（防覆盖回溯点）",
+              st == 400 and "原始" in str(r.get("error") or ""), str(r)[:200])
+        st, r = admin("/admin/model/reorder-by-speed", {
+            "name": "deepseek", "label": "原始",
+            "results": [{"upstream": "a1", "ok": True, "latency_seconds": 0.1}]})
+        check("按测速重排也不允许占用「原始」这个名字",
+              st == 400 and "原始" in str(r.get("error") or ""), str(r)[:200])
+        st, r = admin("/admin/model/reorder-by-speed", {"name": "deepseek", "results": []})
+        check("没有测速结果时重排被拒绝", st == 400, str(r)[:160])
+        st, r = admin("/admin/model/orderings", {"name": "没这个分组"})
+        check("不存在的分组返回 404", st == 404, str(st))
+
+        # 回归：保存路由（比如只是在弹窗里改了额度）不能把「原始」改掉，
+        # 否则用户切回「原始」拿到的其实是当时的顺序，回溯就失效了
+        st, snap = get("/stats")
+        before_orig = snap["models"]["deepseek"]["orderings"]["原始"]
+        st, r = admin("/admin/model/save", {
+            "name": "deepseek", "strategy": "priority",
+            "entries": [{"upstream": "d1", "model": "ds4", "quota": 0},
+                        {"upstream": "c1", "model": "ds3"},
+                        {"upstream": "b1", "model": "ds2"},
+                        {"upstream": "a1", "model": "ds1"}]})
+        check("带额度保存路由成功", st == 200, str(r)[:160])
+        st, snap = get("/stats")
+        check("保存路由不影响「原始」",
+              snap["models"]["deepseek"]["orderings"]["原始"] == before_orig,
+              str(snap["models"]["deepseek"]["orderings"].get("原始")))
+        check("保存路由保留了「按测速」这套",
+              "按测速" in snap["models"]["deepseek"]["orderings"],
+              str(list(snap["models"]["deepseek"]["orderings"])))
+        st, r = admin("/admin/model/order/apply", {"name": "deepseek", "label": "原始"})
+        st, snap = get("/stats")
+        check("保存后仍能切回真的原始顺序（a→b→c→d）",
+              [e["upstream"] for e in snap["models"]["deepseek"]["entries"]]
+              == ["a1", "b1", "c1", "d1"],
+              str([e["upstream"] for e in snap["models"]["deepseek"]["entries"]]))
+        # 还原成按测速那套，方便后面的持久化检查
+        admin("/admin/model/order/apply", {"name": "deepseek", "label": "按测速"})
+        admin("/admin/model/quota", {"name": "deepseek", "entries": [
+            {"upstream": "d1", "model": "ds4", "quota": None}]})
+
+        # 状态文件里两套排序都落了盘
+        state_file = os.path.join(HERE, ".llmrouter",
+                                  os.path.splitext(os.path.basename(cfg))[0] + ".state.json")
+        with open(state_file, "r", encoding="utf-8") as fh:
+            st_data = json.load(fh)
+        check("排序写进了状态文件",
+              "orderings" in st_data["models"]["deepseek"],
+              str(list(st_data["models"]["deepseek"].keys())))
+    finally:
+        stop_router(p)
+
+    # 重启后排序还在
+    p = start_router(cfg)
+    try:
+        st, snap = get("/stats")
+        labels = sorted((snap["models"]["deepseek"].get("orderings") or {}).keys())
+        check("重启后具名排序还在", labels == ["原始", "按测速"], str(labels))
+        check("重启后当前顺序还是按测速那套",
+              [e["upstream"] for e in snap["models"]["deepseek"]["entries"]]
+              == ["d1", "c1", "b1", "a1"],
+              str([e["upstream"] for e in snap["models"]["deepseek"]["entries"]]))
+        st, r = admin("/admin/model/order/apply", {"name": "deepseek", "label": "原始"})
+        check("重启后还能切回原始顺序",
+              st == 200 and r.get("active") == "原始", str(r)[:160])
+    finally:
+        stop_router(p)
+        UP_MODELS.update({"a": ["deepseek-chat", "deepseek-reasoner", "glm-4.6"],
+                          "b": ["deepseek-chat", "glm-4.6", "qwen-max"],
+                          "c": ["deepseek-chat"],
+                          "d": ["ds4", "other"]})
+
+    # ================= 22. 分组内上游调用额度 =================
+    print("\n[22] 分组里设上游额度：0 = 不调用（跳过并沉到最后）")
+    cleanup()
+    cfg = write_config(with_routes=True)
+    p = start_router(cfg)
+    try:
+        # deepseek-chat 的路由是 a→b→c
+        st, snap = get("/stats")
+        entries = snap["models"]["deepseek-chat"]["entries"]
+        check("初始三个上游都没设额度",
+              len(entries) == 3 and all(e.get("quota") is None for e in entries), str(entries))
+
+        # 把 a 的额度设成 0：不该再被调用
+        st, r = admin("/admin/model/quota", {
+            "name": "deepseek-chat", "upstream": "a1", "model": "deepseek-chat", "quota": 0})
+        check("设置额度成功", st == 200, str(r)[:200])
+        applied = (r.get("applied") or [{}])[0]
+        check("返回里标出额度 0 且被跳过",
+              applied.get("quota") == 0 and applied.get("skipped") is True, str(applied))
+        check("a 的额度写成了 0",
+              next(e for e in r["entries"] if e["upstream"] == "a1")["quota"] == 0,
+              str(r.get("entries")))
+
+        reset_hits()
+        st, body, hdr = post()
+        # b1 在这个配置里把模型映射成了 deepseek-ai/DeepSeek-V3
+        check("额度 0 的上游被直接跳过",
+              st == 200 and not hits["a"] and hits["b"] == ["deepseek-ai/DeepSeek-V3"],
+              f"status={st} hits={hits}")
+        check("换到了下一个上游", hdr.get("X-Upstream") == "up-b",
+              str(hdr.get("X-Upstream")))
+
+        st, snap = get("/stats")
+        check("stats 里也能看到 0 额度",
+              next(e for e in snap["models"]["deepseek-chat"]["entries"]
+                   if e["upstream"] == "a1")["quota"] == 0,
+              str(snap["models"]["deepseek-chat"]["entries"]))
+        check("额度 0 的不算进「可用上游数」",
+              snap["models"]["deepseek-chat"]["resolved_count"] == 2,
+              str(snap["models"]["deepseek-chat"]["resolved_count"]))
+
+        # 沉到最后：按测速重排时，0 额度的成员一律排最后（哪怕它测出来最快）
+        st, r = admin("/admin/model/reorder-by-speed", {
+            "name": "deepseek-chat", "label": "按测速",
+            "results": [{"upstream": "a1", "ok": True, "latency_seconds": 0.01},   # 最快但是 0 额度
+                        {"upstream": "b1", "ok": True, "latency_seconds": 0.5},
+                        {"upstream": "c1", "ok": True, "latency_seconds": 0.2}]})
+        check("按测速重排成功（含 0 额度成员）", st == 200, str(r)[:200])
+        order = [o["upstream"] for o in r.get("order") or []]
+        check("0 额度的排最后，其余按快慢排", order == ["c1", "b1", "a1"], str(order))
+        st, snap = get("/stats")
+        check("重排后 0 额度的 u-a 确实在末尾",
+              [e["upstream"] for e in snap["models"]["deepseek-chat"]["entries"]]
+              == ["c1", "b1", "a1"],
+              str([e["upstream"] for e in snap["models"]["deepseek-chat"]["entries"]]))
+        reset_hits()
+        st, body, hdr = post()
+        check("重排后调用仍然跳过 0 额度的那家",
+              st == 200 and not hits["a"] and hits["c"] == ["deepseek-chat"],
+              f"status={st} hits={hits}")
+
+        # 改成不限量：又能用了
+        st, r = admin("/admin/model/quota", {
+            "name": "deepseek-chat", "upstream": "a1", "model": "deepseek-chat", "quota": None})
+        check("清空额度成功",
+              (r.get("applied") or [{}])[0].get("quota") is None, str(r)[:200])
+        reset_hits()
+        st, body, hdr = post()
+        check("清空额度后恢复按当前顺序（c 仍是首选）", hits["c"] == ["deepseek-chat"], str(hits))
+
+        # 定量额度（>0）也会被记下来，只是不限死
+        st, r = admin("/admin/model/quota", {
+            "name": "deepseek-chat", "upstream": "a1", "model": "deepseek-chat", "quota": 50})
+        check("设置上限 50 成功",
+              (r.get("applied") or [{}])[0].get("quota") == 50, str(r)[:200])
+        reset_hits()
+        st, body, hdr = post()
+        check("设了上限、没用完，照常调用", 200 <= st < 300 and any(hits[k] for k in "abc"),
+              f"status={st} hits={hits}")
+
+        # 批量设置：一次给两家设额度
+        st, r = admin("/admin/model/quota", {"name": "deepseek-chat", "entries": [
+            {"upstream": "a1", "model": "deepseek-chat", "quota": ""},
+            {"upstream": "b1", "model": "deepseek-ai/DeepSeek-V3", "quota": 0},
+        ]})
+        check("批量设置额度成功", st == 200 and len(r.get("applied") or []) == 2, str(r)[:220])
+        check("批量里留空 = 不限量",
+              next(e for e in r["entries"] if e["upstream"] == "a1")["quota"] is None,
+              str(r.get("entries")))
+        reset_hits()
+        st, body, hdr = post()
+        check("批量后 b 被跳过（走的是排第一的 c）",
+              st == 200 and not hits["b"] and hits["c"] == ["deepseek-chat"], str(hits))
+
+        # 额度写进状态文件
+        state_file = os.path.join(HERE, ".llmrouter",
+                                  os.path.splitext(os.path.basename(cfg))[0] + ".state.json")
+        with open(state_file, "r", encoding="utf-8") as fh:
+            st_data = json.load(fh)
+        q0 = [e.get("quota") for e in st_data["models"]["deepseek-chat"]["entries"]]
+        check("额度落盘（b 是 0，其余不写 quota 字段）",
+              q0 == [None, 0, None], str(q0))
+
+        # 错误处理
+        st, r = admin("/admin/model/quota", {"name": "deepseek-chat", "entries": []})
+        check("空额度请求被拒绝", st == 400, str(r)[:160])
+        st, r = admin("/admin/model/quota", {
+            "name": "deepseek-chat", "upstream": "不存在", "quota": 0})
+        check("上游不在这个分组里返回 404", st == 404, str(r)[:160])
+        st, r = admin("/admin/model/quota", {"name": "没这个分组", "upstream": "a1", "quota": 0})
+        check("分组不存在返回 404", st == 404, str(st))
+
+        # 负数当「不限量」
+        st, r = admin("/admin/model/quota", {
+            "name": "deepseek-chat", "upstream": "c1", "model": "deepseek-chat", "quota": -5})
+        check("负数额度当成不限量",
+              st == 200 and (r.get("applied") or [{}])[0].get("quota") is None, str(r)[:200])
+    finally:
+        stop_router(p)
+
+    # 全 0 时退回自动兜底，而不是 503
+    cleanup()
+    cfg = write_config(with_routes=True)
+    p = start_router(cfg)
+    try:
+        admin("/admin/model/quota", {"name": "deepseek-chat", "entries": [
+            {"upstream": "a1", "model": "deepseek-chat", "quota": 0},
+            {"upstream": "b1", "model": "deepseek-ai/DeepSeek-V3", "quota": 0},
+            {"upstream": "c1", "model": "deepseek-chat", "quota": 0},
+        ]})
+        reset_hits()
+        st, body, hdr = post()
+        # 路由成员全被 0 掉，就和「配置为空」一样走自动兜底，不该直接 503
+        check("额度全为 0 时不至于 503（退回自动兜底）", st == 200, str(st))
+        check("兜底确实挑了上游", any(hits[k] for k in "abc"), str(hits))
+        st, raw = get("/admin/history")
+        hist = raw.get("history") or []
+        src = (hist[-1].get("route_source") or "").strip() if hist else ""
+        # 「配置」= 正常走路由；全 0 的情况下这里应该是兜底路径
+        check("历史里标明是兜底、不是走配置",
+              bool(hist) and src != "配置" and ("自动" in src or "兜底" in src),
+              repr(src))
+    finally:
+        stop_router(p)
+
+    # ================= 23. 配置文件里预写额度与排序 =================
+    print("\n[23] 配置文件里的 quota 与 orderings")
+    cleanup()
+    cfg = write_config_quota()
+    p = start_router(cfg)
+    try:
+        st, snap = get("/stats")
+        route = snap["models"]["deepseek-chat"]
+        check("配置里的三家里有一家 quota=0",
+              {e["upstream"]: e.get("quota") for e in route["entries"]}
+              == {"a1": None, "b1": 0, "c1": None},
+              str(route["entries"]))
+        check("配置里的两套排序都被读到",
+              set((route.get("orderings") or {}).keys()) == {"原始", "快的先"},
+              str(sorted((route.get("orderings") or {}).keys())))
+        check("当前顺序就是配置里 entries 的顺序",
+              [e["upstream"] for e in route["entries"]] == ["a1", "b1", "c1"],
+              str([e["upstream"] for e in route["entries"]]))
+
+        # quota=0 的 b 不该被调用
+        reset_hits()
+        st, body, hdr = post()
+        check("配置里的 quota=0 生效（跳过 b）",
+              st == 200 and not hits["b"] and hits["a"] == ["deepseek-chat"],
+              f"status={st} hits={hits}")
+
+        # 配置里预存的排序能直接切
+        st, r = admin("/admin/model/order/apply",
+                      {"name": "deepseek-chat", "label": "快的先"})
+        check("能切到配置里预存的排序",
+              st == 200 and r.get("active") == "快的先", str(r)[:160])
+        st, snap = get("/stats")
+        route = snap["models"]["deepseek-chat"]
+        check("切换后顺序变成快的先（c→a→b）",
+              [e["upstream"] for e in route["entries"]] == ["c1", "a1", "b1"],
+              str([e["upstream"] for e in route["entries"]]))
+        check("切换后 quota 还是跟着原来的成员（b 仍是 0）",
+              {e["upstream"]: e.get("quota") for e in route["entries"]}
+              == {"a1": None, "b1": 0, "c1": None},
+              str(route["entries"]))
+        reset_hits()
+        st, body, hdr = post()
+        check("切换后仍然跳过 b（走 c）",
+              st == 200 and not hits["b"] and hits["c"] == ["deepseek-chat"],
+              f"status={st} hits={hits}")
+
+        # 重启后（状态文件接管）额度和排序都还在
+        state_file = os.path.join(HERE, ".llmrouter",
+                                  os.path.splitext(os.path.basename(cfg))[0] + ".state.json")
+        check("首次启动就把配置写成了状态文件", os.path.exists(state_file), state_file)
+    finally:
+        stop_router(p)
+
+    p = start_router(cfg)
+    try:
+        st, snap = get("/stats")
+        route = snap["models"]["deepseek-chat"]
+        check("重启后额度还在",
+              {e["upstream"]: e.get("quota") for e in route["entries"]}
+              == {"a1": None, "b1": 0, "c1": None},
+              str(route["entries"]))
+        check("重启后排序还在",
+              set((route.get("orderings") or {}).keys()) == {"原始", "快的先"},
+              str(sorted((route.get("orderings") or {}).keys())))
+        check("重启后当前生效的排序也对",
+              route.get("active_ordering") == "快的先",
+              str(route.get("active_ordering")))
+    finally:
+        stop_router(p)
+
+    # ================= 24. 左侧统计与右侧上游卡片对得上（失败转移也算）=================
+    # 一次客户端请求可能试多家上游。左右两处数字口径不同但必须自洽：
+    #   请求层面（左侧「总请求/成功/失败」）—— 一次客户端请求算一次，只看最终结果
+    #   尝试层面（左侧分组×上游、右侧上游卡片）—— 发给上游算一次，换一家就多一次
+    # 曾经的 bug：中间的失败没进左侧统计，于是左侧永远 0 失败、右侧却有一堆失败。
+    print("\n[24] 左右两处统计口径一致（失败转移的中间失败也看得见）")
+    cleanup()
+    cfg = write_config(with_routes=True)      # deepseek-chat: a→b→c
+    behavior["a"] = "fail500"                 # a 恒挂，每次都落到 b
+    p = start_router(cfg)
+    try:
+        for _ in range(2):
+            st, body, hdr = post()
+            check("失败转移后最终成功", st == 200 and hdr.get("X-Upstream") == "up-b",
+                  f"status={st} up={hdr.get('X-Upstream')}")
+
+        st, snap = get("/stats")
+        cs = snap["call_stats"]
+        t = cs["totals"]
+        # 请求层面：2 次请求，都成功（最终落到 b），没有任何「失败的请求」
+        check("请求层面 calls=2", t["calls"] == 2, str(t))
+        check("请求层面 ok=2", t["ok"] == 2, str(t))
+        check("请求层面 failed=0", t["failed"] == 0, str(t))
+        # 尝试层面：2 次请求 × 2 家 = 4 次上游尝试
+        check("尝试层面 attempts=4", t["attempts"] == 4, str(t))
+
+        # 右侧卡片（累计）：a 被打了 2 次全失败，b 成功 2 次
+        cards = {u["name"]: u for u in snap["upstreams"]}
+        check("右侧 a 请求=2", cards["up-a"]["requests"] == 2, str(cards.get("up-a")))
+        check("右侧 a 失败=2", cards["up-a"]["failures"] == 2, str(cards.get("up-a")))
+        check("右侧 b 成功=2", cards["up-b"]["successes"] == 2, str(cards.get("up-b")))
+
+        # 左侧分组×上游 用尝试口径，数字必须和右侧卡片一模一样
+        g = next(x for x in cs["groups"] if x["group"] == "deepseek-chat")
+        ups = {u["upstream"]: u for u in g["upstreams"]}
+        check("左侧 a 调用=2（和右侧一致）", ups["up-a"]["calls"] == 2, str(ups.get("up-a")))
+        check("左侧 a 失败=2（和右侧一致）", ups["up-a"]["failed"] == 2, str(ups.get("up-a")))
+        check("左侧 a 成功=0", ups["up-a"]["ok"] == 0, str(ups.get("up-a")))
+        check("左侧 b 调用=2", ups["up-b"]["calls"] == 2, str(ups.get("up-b")))
+        check("左侧 b 成功=2", ups["up-b"]["ok"] == 2, str(ups.get("up-b")))
+        check("左侧分组尝试数=4", g["attempts"] == 4, str(g.get("attempts")))
+
+        # 跨分组的上游汇总（左侧顶部对照区）
+        lu = {u["upstream"]: u for u in cs["upstreams"]}
+        check("左侧汇总 a 失败=2", lu["up-a"]["failed"] == 2, str(lu.get("up-a")))
+        check("左侧汇总 b 成功=2", lu["up-b"]["ok"] == 2, str(lu.get("up-b")))
+
+        # 历史记录里保留了每一步，点开请求详情能看到中间那次失败
+        trail = snap["history"][-1]["trail"]
+        check("trail 有两步", len(trail) == 2, str(trail))
+        check("trail 第一步是 a 的失败",
+              trail[0]["ok"] is False and trail[0]["upstream"] == "up-a", str(trail[0]))
+        check("trail 第二步是 b 的成功",
+              trail[1]["ok"] is True and trail[1]["upstream"] == "up-b", str(trail[1]))
+
+        # token 用量不应该因为多试了一家而重复累计
+        check("token 只算一次（没按尝试次数翻倍）",
+              g["usage"].get("total") == 240, str(g["usage"]))
+
+        # 全失败时：请求层面失败数也要和「重试到底」的尝试数区分开。
+        # 统计不再能被清零，所以用「前后差量」断言，只看这一段新增的。
+        behavior["b"] = behavior["c"] = "fail500"
+        st, snap = get("/stats")
+        t0 = snap["call_stats"]["totals"]
+        base = {k: t0.get(k, 0) for k in ("calls", "failed", "attempts")}
+        post()
+        st, snap = get("/stats")
+        t = snap["call_stats"]["totals"]
+        check("全失败时 请求=1",
+              t["calls"] - base["calls"] == 1, f'{base} -> {t}')
+        check("全失败时 失败请求=1",
+              t["failed"] - base["failed"] == 1, f'{base} -> {t}')
+        check("全失败时 尝试=3（三家都试了）",
+              t["attempts"] - base["attempts"] == 3, f'{base} -> {t}')
+        behavior["b"] = behavior["c"] = "ok"
+    finally:
+        stop_router(p)
+        behavior["a"] = "ok"
+
+    # ================= 25. 请求记录持久化（跨重启 + 按天统计） =================
+    print("\n[25] 请求记录重启后还在，按天/本月/全部都查得到")
+    cleanup()
+    cfg = write_config(with_routes=True)
+    today = time.strftime("%Y-%m-%d")
+    month = today[:7]
+    p = start_router(cfg)
+    before = None
+    try:
+        reset_hits()
+        st, body, hdr = post()
+        check("持久化测试里请求成功", st == 200, str(st))
+        st, snap = get("/stats")
+        before = snap["call_stats"]["totals"]["calls"]
+        check("单次请求后 call_stats 有计数", before >= 1, str(before))
+
+        # range 接口：今天 / 本月 / 全部都能查到这次请求
+        st, snap = get("/stats?range=day:" + today)
+        day_calls = (snap.get("stats_range") or {}).get("totals", {}).get("calls", -1)
+        check("range=day 能查到今天的请求", day_calls >= 1, str(day_calls))
+        st, snap = get("/stats?range=month:" + month)
+        mon_calls = (snap.get("stats_range") or {}).get("totals", {}).get("calls", -1)
+        check("range=month 能查到本月的请求", mon_calls >= 1, str(mon_calls))
+        st, snap = get("/stats?range=all")
+        all_calls = (snap.get("stats_range") or {}).get("totals", {}).get("calls", -1)
+        check("range=all 能查到全部请求", all_calls >= 1, str(all_calls))
+
+        st, raw = get("/admin/history")
+        hist = raw.get("history") or []
+        check("请求后历史有记录", len(hist) > 0, f"len={len(hist)}")
+
+        # 明细日志文件落盘了
+        hist_file = os.path.join(HERE, ".llmrouter",
+                                 os.path.splitext(os.path.basename(cfg))[0] + ".history.jsonl")
+        check("生成了历史明细日志", os.path.exists(hist_file), hist_file)
+    finally:
+        stop_router(p)
+
+    # 重启后：明细 + 统计都还在
+    p = start_router(cfg)
+    try:
+        st, raw = get("/admin/history")
+        hist = raw.get("history") or []
+        check("重启后请求记录还在", len(hist) > 0, f"len={len(hist)}")
+        st, snap = get("/stats?range=all")
+        tr = (snap.get("stats_range") or {}).get("totals") or {}
+        check("重启后统计还在（>= 重启前）", tr.get("calls", 0) >= before, str(tr))
+        st, snap = get("/stats?range=day:" + today)
+        check("重启后今天的统计还在",
+              (snap.get("stats_range") or {}).get("totals", {}).get("calls", 0) >= 1,
+              str(snap.get("stats_range")))
+    finally:
+        stop_router(p)
+
+    # ================= 26. 测速把「限流」和「故障」分开 =================
+    # 用户遇到的真实场景：sensenova 返回 429「inference exceeds tpm/rpm limit」，
+    # Key 和地址都没问题，只是这会儿不让调。以前这会被报成「失败」，
+    # 看起来像配置错了，容易误判。
+    print("\n[26] 测速区分限流与故障")
+    cleanup()
+    cfg = write_config()
+    p = start_router(cfg)
+    try:
+        admin("/admin/fetch-models")
+
+        # a 限流、b 正常：界面上要能分辨
+        behavior["a"] = "fail429"
+        st, r = admin("/admin/speedtest", {"ids": ["a1", "b1"]})
+        res = {x["id"]: x for x in (r.get("results") or [])}
+        check("限流的上游被标成 rate_limited",
+              res["a1"].get("rate_limited") is True, str(res.get("a1")))
+        check("限流的上游 ok=False（不算可用）",
+              res["a1"].get("ok") is False, str(res.get("a1")))
+        check("限流仍带上说明文字", bool(res["a1"].get("error")), str(res.get("a1")))
+        check("正常的上游不会被标成限流",
+              res["b1"].get("rate_limited") is False and res["b1"].get("ok") is True,
+              str(res.get("b1")))
+
+        # 500 这种真故障不能被当成限流
+        behavior["a"] = "fail500"
+        st, r = admin("/admin/speedtest", {"ids": ["a1"]})
+        one = (r.get("results") or [{}])[0]
+        check("500 故障不算限流",
+              one.get("rate_limited") is False and one.get("ok") is False, str(one))
+
+        # 401（Key 不对）也不算限流，那需要用户去改配置
+        behavior["a"] = "fail401"
+        st, r = admin("/admin/speedtest", {"ids": ["a1"]})
+        one = (r.get("results") or [{}])[0]
+        check("401 不算限流", one.get("rate_limited") is False, str(one))
+
+        # 限流只影响测速的展示；真调用时照样会切换下一个上游
+        behavior["a"] = "fail429"
+        admin("/admin/model/save", {
+            "name": "deepseek-chat", "strategy": "priority",
+            "entries": [{"upstream": "a1", "model": "deepseek-chat"},
+                        {"upstream": "b1", "model": "deepseek-chat"}]})
+        reset_hits()
+        st, body, hdr = post()
+        check("限流的上游在真调用时会被跳过并切换",
+              st == 200 and hdr.get("X-Upstream") == "up-b" and hits["a"],
+              f"status={st} up={hdr.get('X-Upstream')} hits={hits}")
+        behavior["a"] = "ok"
+    finally:
+        stop_router(p)
+
+    # ================= 27. 流水只增不减，累计统计全量 =================
+    # 两条核心不变量：
+    #   1) 内存明细列表只留最近 history_limit 条（避免界面/内存被撑爆）；
+    #   2) 落盘的流水文件只追加、永不删行 —— 归档是改名，不是重写。
+    # 以前这里做的是「把文件重写成最近 N 条」，等于真删历史，改成只增不减。
+    print("\n[27] 内存明细有上限，落盘流水只增不减")
+    cleanup()
+    cfg = write_config(with_routes=True, history_limit=3)
+    p = start_router(cfg)
+    sent = 12          # 远超过内存上限，用来验证「内存截断但文件不截断」
+    cap = 3
+    try:
+        reset_hits()
+        for _ in range(sent):
+            st, _, _ = post()
+            if st != 200:
+                check("第 27 组请求成功", False, f"status={st}")
+                break
+
+        st, snap = get("/stats?range=all")
+        tr = (snap.get("stats_range") or {}).get("totals") or {}
+        check("明细超上限后，全量统计照样记满",
+              tr.get("calls") == sent, f"calls={tr.get('calls')} 期望={sent} 详情={tr}")
+
+        st, raw = get("/admin/history")
+        hist = raw.get("history") or []
+        check("内存明细列表被截到上限", len(hist) == cap, f"len={len(hist)}")
+
+        st, snap = get("/stats")
+        check("快照里报出明细上限", snap["call_stats"].get("history_limit") == cap,
+              str(snap["call_stats"].get("history_limit")))
+        check("全量统计不因内存截断而变小",
+              tr.get("calls", 0) > len(hist), f"calls={tr.get('calls')} 明细={len(hist)}")
+
+        # 关键：落盘流水必须一条不少（不能被「上限」裁掉）
+        hist_file = os.path.join(HERE, ".llmrouter",
+                                 os.path.splitext(os.path.basename(cfg))[0] + ".history.jsonl")
+        with open(hist_file, "r", encoding="utf-8") as fh:
+            lines = [ln for ln in fh.read().splitlines() if ln.strip()]
+        check("落盘流水一条不少（只增不减）", len(lines) == sent,
+              f"lines={len(lines)} 期望={sent}")
+
+        # 手动归档应该是改名保留，不是删掉
+        st, rot = admin("/admin/journal/rotate")
+        check("归档接口返回归档文件名",
+              st == 200 and rot.get("archived"), str(rot)[:160])
+        archived = rot.get("archived")
+        arch_path = os.path.join(HERE, ".llmrouter", archived) if archived else ""
+        check("归档文件保留下来了", bool(archived) and os.path.exists(arch_path),
+              arch_path)
+        if archived and os.path.exists(arch_path):
+            with open(arch_path, "r", encoding="utf-8") as fh:
+                arch_lines = [ln for ln in fh.read().splitlines() if ln.strip()]
+            check("归档文件里的记录条数和归档前一致", len(arch_lines) == sent,
+                  f"archived={len(arch_lines)} 期望={sent}")
+        # 归档后当前流水是空的（文件要等下一条请求才重新出现），接着写新的
+        after = []
+        if os.path.exists(hist_file):
+            with open(hist_file, "r", encoding="utf-8") as fh:
+                after = [ln for ln in fh.read().splitlines() if ln.strip()]
+        check("归档后当前流水重新开始", len(after) == 0, f"lines={len(after)}")
+
+        # 重启后：累计统计还是全量
+        stop_router(p)
+        p = start_router(cfg)
+        st, snap = get("/stats?range=all")
+        tr2 = (snap.get("stats_range") or {}).get("totals") or {}
+        check("重启后累计统计没缩水", tr2.get("calls") == sent,
+              f"calls={tr2.get('calls')} 期望={sent}")
+        st, raw = get("/admin/history")
+        check("重启后内存明细仍只留上限条数", len(raw.get("history") or []) <= cap,
+              f"len={len(raw.get('history') or [])}")
+        # 归档文件必须还在（重启不能把它弄丢）
+        st, jf = get("/admin/journal/files")
+        names = [f.get("path") for f in (jf.get("files") or [])]
+        check("归档文件在重启后依然在", bool(archived) and archived in names,
+              f"archived={archived} names={names}")
+    finally:
+        stop_router(p)
+
+    # ================= 28. 统计与流水不可清除 + 快照可回退 =================
+    print("\n[28] 统计不可清除、状态快照可回退")
+    cleanup()
+    cfg = write_config(with_routes=True)
+    p = start_router(cfg)
+    try:
+        reset_hits()
+        post()
+        st, snap = get("/stats?range=all")
+        calls_before = (snap.get("stats_range") or {}).get("totals", {}).get("calls", 0)
+        check("先有一次请求作为基线", calls_before >= 1, str(calls_before))
+
+        # /admin/reset 现在只复位冷却，不许动统计
+        st, r = admin("/admin/reset")
+        check("reset 返回成功且说明统计保留",
+              st == 200 and "统计" in str(r.get("message") or ""), str(r)[:160])
+        st, snap = get("/stats?range=all")
+        calls_after = (snap.get("stats_range") or {}).get("totals", {}).get("calls", 0)
+        check("reset 之后统计没有被清零", calls_after >= calls_before,
+              f"{calls_before} -> {calls_after}")
+
+        st, raw = get("/admin/history")
+        check("reset 之后请求流水还在", len(raw.get("history") or []) > 0,
+              f"len={len(raw.get('history') or [])}")
+
+        # 审计日志要能查到刚才那次操作
+        st, lg = get("/admin/admin-log")
+        log = lg.get("log") or []
+        check("审计日志记录了管理操作",
+              any("/admin/" in (e.get("op") or "") for e in log), str(log)[:200])
+
+        # 状态快照：每次覆盖前都会轮转出一份带时间戳的旧版本。
+        # 第一次保存时还没有「上一版」可存，所以要改两次才看得到两份。
+        admin("/admin/upstream/add", {"name": "临时上游1", "base_url": "http://127.0.0.1:9/v1",
+                                      "api_key": "k"})
+        admin("/admin/upstream/add", {"name": "临时上游2", "base_url": "http://127.0.0.1:9/v1",
+                                      "api_key": "k"})
+        st, vs = get("/admin/state/versions")
+        versions = vs.get("versions") or []
+        check("状态快照能列出来（留了多份）", len(versions) >= 2, str(vs)[:240])
+        check("快照带得出上游/模型数量",
+              all(v.get("upstreams") is not None for v in versions), str(versions[:2])[:240])
+
+        # 回退到最早的那份快照，上游数量应该回到 3（配置里的三家）
+        if versions:
+            oldest = versions[-1]["file"]
+            st, rr = admin("/admin/state/restore", {"file": oldest})
+            check("状态快照可以回退", st == 200 and rr.get("ok"), str(rr)[:200])
+            st, snap = get("/stats")
+            check("回退后上游数量符合快照内容",
+                  len(snap.get("upstreams") or []) == (versions[-1].get("upstreams") or -1),
+                  f'now={len(snap.get("upstreams") or [])} snap={versions[-1].get("upstreams")}')
+
+        st, snap = get("/stats")
+        check("快照里报出流水概况",
+              isinstance(snap.get("journal"), dict)
+              and snap["journal"].get("current_lines") is not None,
+              str(snap.get("journal")))
+    finally:
+        stop_router(p)
+
+    # ================= 29. 调用记录全量持久化 + 按天/月/分组筛选 =================
+    # 用户的核心诉求：所有调用都要落盘、能按天/按月/按分组翻，
+    # 而且列表条数必须和统计数字是同一个口径（不能一边 375 一边 188）。
+    print("\n[29] 调用记录全量可查（按天 / 按月 / 按分组 + 分页）")
+    cleanup()
+    cfg = write_config(with_routes=True)
+    p = start_router(cfg)
+    try:
+        reset_hits()
+        sent = 8
+        for _ in range(sent):
+            st, _, _ = post()
+            if st != 200:
+                check("第 29 组请求成功", False, f"status={st}")
+                break
+
+        # 索引：有哪些天/月/分组，条数对不对
+        st, idx = get("/admin/journal/index")
+        check("流水索引能读到", st == 200 and idx.get("total") is not None, str(idx)[:200])
+        check("索引里的总条数 = 实际请求数",
+              idx.get("total") == sent, f"total={idx.get('total')} 期望={sent}")
+        today = time.strftime("%Y-%m-%d")
+        days = {d["key"]: d["calls"] for d in (idx.get("days") or [])}
+        check("索引里有今天且条数正确", days.get(today) == sent, str(days))
+        months = {m["key"]: m["calls"] for m in (idx.get("months") or [])}
+        check("索引里有本月且条数正确",
+              months.get(today[:7]) == sent, str(months))
+        groups = {g["key"]: g["calls"] for g in (idx.get("groups") or [])}
+        check("索引里有这个分组且条数正确",
+              groups.get("deepseek-chat") == sent, str(groups))
+
+        # 分页查询：列表条数和索引/统计一致（不再有两套数字）
+        st, page = get("/admin/journal?limit=100")
+        check("列表返回的记录数 = 索引总数",
+              len(page.get("entries") or []) == idx.get("total"),
+              f"entries={len(page.get('entries') or [])} idx={idx.get('total')}")
+        check("列表 total 和索引 total 一致",
+              page.get("total") == idx.get("total"),
+              f"{page.get('total')} vs {idx.get('total')}")
+
+        # 按天筛选
+        st, byday = get("/admin/journal?day=" + today)
+        check("按天筛选命中条数正确",
+              byday.get("total") == sent, str(byday.get("total")))
+        st, byday2 = get("/admin/journal?day=1999-01-01")
+        check("筛一个没有记录的日期得到 0 条",
+              byday2.get("total") == 0, str(byday2.get("total")))
+
+        # 按月筛选
+        st, bymon = get("/admin/journal?month=" + today[:7])
+        check("按月筛选命中条数正确",
+              bymon.get("total") == sent, str(bymon.get("total")))
+
+        # 按分组筛选
+        st, bygrp = get("/admin/journal?group=deepseek-chat")
+        check("按分组筛选命中条数正确",
+              bygrp.get("total") == sent, str(bygrp.get("total")))
+        # 不存在的分组得到 0 条（中文分组名要先 URL 编码才能发出去）
+        st, bygrp2 = get("/admin/journal?group=" + urllib.parse.quote("不存在的组"))
+        check("筛一个不存在的分组得到 0 条",
+              bygrp2.get("total") == 0, str(bygrp2.get("total")))
+
+        # 按上游筛选：在分组里定位到具体某个上游（用户要找一个一直报错的上游）。
+        # 这里所有请求都命中 up-a，所以拿它验证。
+        st, byup = get("/admin/journal?group=deepseek-chat&upstream=up-a")
+        check("按上游筛选命中条数正确",
+              byup.get("total") == sent, str(byup.get("total")))
+        ups = {u["key"]: u for u in (byup.get("upstreams") or [])}
+        check("分组内上游计数带调用数和失败数",
+              ups.get("up-a", {}).get("calls") == sent
+              and ups.get("up-a", {}).get("failed") == 0, str(ups))
+        st, byup2 = get("/admin/journal?group=deepseek-chat&upstream="
+                        + urllib.parse.quote("不存在"))
+        check("筛一个不存在的上游得到 0 条",
+              byup2.get("total") == 0, str(byup2.get("total")))
+
+
+        # 分页：offset 往后翻，条数守恒
+        st, p1 = get("/admin/journal?limit=3&offset=0")
+        st, p2 = get("/admin/journal?limit=3&offset=3")
+        check("第一页返回 limit 条", len(p1.get("entries") or []) == 3,
+              str(len(p1.get("entries") or [])))
+        check("翻页后仍是同一批数据（total 不变）",
+              p2.get("total") == p1.get("total"),
+              f"{p1.get('total')} vs {p2.get('total')}")
+        ats1 = {e.get("at") for e in (p1.get("entries") or [])}
+        ats2 = {e.get("at") for e in (p2.get("entries") or [])}
+        check("两页没有重叠", not (ats1 & ats2), f"{ats1 & ats2}")
+
+        # 列表为了省流量不带正文，单条接口要能取回正文
+        first = (p1.get("entries") or [{}])[0]
+        check("列表记录不含正文（省流量）",
+              "request_text" not in first, sorted(first.keys()))
+        st, one = get("/admin/journal/entry?at=%s" % first.get("at"))
+        entry = one.get("entry") or {}
+        # 时间戳是浮点数，经 URL 传一圈会有末位精度差，所以按 0.1 秒比对
+        check("单条接口能取回这条记录",
+              st == 200 and abs(float(entry.get("at") or 0)
+                                - float(first.get("at") or 0)) < 0.1,
+              f"want={first.get('at')} got={entry.get('at')}")
+        check("单条接口带回输入正文", entry.get("request_text") is not None,
+              str(entry.get("request_text"))[:60])
+
+        # 列表条数必须和 /stats 的统计口径一致（曾经一边 375 一边 188）
+        st, snap = get("/stats?range=all")
+        snap_calls = (snap.get("stats_range") or {}).get("totals", {}).get("calls")
+        check("统计口径和流水条数一致",
+              snap_calls == idx.get("total"),
+              f"stats={snap_calls} journal={idx.get('total')}")
+
+        # 上游卡片上的数字要走**落盘聚合**（跨重启不归零），不能再用内存计数 ——
+        # 否则重启后左边按累计显示、右边从 0 开始，两边又对不上。
+        # 这里所有请求都命中 up-a（priority 顺序第一家），所以看它。
+        cards = {u["name"]: u for u in snap.get("upstreams") or []}
+        ca = cards.get("up-a") or {}
+        check("卡片数字来自落盘聚合（跨重启不归零）",
+              ca.get("counters_persistent") is True,
+              f"counters_persistent={ca.get('counters_persistent')}")
+        check("卡片上的请求数 = 实际命中次数",
+              ca.get("requests") == sent, f"req={ca.get('requests')} 期望={sent}")
+        # 没有分担流量的上游，卡片数字就是 0（不应该编造出数字）
+        cu = cards.get("up-b") or {}
+        check("未命中的上游显示 0", cu.get("requests") == 0 and cu.get("successes") == 0,
+              f"up-b req={cu.get('requests')} ok={cu.get('successes')}")
+
+        # 故障转移下的「按上游筛选」：a 失败、请求在 b 上成功时，
+        # a 这一次失败尝试也必须能被筛出来 —— 否则用户只看到成功的那些，
+        # 看不到「某上游一直失败但请求在别家兜住了」的真相。
+        with lock:
+            behavior["a"] = "fail500"
+        st, _, _ = post()
+        with lock:
+            behavior["a"] = "ok"
+        check("故障转移后请求仍成功（落在 up-b）", st == 200, str(st))
+        st, fo = get("/admin/journal?upstream=" + urllib.parse.quote("up-a"))
+        rows = fo.get("entries") or []
+        check("失败换家的上游也能被筛出来（匹配 trail）",
+              any(any((s or {}).get("upstream") == "up-a"
+                      and not (s or {}).get("ok")
+                      for s in (e.get("trail") or [])) for e in rows),
+              f"total={fo.get('total')}")
+        foups = {u["key"]: u for u in (fo.get("upstreams") or [])}
+        check("组内上游计数按每次尝试（失败也计入）",
+              foups.get("up-a", {}).get("failed", 0) >= 1, str(foups))
+    finally:
+        stop_router(p)
+
+    # ================= 30. HTTP/1.1 长连接：每条请求各读各的 body =================
+    # 回归：body 缓存曾经只在 setup 里清（每条连接一次），
+    # 同一连接上的第二条请求会读到上一条的 body —— 表现就是
+    # 「点启用要点很多次」「添加后拉取退化成拉全部」。
+    print("\n[30] 长连接下每条请求各读各的 body")
+    cleanup()
+    cfg = write_config(with_routes=True)
+    p = start_router(cfg)
+    try:
+        import http.client as _http
+
+        def ka_post(conn, path, payload):
+            body = json.dumps(payload)
+            conn.request("POST", path, body=body,
+                         headers={"Content-Type": "application/json",
+                                  "Content-Length": str(len(body.encode()))})
+            r = conn.getresponse()
+            return r.status, json.loads(r.read())
+
+        conn = _http.HTTPConnection("127.0.0.1", PORT, timeout=30)
+        try:
+            st1, r1 = ka_post(conn, "/admin/upstream/add",
+                              {"name": "ka-test",
+                               "base_url": f"http://127.0.0.1:{UP_PORTS['a']}"})
+            new_id = (r1.get("upstream") or {}).get("id")
+            check("长连接：添加上游成功", st1 == 200 and bool(new_id), str(r1)[:200])
+
+            # 同一条连接紧接着发：只该拉这一个上游。
+            # 如果复用了上一条 body，这里就没有 ids，会退化成拉全部。
+            st2, r2 = ka_post(conn, "/admin/fetch-models", {"ids": [new_id]})
+            ids = [x.get("id") for x in (r2.get("results") or [])]
+            check("长连接：fetch 只拉指定上游（没退化成拉全部）",
+                  st2 == 200 and ids == [new_id], f"ids={ids}")
+
+            # 同一条连接连续两次 update：第二次必须真的生效
+            st3, r3 = ka_post(conn, "/admin/upstream/update",
+                              {"id": new_id, "enabled": False})
+            off = (r3.get("upstream") or {}).get("enabled")
+            st4, r4 = ka_post(conn, "/admin/upstream/update",
+                              {"id": new_id, "enabled": True})
+            on = (r4.get("upstream") or {}).get("enabled")
+            check("长连接：连续停用再启用，第二次生效",
+                  off is False and on is True, f"off={off} on={on}")
+        finally:
+            conn.close()
     finally:
         stop_router(p)
 

@@ -22,6 +22,12 @@ failure_threshold = 3
 # 踢出后多久自动恢复（秒）
 cooldown_seconds = 60
 
+# 请求明细保留多少条（网页「请求记录」列表能翻出多少条）。
+# 这只限制**明细列表**，不影响统计口径：总请求数、成功/失败次数、
+# token 用量都是全量累计，按天汇总存在 .llmrouter/<配置名>.stats.json 里，
+# 重启不清零，明细被裁掉多少都不会让统计数字变小。
+history_limit = 500
+
 
 # ---------------------------------------------------------------------------
 # 上游来源：有几个写几个，[[upstreams]] 可以重复很多组
@@ -77,6 +83,14 @@ api_key = "你的火山key"
 #
 # 注意 entries 里的 model 是「上游那边的真实名字」，而分组名（下面的键）
 # 才是客户端调用的名字 —— 各家把 deepseek 叫成不同名字时，就靠这个对应关系。
+#
+# entries 里的 quota 可省略：
+#   不写        = 不限量（默认）
+#   0           = 这家不调用（请求时跳过，排序时沉到最后）
+#   大于 0 的数 = 记一个上限（只作记录，不会自动停用；停用请填 0）
+#
+# orderings 里可以预存几套具名排序（名字 → 成员顺序），
+# 平时用网页上的「保存当前顺序为…」「按测速重排并保存」更省事。
 # ---------------------------------------------------------------------------
 
 # [models."deepseek"]              # 客户端用这个名字调用
@@ -84,7 +98,13 @@ api_key = "你的火山key"
 # entries = [
 #   { upstream = "u1", model = "ds1" },                        # A 家叫 ds1
 #   { upstream = "u2", model = "ds2" },                        # B 家叫 ds2
-#   { upstream = "u3", model = "deepseek-ai/DeepSeek-V3" },    # C 家叫这个
+#   { upstream = "u3", model = "deepseek-ai/DeepSeek-V3", quota = 0 },  # C 家这个先不用
+# ]
+# [models."deepseek".orderings]    # 可选：预存排序（顺序里写 upstream + model）
+# "原始" = [
+#   { upstream = "u1", model = "ds1" },
+#   { upstream = "u2", model = "ds2" },
+#   { upstream = "u3", model = "deepseek-ai/DeepSeek-V3" },
 # ]
 #
 # [models."glm"]
