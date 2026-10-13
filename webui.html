@@ -589,6 +589,7 @@ let state = null;
 let pageVersion = null;  // 服务端版本号，变了就自动重载（避免旧 JS 配新后端）
 let editing = null;      // { name, strategy, picks:[{id,name,hasModel,model,enabled}] }
 let lastTest = {};
+let lastTestByModel = {};   // 每个模型各测一次的结果，key = "上游id|模型名"
 let serverUrl = location.origin;
 
 function pad2(n) { return String(n).padStart(2, "0"); }
@@ -675,6 +676,32 @@ function restorePickScroll(root) {
   });
 }
 
+// 每个模型的测速结果：一行一个模型，标出 可用/不可用/限流 + 延迟。
+// 数据来源：本次会话刚测的(lastTestByModel)，或持久化的 u.last_checks。
+function modelCheckEntry(u, m) {
+  return lastTestByModel[`${u.id}|${m}`]
+    || (u.last_checks || {})[m]
+    || null;
+}
+function checkBadge(c) {
+  if (!c) return "";
+  let label, color;
+  if (c.rate_limited) { label = "限流"; color = "var(--warn)"; }
+  else if (c.ok) { label = "可用"; color = "var(--ok)"; }
+  else { label = "不可用"; color = "var(--bad)"; }
+  const lat = (c.ok && c.latency_seconds != null) ? " " + fmtLat(c.latency_seconds) : "";
+  return `<span class="badge mono" style="color:${color};border-color:currentColor" title="${esc(c.error || "")}">${label}${lat}</span>`;
+}
+// 该上游勾选的每个模型各一行测试结果(没测过的也列出来，提示去测)
+function renderCheckResults(u) {
+  const sel = u.selected_models || [];
+  if (!sel.length) return "";
+  const rows = sel.map(m => {
+    const c = modelCheckEntry(u, m);
+    return `<span class="mchip" style="display:inline-flex;align-items:center;gap:5px">${esc(m)} ${c ? checkBadge(c) : '<span class="badge" style="color:var(--dim)">未测</span>'}</span>`;
+  }).join("");
+  return `<div class="models-wrap" style="margin-top:8px">${rows}</div>`;
+}
 function renderUpstreams() {
   const ups = state.upstreams || [];
   // 用户正在分组输入框里操作（或下拉开着）时不要重建 DOM，
@@ -750,6 +777,7 @@ function renderUpstreams() {
               background:${latColor(lat)}"></i></div>` : ""}
       ${u.models_error ? `<div class="hint" style="color:var(--bad)">拉取失败：${esc(u.models_error)}</div>` : ""}
       ${u.last_error && !u.models_error ? `<div class="hint">最近错误：${esc(u.last_error)}</div>` : ""}
+      ${renderCheckResults(u)}
       ${open ? renderPickPanel(u) : ""}
     </div>`;
   }).join("");
@@ -1668,19 +1696,24 @@ async function delUpstream(id) {
 }
 
 async function testUpstream(id) {
-  toast("正在测速…");
+  const u = (state.upstreams || []).find(x => x.id === id);
+  const n = u ? ((u.selected_models || []).length || 1) : 1;
+  toast(`正在测速(${n} 个模型各测一次)…`);
   try {
     const r = await api("/admin/speedtest", { ids: [id] });
-    const one = (r.results || [])[0];
-    if (one) {
-      lastTest[one.id] = one;
-      if (one.rate_limited) {
-        toast(`${one.name} 限流（暂时不可用）：${one.error || ""}`, "warn");
-      } else if (one.ok) {
-        toast(`${one.name} 正常，延迟 ${fmtLat(one.latency_seconds)}`, "ok");
-      } else {
-        toast(`${one.name} 失败：${one.error || ""}`, "bad");
-      }
+    const res = r.results || [];
+    const sum = (r.upstreams || [])[0];
+    // 每个模型一条结果，都存下来，卡片上逐条展示
+    res.forEach(x => { if (x && x.id) lastTestByModel[`${x.id}|${x.model}`] = x; });
+    if (sum) lastTest[id] = sum;
+    if (!res.length) { toast("这个上游还没勾选任何模型，先拉取并勾选", "bad"); }
+    else if (sum && sum.ok) {
+      const nOk = res.filter(x => x.ok).length;
+      toast(`${sum.name}：${nOk}/${res.length} 个模型可用，最快 ${fmtLat(sum.latency_seconds)}`, "ok");
+    } else if (sum && sum.rate_limited) {
+      toast(`${sum.name} 限流(暂时不可用)`, "warn");
+    } else {
+      toast(`${sum ? sum.name : ""} 全部模型都失败`, "bad");
     }
   } catch (e) { toast("测速失败：" + e.message, "bad"); }
   await refresh();

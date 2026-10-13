@@ -919,9 +919,15 @@ def main():
 
         st, r = admin("/admin/speedtest")
         res = r.get("results") or []
-        check("测速返回三个上游", len(res) == 3, str(len(res)))
+        # 现在按「每个上游勾选的每个模型」各测一次：a1 勾了 2 个、b1 勾了 1 个、
+        # c1 没勾 → 退回它的第一个可用模型。合计 4 条。
+        check("测速按模型逐条返回(a1 两个 + b1 一个 + c1 兜底一个)",
+              len(res) == 4, str(len(res)))
         check("测速都成功", all(x["ok"] for x in res), str(res))
         check("测速带延迟", all(x.get("latency_seconds") is not None for x in res), str(res))
+        check("测速结果带 model 字段", all(x.get("model") for x in res), str(res))
+        check("上游汇总也返回",
+              len(r.get("upstreams") or []) == 3, str(r.get("upstreams")))
 
         behavior["b"] = "fail500"
         st, r = admin("/admin/speedtest", {"ids": ["b1"]})

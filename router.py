@@ -357,6 +357,11 @@ class Upstream:
         self.models_error: Optional[str] = cfg.get("models_error")
         # 最近一次连通性测试结果(持久化，重启后还在)
         self.last_check: Optional[dict] = cfg.get("last_check")
+        # 每个模型各测一次的结果(model -> {ok/latency/at/...})，持久化
+        raw_checks = cfg.get("last_checks")
+        self.last_checks: dict[str, dict] = (
+            {str(k): v for k, v in raw_checks.items()} if isinstance(raw_checks, dict) else {}
+        )
 
         # 用户勾选了哪些模型要用（存的是上游这边的真实模型名）。
         # None 表示「状态文件里没这个字段」（升级前的老状态），
@@ -498,17 +503,25 @@ class Upstream:
             self.latency_samples = 0
 
     def _remember_check(self, result: dict) -> None:
-        """记下最近一次连通性测试结果，随状态持久化。"""
+        """记下最近一次连通性测试结果，随状态持久化。
+
+        按模型分别记(last_checks[model])：一个上游可能勾了多个模型，
+        每个模型的连通性/延迟各不一样，要能分别看到。
+        """
+        entry = {
+            "at": result.get("at") or time.time(),
+            "ok": bool(result.get("ok")),
+            "status": result.get("status"),
+            "latency_seconds": result.get("latency_seconds"),
+            "error": result.get("error"),
+            "rate_limited": bool(result.get("rate_limited")),
+            "model": result.get("model"),
+        }
         with self._lock:
-            self.last_check = {
-                "at": result.get("at") or time.time(),
-                "ok": bool(result.get("ok")),
-                "status": result.get("status"),
-                "latency_seconds": result.get("latency_seconds"),
-                "error": result.get("error"),
-                "rate_limited": bool(result.get("rate_limited")),
-                "model": result.get("model"),
-            }
+            self.last_check = entry
+            m = entry.get("model")
+            if m:
+                self.last_checks[str(m)] = entry
 
     def snapshot(self) -> dict:
         with self._lock:
@@ -539,6 +552,7 @@ class Upstream:
                 "avg_latency_seconds": round(avg, 3),
                 "last_used": self.last_used or None,
                 "last_check": self.last_check,
+                "last_checks": dict(self.last_checks),
             }
 
     def state(self) -> dict:
@@ -555,6 +569,7 @@ class Upstream:
             "models_fetched_at": self.models_fetched_at,
             "models_error": self.models_error,
             "last_check": self.last_check,
+            "last_checks": dict(self.last_checks),
         }
 
     # ---- 请求上游 ----
@@ -2484,7 +2499,9 @@ class Router:
             raise ValueError("缺少测速结果，先点「测速」再重排")
         self._check_label(label)
 
-        lat: dict[str, Optional[float]] = {}
+        # 优先按 (上游, 模型) 精确匹配延迟；没有 model 的结果退回按上游匹配。
+        lat: dict[tuple[str, str], Optional[float]] = {}
+        lat_uid: dict[str, Optional[float]] = {}
         for r in results:
             if not isinstance(r, dict):
                 continue
@@ -2493,13 +2510,20 @@ class Router:
                 continue
             v = r.get("latency_seconds")
             ok = r.get("ok", v is not None)
-            lat[uid] = float(v) if (ok and isinstance(v, (int, float))) else None
+            val = float(v) if (ok and isinstance(v, (int, float))) else None
+            m = r.get("model")
+            if m:
+                lat[(uid, str(m))] = val
+            else:
+                lat_uid[uid] = val
 
         def sort_key(idx_entry: tuple[int, RouteEntry]):
             idx, e = idx_entry
             if e.skipped():
                 return (2, 0.0, idx)          # 额度 0：直接放最后
-            v = lat.get(e.upstream_id)
+            v = lat.get((e.upstream_id, e.model))
+            if v is None and (e.upstream_id, e.model) not in lat:
+                v = lat_uid.get(e.upstream_id)
             # 没结果的、失败的：排到（非 0 额度里的）最后，内部保持原相对顺序
             return (0 if v is not None else 1, v if v is not None else 0.0, idx)
 
@@ -3548,21 +3572,56 @@ class Handler(BaseHTTPRequestHandler):
             targets = [u for u in self.router.upstreams
                        if u.enabled and (not ids or u.id in set(str(i) for i in ids))]
             if not targets:
-                return {"ok": True, "results": []}
+                return {"ok": True, "results": [], "upstreams": []}
+            # 每个上游：对它**勾选了的每个模型**各测一次(一个上游勾了多个
+            # 模型时，各模型的连通性/延迟不一样，只测第一个会骗人)。
+            # 一个都没勾选时退回第一个可用模型，至少给个基本判断。
+            jobs: list[tuple[Upstream, str]] = []
+            for u in targets:
+                models = list(u.selected())
+                if not models:
+                    models = list(u.available_models[:1])
+                for m in models:
+                    jobs.append((u, m))
+            if not jobs:
+                return {"ok": True, "results": [], "upstreams": []}
             results: list[dict] = []
             with concurrent.futures.ThreadPoolExecutor(
-                    max_workers=min(8, len(targets))) as pool:
-                futures = [pool.submit(u.ping) for u in targets]
-                for fut in concurrent.futures.as_completed(futures, timeout=90):
+                    max_workers=min(8, len(jobs))) as pool:
+                futures = {pool.submit(u.ping, m): (u, m) for u, m in jobs}
+                for fut in concurrent.futures.as_completed(futures, timeout=180):
+                    u, m = futures[fut]
                     try:
                         results.append(fut.result())
                     except Exception as exc:  # noqa: BLE001
-                        results.append({"ok": False, "error": str(exc), "latency_seconds": None})
+                        results.append({"id": u.id, "name": u.name, "model": m,
+                                        "ok": False, "latency_seconds": None,
+                                        "error": f"{type(exc).__name__}: {exc}"})
             order = {u.id: i for i, u in enumerate(self.router.upstreams)}
-            results.sort(key=lambda r: order.get(r.get("id", ""), 999))
+            results.sort(key=lambda r: (order.get(r.get("id", ""), 999),
+                                         str(r.get("model") or "")))
+            # 每个上游的汇总(取第一个成功的延迟)——给「按测速重排」和卡片汇总用
+            summary: dict[str, dict] = {}
+            for r in results:
+                uid = r.get("id")
+                if uid not in summary:
+                    summary[uid] = {"id": uid, "name": r.get("name"),
+                                    "ok": False, "latency_seconds": None,
+                                    "rate_limited": False, "model_count": 0}
+                s = summary[uid]
+                s["model_count"] += 1
+                if r.get("ok"):
+                    s["ok"] = True
+                    lat = r.get("latency_seconds")
+                    if lat is not None and (s["latency_seconds"] is None
+                                             or lat < s["latency_seconds"]):
+                        s["latency_seconds"] = lat
+                elif r.get("rate_limited"):
+                    s["rate_limited"] = True
             # 连通性结果要持久化(重启后仍能看到上次测试)
             self.router._save_state()
-            return {"ok": True, "results": results}
+            return {"ok": True, "results": results,
+                    "upstreams": list(summary.values())}
         status, out = self._result(go)
         self._send_json(status, out)
 
