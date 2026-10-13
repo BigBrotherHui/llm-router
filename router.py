@@ -3201,6 +3201,8 @@ class Handler(BaseHTTPRequestHandler):
             if path.startswith("/v1/"):
                 if path == "/v1/models" and method == "GET":
                     return self._handle_models()
+                if path == "/v1/messages" and method == "POST":
+                    return self._handle_anthropic_messages()
                 return self._proxy(method, path)
             return self._send_json(404, {"error": {"message": f"未知路径 {path}"}})
         except BrokenPipeError:
@@ -3710,20 +3712,62 @@ class Handler(BaseHTTPRequestHandler):
         self.router.stats.record(entry)
 
     # ---- 核心代理 ----
-    def _proxy(self, method: str, path: str) -> None:
-        raw_body = self._read_body() if method in ("POST", "PUT", "PATCH") else b""
+    def _handle_anthropic_messages(self) -> None:
+        """Anthropic (/v1/messages) -> OpenAI (/v1/chat/completions) 适配"""
+        raw_body = self._read_body()
+        try:
+            body = json.loads(raw_body)
+        except Exception:
+            return self._send_json(400, {"error": {"message": "Invalid JSON"}})
 
-        payload: Optional[dict] = None
+        # 核心转换逻辑：Anthropic Messages -> OpenAI Chat
+        msgs = []
+        # 处理 system prompt
+        if "system" in body:
+            msgs.append({"role": "system", "content": body["system"]})
+        
+        # 处理消息体
+        for m in body.get("messages", []):
+            role = m.get("role")
+            content = m.get("content")
+            # 简单的内容块转换（目前仅处理文本）
+            text_content = ""
+            if isinstance(content, str):
+                text_content = content
+            elif isinstance(content, list):
+                for part in content:
+                    if part.get("type") == "text":
+                        text_content += part.get("text", "")
+            msgs.append({"role": role, "content": text_content})
+
+        openai_payload = {
+            "model": body.get("model", "claude-3-5-sonnet"),
+            "messages": msgs,
+            "stream": body.get("stream", False),
+            "max_tokens": body.get("max_tokens", 4096)
+        }
+        self._proxy("POST", "/v1/chat/completions", custom_payload=openai_payload)
+
+    def _proxy(self, method: str, path: str, custom_payload: Any = None) -> None:
+        if custom_payload:
+            payload = custom_payload
+            raw_body = json.dumps(custom_payload).encode("utf-8")
+        else:
+            raw_body = self._read_body() if method in ("POST", "PUT", "PATCH") else b""
+            payload = None
+
         requested_model: Optional[str] = None
-        if raw_body:
+        if not payload and raw_body:
             try:
                 parsed = json.loads(raw_body)
                 if isinstance(parsed, dict):
                     payload = parsed
-                    m = parsed.get("model")
-                    requested_model = str(m) if m else None
             except Exception:
                 payload = None
+        
+        if payload:
+            m = payload.get("model")
+            requested_model = str(m) if m else None
 
         pairs, route_source = self.router.resolve(requested_model)
         if not pairs:
