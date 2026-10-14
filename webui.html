@@ -266,11 +266,25 @@
     border:1px solid var(--line);border-radius:8px;padding:10px 12px;margin-bottom:7px;
     /* 这一行挺宽（模型名 + 参与 + 额度 + 并发/速率 + 测试），窗口窄时
        让动作区整体换到第二行，别把上游名字挤成两行 */
-    flex-wrap:wrap}
-  .pick.dragging{opacity:.35}
-  .pick.target{border-color:var(--accent);border-style:dashed}
-  .handle{cursor:grab;color:var(--dim);user-select:none;font-size:15px}
-  .handle:active{cursor:grabbing}
+    flex-wrap:wrap;
+    /* 整行都可以按住拖（见拖动排序那段），所以不让选中文字；
+       输入框照旧能选、能改 */
+    user-select:none;-webkit-user-select:none}
+  .pick input,.pick select{user-select:text;-webkit-user-select:text}
+  /* 拖动排序（Pointer Events，鼠标/触屏通用，见 JS 里 pickDrag 那一段）：
+     被拖的行跟着手指抬起来，其它行用 transition 让出空位 */
+  .pick.dragging{opacity:.96;z-index:3;box-shadow:0 8px 22px rgba(0,0,0,.55);
+    border-color:var(--accent);background:var(--panel3);cursor:grabbing;transition:none}
+  .pick.shifting{transition:transform .13s ease}
+  .pick.pressing{background:var(--panel3)}
+  body.pick-dragging{user-select:none;-webkit-user-select:none}
+  .handle{cursor:grab;color:var(--dim);user-select:none;font-size:15px;
+    /* 手柄上按下就直接开拖；touch-action:none 免得触屏这一下被滚动抢走 */
+    touch-action:none;-webkit-touch-callout:none;padding:6px 8px;margin:-6px -4px}
+  .handle:active{cursor:grabbing;color:var(--accent)}
+  /* 手机上的 ↑↓ 兜底：悬停拖拽在小屏上本来就不好使 */
+  .pick-move{display:none;gap:4px}
+  @media(max-width:680px){.pick-move{display:flex}}
   .seqnum{background:var(--bg);border:1px solid var(--line);color:var(--dim);
     border-radius:5px;padding:1px 7px;font-size:11px;min-width:24px;text-align:center}
   .pick-name{font-weight:500;white-space:nowrap}
@@ -511,7 +525,7 @@
     <div class="hint" id="mStrategyHint" style="margin-bottom:16px"></div>
 
     <div class="row" style="margin-bottom:8px">
-      <span class="hint" style="flex:1">参与的上游与顺序（拖 <span class="mono">⠿</span> 调整）；最右列是调用额度（留空 = 不限量，0 = 不调用）</span>
+      <span class="hint" style="flex:1">参与的上游与顺序（拖 <span class="mono">⠿</span> 调整，手机上长按整行也能拖，或用行里的 <span class="mono">↑↓</span>）；最右列是调用额度（留空 = 不限量，0 = 不调用）</span>
     </div>
     <div id="mPicks"></div>
     <div class="hint" id="mQuotaHint" style="margin-top:6px"></div>
@@ -1337,11 +1351,15 @@ function renderModal() {
       还没有选任何上游。用下面的下拉框加一个。</div>`;
   } else {
     $("#mPicks").innerHTML = picks.map((p, i) => `
-      <div class="pick" draggable="true" data-idx="${i}">
-        <span class="handle" title="拖动调整顺序">⠿</span>
+      <div class="pick" data-idx="${i}">
+        <span class="handle" title="按住拖动调整顺序">⠿</span>
         <span class="seqnum">${i + 1}</span>
         <span class="pick-name">${esc(p.name)}</span>
         <div class="pick-actions">
+          <div class="pick-move">
+            <button class="mini" data-act="up" title="上移一位" ${i === 0 ? "disabled" : ""}>↑</button>
+            <button class="mini" data-act="down" title="下移一位" ${i === picks.length - 1 ? "disabled" : ""}>↓</button>
+          </div>
           ${p.model && p.model !== name
             ? `<span class="badge purple mono" title="这个上游那边的真实模型名">${esc(p.model)}</span>`
             : `<span class="badge blue mono">${esc(p.model || name)}</span>`}
@@ -1455,23 +1473,9 @@ function bindModal() {
     el.querySelector('[data-act="enable"]').onchange = e => {
       editing.picks[i].enabled = e.target.checked; renderModal();
     };
-    el.addEventListener("dragstart", e => {
-      dragIdx = i; el.classList.add("dragging"); e.dataTransfer.effectAllowed = "move";
-    });
-    el.addEventListener("dragend", () => {
-      el.classList.remove("dragging");
-      document.querySelectorAll(".pick").forEach(x => x.classList.remove("target"));
-      dragIdx = null;
-    });
-    el.addEventListener("dragover", e => { e.preventDefault(); el.classList.add("target"); });
-    el.addEventListener("dragleave", () => el.classList.remove("target"));
-    el.addEventListener("drop", e => {
-      e.preventDefault(); el.classList.remove("target");
-      if (dragIdx === null || dragIdx === i) return;
-      const moved = editing.picks.splice(dragIdx, 1)[0];
-      editing.picks.splice(i, 0, moved);
-      renderModal();
-    });
+    // 手机上的兜底：行内 ↑↓ 直接换相邻两行，不依赖拖拽手势
+    el.querySelector('[data-act="up"]').onclick = () => movePick(i, i - 1);
+    el.querySelector('[data-act="down"]').onclick = () => movePick(i, i + 1);
   });
 
   // 「测试」按钮：精确测这一行的那个模型
@@ -1563,7 +1567,318 @@ function renderQuotaHint() {
        额度为 0 的上游调用时会被直接跳过，排序时也放在最后。`
     : `不填就代表不限量。填 0 表示这家不用。`) + capNote;
 }
-let dragIdx = null;
+/* ================= 拖动排序（鼠标 + 触屏） =================
+   旧实现用 HTML5 的 dragstart/dragover/drop —— 触屏浏览器根本不发这些事件，
+   所以手机上怎么拖都没反应。现在按输入方式分两条路：
+
+   - 鼠标 / 触控笔：按在行上（按钮、输入框除外）拖过 3px 就开始，桌面手感不变
+   - 触屏：按 ⠿ 手柄直接拖；按行里别处则长按 220ms 再进入拖动 ——
+     不然手指一划就被浏览器当成滚动列表了
+
+   两条路都只是把「按下 → 跟手 → 松手」翻译成一次 movePick(from, to)，
+   落位时改 editing.picks 再重渲染，和行里的 ↑↓ 按钮是同一段逻辑。 */
+
+let pickDrag = null;           // 当前这一轮拖动（等长按的等待期也在里面，看 mode）
+const PICK_LONG_PRESS = 220;   // 触屏长按多久算「我要拖」
+const PICK_SLOP = 10;          // 触屏位移超过这么多 = 用户其实在滚列表
+const PICK_MOUSE_SLOP = 3;     // 鼠标抖动容忍
+
+// 把 picks 里的行从 from 挪到 to。行内 ↑↓ 和拖动落位都走这里
+function movePick(from, to) {
+  const picks = editing && editing.picks;
+  if (!picks) return;
+  if (from < 0 || to < 0 || from >= picks.length || to >= picks.length || from === to) return;
+  collectQuotas();               // 先把输入框里没提交的额度收进来，免得顺序变了配错行
+  picks.splice(to, 0, picks.splice(from, 1)[0]);
+  renderModal();
+}
+
+function pickRows() {
+  return [...document.querySelectorAll("#mPicks .pick")];
+}
+
+// 找指针底下那一行（不在行里就返回 null）
+function pickRowAt(target) {
+  const el = target && target.closest ? target.closest("#mPicks .pick") : null;
+  return el && el.isConnected ? el : null;
+}
+
+// 点在按钮/输入框/复选框上是要操作，不是要排序
+function pickIsControl(target) {
+  return !!(target && target.closest &&
+            target.closest("button, input, select, textarea, label, a"));
+}
+
+// 行的位置只量一次（拖动还没开始、没有任何 transform 时）：
+// 之后所有换算都基于它。不能每次移动都实时读 rect ——
+// 让位的行正带着 transform 和过渡动画，读到的是动画中间态，落点会来回跳。
+function pickMeasureBase(d) {
+  d.baseMid = d.others.map(row => {
+    const b = row.getBoundingClientRect();
+    return (b.top + b.bottom) / 2;
+  });
+}
+
+// 指针落在哪一格：只看「除自己以外的行」，越过谁的中线就插在谁前面。
+// 这么算不用管自己那行（它正跟着手指跑），也就不会自己推自己。
+function pickSlot(clientY) {
+  const d = pickDrag;
+  if (!d || !d.baseMid) return 0;
+  // 容器滚动后，行在屏幕上的位置整体上移了 scrollDelta，先补回来
+  const y = clientY + d.scrollDelta;
+  let slot = 0;
+  while (slot < d.baseMid.length && y > d.baseMid[slot]) slot++;
+  return slot;
+}
+
+// 从元素往上找滚动容器（弹窗本身）。.mask 是 overflow:auto，滚的就是它
+function pickScrollBox(el) {
+  let p = el && el.parentElement;
+  while (p && p !== document.body && p !== document.documentElement) {
+    const st = getComputedStyle(p);
+    if (/(auto|scroll)/.test(st.overflowY)) return p;
+    p = p.parentElement;
+  }
+  return document.scrollingElement || document.documentElement;
+}
+
+// 开始跟手拖动。clientY 只作为起点记下来，之后的位移都相对它算
+function pickBegin(el, clientY, touchId) {
+  if (!editing || pickDrag) return;
+  const rows = pickRows();
+  const idx = rows.indexOf(el);
+  if (idx < 0) return;
+  const rect = el.getBoundingClientRect();
+  const next = rows[idx + 1];
+  const prev = rows[idx - 1];
+  // 一格的高度 = 行高 + 行距（margin-bottom）。末行没有下一行，就问上一行。
+  const ref = next || prev;
+  const gap = ref
+    ? Math.abs((next ? next.getBoundingClientRect().top - rect.bottom
+                       : rect.top - prev.getBoundingClientRect().bottom))
+    : 0;
+  const sliceH = rect.height + Math.max(0, gap);
+  pickDrag = {
+    mode: "active", el, idx, rows, touchId,
+    others: rows.filter(r => r !== el),
+    shiftOf: new Map(),
+    startY: clientY, autoY: clientY,
+    height: sliceH, scrollBox: pickScrollBox(el),
+    scrollDelta: 0, moved: false, target: idx, raf: 0,
+  };
+  pickMeasureBase(pickDrag);
+  el.classList.remove("pressing");
+  el.classList.add("dragging");
+  document.body.classList.add("pick-dragging");
+  el.style.width = rect.width + "px";
+  startAutoScroll();
+}
+
+// 拖动中：行贴着手走，其余行让位
+function pickDragTo(clientY) {
+  const d = pickDrag;
+  if (!d || d.mode !== "active") return;
+  d.autoY = clientY;
+  const dy = clientY - d.startY + d.scrollDelta;
+  if (!d.moved) {
+    if (Math.abs(dy) < 1) return;
+    d.moved = true;
+  }
+  d.el.style.transform = `translateY(${dy}px)`;
+  const slot = pickSlot(clientY);
+  d.target = slot;
+  // 让位方向：把自己那行从列表里抽走后，其余行是紧凑的；
+  // 最终插在下标 slot 处，意味着所有 j >= slot 的行要往下让一格，
+  // 而原本排在拖动行后面的（j >= idx）本来就要往上补一格。
+  d.others.forEach((row, j) => {
+    let shift = 0;
+    if (j >= slot) shift += d.height;
+    if (j >= d.idx) shift -= d.height;
+    if ((d.shiftOf.get(row) || 0) !== shift) {
+      d.shiftOf.set(row, shift);
+      row.classList.add("shifting");
+      row.style.transform = shift ? `translateY(${shift}px)` : "";
+    }
+  });
+}
+
+// 指针停在上下边缘时要一直滚，所以开个 rAF 循环盯着 ——
+// 手停住不动就没有新事件，光靠 move 事年滚不起来。
+function startAutoScroll() {
+  const d = pickDrag;
+  if (!d || d.raf) return;
+  const step = () => {
+    const cur = pickDrag;
+    if (!cur || cur.mode !== "active") return;
+    const box = cur.scrollBox;
+    if (box && box.scrollHeight > box.clientHeight + 1) {
+      const r = box.getBoundingClientRect();
+      const band = Math.min(72, r.height / 4);
+      const y = cur.autoY;
+      let dy = 0;
+      if (y < r.top + band) dy = -Math.ceil((r.top + band - y) / 5);
+      else if (y > r.bottom - band) dy = Math.ceil((y - (r.bottom - band)) / 5);
+      if (dy) {
+        const before = box.scrollTop;
+        box.scrollTop = before + dy;
+        const real = box.scrollTop - before;
+        if (real) cur.scrollDelta += real;   // 容器滚了，补偿起点，行才继续贴着手
+      }
+    }
+    cur.raf = requestAnimationFrame(step);
+  };
+  d.raf = requestAnimationFrame(step);
+}
+
+// 松手：收尾 + 落位
+function pickFinish() {
+  const d = pickDrag;
+  if (!d || d.mode !== "active") { pickAbort(); return; }
+  const moved = d.moved && d.target !== d.idx;
+  const from = d.idx, to = d.target;
+  pickTeardown(d, d.moved);
+  if (moved) movePick(from, to);
+}
+
+// 放弃这一轮：长按还没到点就在滚列表、来了第二根手指、系统打断手势。
+// 这里只是把界面还原，不动顺序 —— 手势被系统抢走时用户多半是在滚动页面，
+// 不该顺手改掉他的路由顺序。
+function pickAbort() {
+  const d = pickDrag;
+  if (!d) return;
+  if (d.timer) clearTimeout(d.timer);
+  if (d.mode === "active") pickTeardown(d, false);
+  else {
+    if (d.el) d.el.classList.remove("pressing");
+    pickDrag = null;
+  }
+}
+
+function pickTeardown(d, swallowClick) {
+  pickDrag = null;
+  if (d.raf) cancelAnimationFrame(d.raf);
+  if (d.el) {
+    d.el.classList.remove("dragging", "pressing");
+    d.el.style.transform = "";
+    d.el.style.width = "";
+  }
+  document.body.classList.remove("pick-dragging");
+  (d.rows || []).forEach(row => {
+    row.classList.remove("shifting", "pressing");
+    row.style.transform = "";
+  });
+  // 真拖过一段距离的话，抬手时浏览器还会补一个 click：
+  // 手落在空白处会点到遮罩上把弹窗关掉，落在「移除」上会误删。
+  // 所以这一下不要了，只管界面，不认动作。
+  if (swallowClick) pickSwallowClickUntil = Date.now() + 400;
+}
+let pickSwallowClickUntil = 0;
+
+// 拖动刚结束时的 click 在捕获阶段吃掉 —— 赶在关弹窗那类处理器前面。
+// 只管弹窗遮罩和这几行里的 click，别处（比如「保存」）照旧。
+document.addEventListener("click", e => {
+  if (Date.now() > pickSwallowClickUntil) return;
+  if (e.target !== $("#modal") && !e.target.closest("#mPicks")) return;
+  e.stopPropagation();
+  e.preventDefault();
+}, true);
+
+/* ---- 触屏：走 touch 事件。只有 touchmove 能 preventDefault 明确告诉浏览器
+        「这一串移动归我」，所以触屏这条路不用 pointer。
+        监听挂在弹窗上而不是 document 上：非 passive 的 touchmove 会让浏览器
+        每次滚动都等 JS 一句话，只让弹窗里的滚动付这个代价。---- */
+const pickModal = document.getElementById("modal");
+
+pickModal.addEventListener("touchstart", e => {
+  if (!editing || pickDrag || e.touches.length !== 1) return;
+  if ($("#modal").hidden) return;
+  const el = pickRowAt(e.target);
+  if (!el || pickIsControl(e.target)) return;
+  const t = e.touches[0];
+  if (e.target.closest(".handle")) {
+    e.preventDefault();                 // 手柄按下去就是要拖，别让浏览器再想别的
+    pickBegin(el, t.clientY, t.identifier);
+    return;
+  }
+  // 行里别处：先等长按。轻轻一划应该是滚列表，不能一按就抢
+  const pending = { mode: "pending", el, startX: t.clientX, startY: t.clientY,
+                    touchId: t.identifier, timer: 0 };
+  pickDrag = pending;
+  el.classList.add("pressing");
+  const startY = t.clientY, touchId = t.identifier;
+  pending.timer = setTimeout(() => {
+    if (pickDrag !== pending) return;
+    pickDrag = null;
+    if (navigator.vibrate) { try { navigator.vibrate(12); } catch (_) {} }
+    pickBegin(el, startY, touchId);
+  }, PICK_LONG_PRESS);
+}, { passive: false });
+
+pickModal.addEventListener("touchmove", e => {
+  const d = pickDrag;
+  if (!d) return;
+  const t = [...e.touches].find(x => x.identifier === d.touchId);
+  if (!t) return;
+  if (d.mode === "pending") {
+    if (Math.hypot(t.clientX - d.startX, t.clientY - d.startY) > PICK_SLOP) pickAbort();
+    return;
+  }
+  e.preventDefault();                   // 已经在拖了，这段移动不许再拿去滚列表
+  pickDragTo(t.clientY);
+}, { passive: false });
+
+pickModal.addEventListener("touchend", e => {
+  const d = pickDrag;
+  if (!d) return;
+  if (d.mode === "pending") { pickAbort(); return; }
+  // 那根手指抬起来了才算结束；还有别的手指按着就继续
+  if (![...e.touches].some(x => x.identifier === d.touchId)) pickFinish();
+});
+pickModal.addEventListener("touchcancel", () => pickAbort());
+
+/* ---- 鼠标 / 触控笔：pointer 事件，没有滚动冲突，按住拖过阈值就开始 ---- */
+document.addEventListener("pointerdown", e => {
+  if (!editing || pickDrag) return;
+  if (e.pointerType === "touch") return;       // 触屏归上面那套管
+  if (e.button !== 0) return;
+  if ($("#modal").hidden) return;
+  const el = pickRowAt(e.target);
+  if (!el || pickIsControl(e.target)) return;
+  pickDrag = { mode: "armed", el, startX: e.clientX, startY: e.clientY,
+               pointerId: e.pointerId };
+});
+
+document.addEventListener("pointermove", e => {
+  const d = pickDrag;
+  if (!d || d.pointerId !== e.pointerId) return;
+  if (d.mode === "armed") {
+    if (Math.hypot(e.clientX - d.startX, e.clientY - d.startY) < PICK_MOUSE_SLOP) return;
+    const el = d.el;
+    const pid = e.pointerId;
+    pickDrag = null;
+    pickBegin(el, e.clientY, null);
+    if (pickDrag) {
+      pickDrag.pointerId = pid;
+      // 抓住指针：拖到窗口外松手也能收到 pointerup，不会留一个卡住的状态
+      try { el.setPointerCapture(pid); } catch (_) {}
+    }
+    return;
+  }
+  if (d.mode === "active") pickDragTo(e.clientY);
+});
+
+document.addEventListener("pointerup", e => {
+  const d = pickDrag;
+  if (!d || d.pointerId !== e.pointerId) return;
+  if (d.mode === "armed") { pickDrag = null; return; }    // 只是点了一下
+  try { d.el.releasePointerCapture(e.pointerId); } catch (_) {}
+  pickFinish();
+});
+
+document.addEventListener("pointercancel", e => {
+  const d = pickDrag;
+  if (d && d.pointerId === e.pointerId) pickAbort();
+});
 
 /* ================= 操作 ================= */
 // 测试某一行(某上游 + 它的那个真实模型)的连通性。

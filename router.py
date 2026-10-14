@@ -37,7 +37,7 @@ import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any, Optional
 
-__version__ = "2.4.1"
+__version__ = "2.4.2"
 
 WEBUI_FILENAME = "webui.html"
 
