@@ -263,15 +263,18 @@
   .seg button.active{background:var(--accent);color:#04121f;font-weight:600}
   .seg button.active:hover{color:#04121f}
   .pick{display:flex;align-items:center;gap:10px;background:var(--panel2);
-    border:1px solid var(--line);border-radius:8px;padding:10px 12px;margin-bottom:7px}
+    border:1px solid var(--line);border-radius:8px;padding:10px 12px;margin-bottom:7px;
+    /* 这一行挺宽（模型名 + 参与 + 额度 + 并发/速率 + 测试），窗口窄时
+       让动作区整体换到第二行，别把上游名字挤成两行 */
+    flex-wrap:wrap}
   .pick.dragging{opacity:.35}
   .pick.target{border-color:var(--accent);border-style:dashed}
   .handle{cursor:grab;color:var(--dim);user-select:none;font-size:15px}
   .handle:active{cursor:grabbing}
   .seqnum{background:var(--bg);border:1px solid var(--line);color:var(--dim);
     border-radius:5px;padding:1px 7px;font-size:11px;min-width:24px;text-align:center}
-  .pick-name{font-weight:500}
-  .pick-actions{margin-left:auto;display:flex;gap:6px;align-items:center}
+  .pick-name{font-weight:500;white-space:nowrap}
+  .pick-actions{margin-left:auto;display:flex;gap:6px;align-items:center;flex-wrap:wrap}
   .preview{display:flex;gap:5px;flex-wrap:wrap;align-items:center;margin-top:8px;
     padding:9px 11px;background:var(--bg);border-radius:7px;border:1px solid var(--line)}
   .preview .t{font-size:11px;padding:2px 8px;border-radius:5px;background:var(--panel3);
@@ -286,6 +289,14 @@
   .quota-cell input[type=number]{width:80px;background:var(--bg);border:1px solid var(--line);
     border-radius:7px;color:var(--text);padding:5px 8px;font-size:12.5px}
   .quota-cell .badge.bad{opacity:.9}
+  /* 并发 / 速率上限（这一列配的是**上游**的容量，不是这个分组的） */
+  .cap-cell{display:flex;align-items:center;gap:4px;white-space:nowrap}
+  .cap-cell input[type=number]{width:52px;background:var(--bg);border:1px solid var(--line);
+    border-radius:7px;color:var(--text);padding:5px 6px;font-size:12.5px;text-align:center}
+  .cap-k{font-size:11px;color:var(--dim)}
+  .cap-live{font-size:11px;font-family:Consolas,Monaco,monospace;color:var(--dim)}
+  .cap-live.full{color:var(--warn)}
+  .cap-live.off{opacity:.55}
   @media(max-width:680px){
     .up-actions{margin-left:0;width:100%}
     .modal{padding:15px}
@@ -568,6 +579,19 @@
       <label class="row" style="gap:7px;cursor:pointer">
         <input type="checkbox" id="eEnabled"> <span style="font-size:13px">启用这个上游</span>
       </label>
+      <div class="grid" style="gap:5px">
+        <span class="hint">容量上限（留空 = 不限量；配在这个上游上，所有分组共用）</span>
+        <div class="row" style="gap:10px">
+          <label class="cap-cell" title="同时在跑的请求数上限。满了就自动换下一家，不会让请求失败。">
+            <span class="cap-k">并发</span>
+            <input type="number" min="0" step="1" id="eCapC" placeholder="∞">
+          </label>
+          <label class="cap-cell" title="60 秒内最多发几次（滑动窗口，不是整点清零）。超了就换下一家。">
+            <span class="cap-k">每分钟</span>
+            <input type="number" min="0" step="1" id="eCapM" placeholder="∞">
+          </label>
+        </div>
+      </div>
     </div>
     <div class="row" style="margin-top:18px">
       <button class="primary" id="eSave">保存</button>
@@ -702,6 +726,19 @@ function renderCheckResults(u) {
   }).join("");
   return `<div class="models-wrap" style="margin-top:8px">${rows}</div>`;
 }
+// 上游卡片上的容量标记：设了上限才显示，顺带带上此刻的占用。
+// 上限是配在**上游**上的（所有引用它的分组共用），所以放在卡片上而不是分组弹窗里。
+function capBadge(u) {
+  const c = u.capacity;
+  if (!c || (c.max_concurrent == null && c.max_per_minute == null)) return "";
+  const full = c.has_room === false;
+  const tip = full
+    ? "此刻已满：新请求会先换别家；整组都满才排队等一会儿"
+    : "此刻还有余量";
+  return `<span class="badge ${full ? "warn" : "mono"}" title="${tip}">${
+    capLiveText(c)}</span>`;
+}
+
 function renderUpstreams() {
   const ups = state.upstreams || [];
   // 用户正在分组输入框里操作（或下拉开着）时不要重建 DOM，
@@ -754,6 +791,7 @@ function renderUpstreams() {
         ${nAvail
           ? `<span class="badge ${nSel ? "blue" : "warn"}">已选用 ${nSel} / ${nAvail} 个模型</span>`
           : `<span class="badge warn">还没拉取模型</span>`}
+        ${capBadge(u)}
         ${u.models_fetched_at ? `<span class="badge">${whenText(u.models_fetched_at)}拉取</span>` : ""}
         <div class="up-actions">
           <button class="mini primary" data-act="models" ${nAvail ? "" : "disabled"}>
@@ -1234,6 +1272,47 @@ function pickTestBadge(p) {
   const tip = t.error ? esc(t.error) : "";
   return `<span class="badge mono" style="color:${color};border-color:currentColor" title="${tip}">${label}${lat}</span>`;
 }
+
+// 实时占用的文案，弹窗里和卡片上共用一份，免得两处对不上。
+// 只在设了对应上限时显示那一项 —— 没设就是「不限量」，数字没意义。
+function capLiveText(cap) {
+  const parts = [];
+  if (cap.max_concurrent != null) parts.push(`${cap.in_flight || 0}/${cap.max_concurrent} 并发`);
+  if (cap.max_per_minute != null) parts.push(`每分钟 ${cap.used_last_minute || 0}/${cap.max_per_minute}`);
+  return (cap.has_room === false ? "满 · " : "") + parts.join(" · ");
+}
+
+// 这一行的并发 / 每分钟上限 + 实时占用。
+//
+// 上限是配在**上游**身上的（反映那个账号/Key 的真实配额），不是这个分组独有的：
+// 同一个上游出现在多个分组里时，配额是共用的一份 —— 每个分组各设一套的话，
+// 两个分组各写 5 并发，实际会同时打进 10 个，上限就白设了。
+// 所以这里改的是一份共用配置，界面上也直说。
+function capCell(p, i) {
+  const u = (state.upstreams || []).find(x => x.id === p.id);
+  const cap = (u && u.capacity) || {};
+  const mc = cap.max_concurrent == null ? "" : cap.max_concurrent;
+  const mp = cap.max_per_minute == null ? "" : cap.max_per_minute;
+  const hasLimit = mc !== "" || mp !== "";
+  // 实时占用：只有设了上限才值得显示（没设就是「不限量」，数字没意义）
+  let live = "";
+  if (hasLimit) {
+    live = `<span class="cap-live${cap.has_room === false ? " full" : ""}" title="${
+      cap.has_room === false
+        ? "此刻已满：新请求会先换别家，全都满了才排队等"
+        : "此刻还有余量"
+    }">${capLiveText(cap)}</span>`;
+  }
+  return `<span class="cap-cell" title="并发 / 每分钟上限（留空 = 不限）。
+配在这个**上游**上：它在别的分组里也共用同一份配额。
+满了就自动换下一个上游，不影响调用；整组都满才排队等一会儿。">
+      <span class="cap-k">并发</span>
+      <input type="number" min="0" step="1" data-cap-c="${i}" placeholder="∞" value="${mc}">
+      <span class="cap-k">/分</span>
+      <input type="number" min="0" step="1" data-cap-m="${i}" placeholder="∞" value="${mp}">
+      ${live}
+    </span>`;
+}
 function renderModal() {
   if (!editing) return;
   const { name, strategy, picks } = editing;
@@ -1274,6 +1353,7 @@ function renderModal() {
                    placeholder="不限量" value="${p.quota === "" || p.quota == null ? "" : p.quota}">
             ${p.quota === 0 ? `<span class="badge bad">不调用</span>` : ""}
           </label>
+          ${capCell(p, i)}
           <button class="mini" data-act="test" data-idx="${i}"
                   title="给这家发一个最小请求，测的就是这一行那个模型">测试</button>
           ${pickTestBadge(p)}
@@ -1424,16 +1504,64 @@ function bindModal() {
     inp.addEventListener("change", commit);
     inp.addEventListener("keydown", e => { if (e.key === "Enter") { commit(); inp.blur(); } });
   });
+
+  // 并发 / 每分钟上限：改完立刻落盘（这个不跟着「保存」走 ——
+  // 它属于上游的容量配置，和这个分组的路由是两回事，没必要等到点保存）
+  document.querySelectorAll("#mPicks input[data-cap-c], #mPicks input[data-cap-m]").forEach(inp => {
+    const commit = async () => {
+      const i = Number(inp.dataset.capC ?? inp.dataset.capM);
+      const p = editing.picks[i];
+      if (!p) return;
+      const cell = inp.closest(".cap-cell");
+      const c = cell.querySelector("input[data-cap-c]");
+      const m = cell.querySelector("input[data-cap-m]");
+      const num = v => {
+        const raw = (v.value || "").trim();
+        if (raw === "") return 0;                       // 空 = 不限量
+        const n = Math.floor(Number(raw));
+        return Number.isFinite(n) && n > 0 ? n : 0;     // 0/负数/乱填 = 不限量
+      };
+      const payload = { id: p.id, max_concurrent: num(c), max_per_minute: num(m) };
+      try {
+        const r = await api("/admin/upstream/capacity", payload);
+        // 回填规范化后的值（填 0 或乱填会被后端当「不限量」）
+        c.value = r.max_concurrent == null ? "" : r.max_concurrent;
+        m.value = r.max_per_minute == null ? "" : r.max_per_minute;
+        // 同步到本地 state，免得下次 renderModal 又拿旧值覆盖
+        const u = (state.upstreams || []).find(x => x.id === p.id);
+        if (u) {
+          u.capacity = Object.assign({}, u.capacity, {
+            max_concurrent: r.max_concurrent, max_per_minute: r.max_per_minute,
+          });
+        }
+        toast(`${p.name} 的容量上限：并发 ${r.max_concurrent == null ? "不限" : r.max_concurrent}`
+              + `，每分钟 ${r.max_per_minute == null ? "不限" : r.max_per_minute}`, "ok");
+      } catch (e) {
+        toast("容量上限保存失败：" + e.message, "bad");
+      }
+    };
+    inp.addEventListener("change", commit);
+    inp.addEventListener("keydown", e => { if (e.key === "Enter") { e.preventDefault(); commit(); inp.blur(); } });
+  });
 }
 
 function renderQuotaHint() {
   const picks = editing.picks || [];
   const n0 = picks.filter(p => p.quota === 0).length;
   const nSet = picks.filter(p => p.quota !== "" && p.quota != null && p.quota !== 0).length;
-  $("#mQuotaHint").innerHTML = (n0 || nSet)
-    ? `其中 ${n0} 个上游设为 0（不调用）${nSet ? `，${nSet} 个设了上限` : ""}。
+  // 「并发 / 每分钟」是配在上游身上的，和分组里的额度不是一回事，分开说
+  const nCap = picks.filter(p => {
+    const u = (state.upstreams || []).find(x => x.id === p.id);
+    const c = (u && u.capacity) || {};
+    return c.max_concurrent != null || c.max_per_minute != null;
+  }).length;
+  const capNote = nCap
+    ? ` 另有 ${nCap} 个上游设了并发/速率上限（那个是配在上游上的，所有分组共用）。`
+    : "";
+  $("#mQuotaHint").innerHTML = ((n0 || nSet)
+    ? `其中 ${n0} 个上游设为 0（不调用）${nSet ? `，${nSet} 个设了调用额度` : ""}。
        额度为 0 的上游调用时会被直接跳过，排序时也放在最后。`
-    : `不填就代表不限量。填 0 表示这家不用。`;
+    : `不填就代表不限量。填 0 表示这家不用。`) + capNote;
 }
 let dragIdx = null;
 
@@ -1651,6 +1779,9 @@ function editUpstream(id) {
   $("#eKey").value = "";
   $("#eKeyHint").textContent = u.has_key ? `（现在：${u.key_hint}）` : "（现在没设）";
   $("#eEnabled").checked = u.enabled;
+  const cap = u.capacity || {};
+  $("#eCapC").value = cap.max_concurrent == null ? "" : cap.max_concurrent;
+  $("#eCapM").value = cap.max_per_minute == null ? "" : cap.max_per_minute;
   $("#eStatus").textContent = "";
   $("#editModal").hidden = false;
   $("#eName").focus();
@@ -1658,11 +1789,20 @@ function editUpstream(id) {
 
 async function saveUpstreamEdit() {
   if (!editId) return;
+  const capNum = el => {
+    const raw = (el.value || "").trim();
+    if (raw === "") return 0;
+    const n = Math.floor(Number(raw));
+    return Number.isFinite(n) && n > 0 ? n : 0;
+  };
   const patch = {
     id: editId,
     name: $("#eName").value.trim(),
     base_url: $("#eUrl").value.trim(),
     enabled: $("#eEnabled").checked,
+    // 0 = 清掉上限（回到不限量）
+    max_concurrent: capNum($("#eCapC")),
+    max_per_minute: capNum($("#eCapM")),
   };
   const k = $("#eKey").value;
   if (k !== "") patch.api_key = k;
@@ -2393,10 +2533,45 @@ async function refresh() {
       lastSideHash = hash;
       renderSide();
     }
-    // 模型弹窗开着时不重渲染，否则会打断正在拖拽排序的手感
+    // 模型弹窗开着时不重渲染，否则会打断正在拖拽排序的手感。
+    // 但「并发占用」是会变的，得单独就地刷新那几个数字。
+    updateCapacityLive();
   } catch (e) {
     $("#health").className = "dot off";
   }
+}
+
+// 只更新弹窗里那几行的「占用/满」标记，不重排 DOM、不动输入框。
+function updateCapacityLive() {
+  if (!editing || $("#modal").hidden) return;
+  document.querySelectorAll("#mPicks input[data-cap-c]").forEach(inp => {
+    const i = Number(inp.dataset.capC);
+    const p = editing.picks[i];
+    if (!p) return;
+    const cell = inp.closest(".cap-cell");
+    if (!cell) return;
+    const u = (state.upstreams || []).find(x => x.id === p.id);
+    const cap = (u && u.capacity) || {};
+    const mc = cap.max_concurrent;
+    const mp = cap.max_per_minute;
+    let live = cell.querySelector(".cap-live");
+    if (mc == null && mp == null) {
+      // 刚被改成不限量：把标记去掉
+      if (live) live.remove();
+      return;
+    }
+    if (!live) {
+      // 刚设上限：标记还没渲染出来，这儿补一个（省得非要重开弹窗才看得见）
+      live = document.createElement("span");
+      cell.appendChild(live);
+    }
+    const full = cap.has_room === false;
+    live.textContent = capLiveText(cap);
+    live.className = "cap-live" + (full ? " full" : "");
+    live.title = full
+      ? "此刻已满：新请求会先换别家，全都满了才排队等"
+      : "此刻还有余量";
+  });
 }
 
 /* ================= 事件绑定 ================= */

@@ -37,9 +37,39 @@ import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any, Optional
 
-__version__ = "2.3.5"
+__version__ = "2.4.1"
 
 WEBUI_FILENAME = "webui.html"
+
+# 判断「上游是不是把网页当 API 响应发回来了」。
+# 不少网关（New API / one-api 这类）对认不出的路径不报 404，而是回 200 + 首页 HTML。
+# 一旦把它当成功，后面就是「测试永远通、调用永远断」：客户端要的是 SSE，
+# 收到一坨 HTML 直接解析失败。所以 2xx + HTML 一律按失败处理。
+HTML_CT_MARKERS = ("text/html", "application/xhtml")
+HTML_BODY_PREFIXES = (b"<!doctype html", b"<html")
+
+
+def looks_like_html_page(ctype: str, body: bytes = b"") -> bool:
+    """Content-Type 或正文开头像网页，就认为这不是 API 响应。"""
+    ct = (ctype or "").lower()
+    if any(m in ct for m in HTML_CT_MARKERS):
+        return True
+    head = body[:200].lstrip().lower()
+    return any(head.startswith(p) for p in HTML_BODY_PREFIXES)
+
+
+def _looks_like_sse_head(head: bytes) -> bool:
+    """正文开头是不是 SSE 事件（用来识别标错 Content-Type 的流式响应）。"""
+    h = (head or b"").lstrip()
+    if not h:
+        return False
+    first = h.split(b"\n", 1)[0].strip()
+    return first.startswith((b"data:", b"event:"))
+
+# 组里的上游全部因「并发/速率已满」被跳过时，最多等这么久碰运气（秒）。
+# 0 = 不等，直接回 429。等待只在**自己配的这些上游**之间排队，
+# 不会让请求无限期挂着。
+QUEUE_TIMEOUT_DEFAULT = 15.0
 
 # 状态文件的历史版本保留份数（每次保存都会轮转出一份带时间戳的快照）。
 # 之前只有单份 .bak，结果「最后一次写入」会把上一版好配置挤掉，
@@ -341,6 +371,120 @@ def api_paths(base_url: str, path: str) -> list[tuple[str, str]]:
 
 
 # ---------------------------------------------------------------------------
+# 上游容量闸门（并发上限 + 每分钟速率上限）
+# ---------------------------------------------------------------------------
+
+class CapacityGate:
+    """一个上游的「同时能跑几个 / 每分钟能发几个」闸门。
+
+    为什么放在路由器这一层而不是靠上游自己 429：
+    同一个厂商开了好几个账号分摊额度时，上游只知道「这个 Key 超了」，
+    它会直接拒绝，而路由器手里有整个组的信息 —— 可以先挑还有容量的那家发，
+    从源头上少撞 429。这里只管**自己这边的上限**（用户按上游手填的），
+    不做全局调度，也不猜上游的真实配额。
+
+    速率用的是**最近 60 秒滑动窗口**（不是「每分钟整点清零」），
+    否则整点那一瞬间会双倍放行。
+    """
+
+    WINDOW = 60.0
+    # 滑动窗口只留时间戳，超过这个数量就没必要记得更细了。
+    # 免得「不限速率」的上游被无限追加时间戳把内存撑起来。
+    MAX_STAMPS = 4096
+
+    def __init__(self) -> None:
+        self.lock = threading.Lock()
+        self.in_flight: int = 0
+        self._stamps: collections.deque = collections.deque()
+
+    # ---- 配置（存在 Upstream 上，这里只读）----
+    def _trim(self, now: float) -> None:
+        cutoff = now - self.WINDOW
+        stamps = self._stamps
+        while stamps and stamps[0] <= cutoff:
+            stamps.popleft()
+
+    def used_last_minute(self, now: Optional[float] = None) -> int:
+        now = time.time() if now is None else now
+        with self.lock:
+            self._trim(now)
+            return len(self._stamps)
+
+    def acquire(self, max_concurrent: Optional[int],
+                max_per_minute: Optional[int],
+                wait: float = 0.0) -> tuple[bool, str]:
+        """尝试占一个坑。返回 (是否放行, 不放行的原因)。
+
+        wait > 0 时会在「并发满了」的情况下小睡重试，直到超时。
+        速率超限**不等待** —— 那要等到窗口滑出去，等一个请求的时间
+        通常已经超过客户端的超时了，不如立刻换下一家。
+        """
+        deadline = time.time() + max(0.0, wait)
+        while True:
+            now = time.time()
+            with self.lock:
+                self._trim(now)
+                if max_per_minute is not None and len(self._stamps) >= max_per_minute:
+                    return False, f"每分钟上限 {max_per_minute} 已用满"
+                if max_concurrent is not None and self.in_flight >= max_concurrent:
+                    full = True
+                else:
+                    full = False
+                    self.in_flight += 1
+                    # 发出去的这一发也计入速率窗口
+                    if len(self._stamps) < self.MAX_STAMPS:
+                        self._stamps.append(now)
+                    return True, ""
+            if not full or time.time() >= deadline:
+                return False, f"并发上限 {max_concurrent} 已满"
+            time.sleep(0.05)
+
+    def release(self) -> None:
+        with self.lock:
+            if self.in_flight > 0:
+                self.in_flight -= 1
+
+    def state(self, max_concurrent: Optional[int], max_per_minute: Optional[int]) -> dict:
+        now = time.time()
+        with self.lock:
+            self._trim(now)
+            used = len(self._stamps)
+            inflight = self.in_flight
+        return {
+            "in_flight": inflight,
+            "used_last_minute": used,
+            "max_concurrent": max_concurrent,
+            "max_per_minute": max_per_minute,
+            # 还有没有容量（给前端标「已满」用；满了不代表坏了）
+            "has_room": (
+                (max_concurrent is None or inflight < max_concurrent)
+                and (max_per_minute is None or used < max_per_minute)
+            ),
+        }
+
+
+class CapacityLease:
+    """占坑的凭据。用 with 包住，异常路径也不会漏掉 release。"""
+
+    __slots__ = ("gate", "released")
+
+    def __init__(self, gate: Optional[CapacityGate]):
+        self.gate = gate
+        self.released = False
+
+    def release(self) -> None:
+        if self.gate is not None and not self.released:
+            self.released = True
+            self.gate.release()
+
+    def __enter__(self) -> "CapacityLease":
+        return self
+
+    def __exit__(self, *exc: Any) -> None:
+        self.release()
+
+
+# ---------------------------------------------------------------------------
 # 上游
 # ---------------------------------------------------------------------------
 
@@ -404,12 +548,48 @@ class Upstream:
         self.read_timeout: float = float(cfg.get("read_timeout_seconds") or 300)
         self.cooldown: float = float(cfg.get("cooldown_seconds") or 60)
 
+        # 容量上限（用户按上游手填）。None = 不限。
+        # max_concurrent 是「同时在跑几个请求」，max_per_minute 是「60 秒内发几次」。
+        # 只影响**发往这家**的请求：满了就换下一家，而不是让请求失败。
+        self.max_concurrent: Optional[int] = self._pos_int(cfg.get("max_concurrent"))
+        self.max_per_minute: Optional[int] = self._pos_int(cfg.get("max_per_minute"))
+        self.gate = CapacityGate()
+
+    @staticmethod
+    def _pos_int(value: Any) -> Optional[int]:
+        """把配置里的上限读成正整数；空/0/负数/看不懂的一律当「不限」。"""
+        if value is None or value == "":
+            return None
+        try:
+            n = int(value)
+        except (TypeError, ValueError):
+            return None
+        return n if n > 0 else None
+
     # ---- 可用性 ----
     def available(self) -> bool:
         return self.enabled and time.time() >= self.cooldown_until
 
     def cooling_remaining(self) -> float:
         return max(0.0, self.cooldown_until - time.time())
+
+    # ---- 容量 ----
+    def has_capacity_limit(self) -> bool:
+        return self.max_concurrent is not None or self.max_per_minute is not None
+
+    def capacity_state(self) -> dict:
+        return self.gate.state(self.max_concurrent, self.max_per_minute)
+
+    def acquire(self, wait: float = 0.0) -> tuple[CapacityLease, str]:
+        """占一个坑。返回 (凭据, 失败原因)；凭据的 gate 为 None 表示被挡下了。
+
+        没配任何上限的上游不占坑（凭据是空壳），零开销。
+        """
+        if not self.has_capacity_limit():
+            return CapacityLease(None), ""
+        ok, why = self.gate.acquire(self.max_concurrent, self.max_per_minute, wait)
+        return CapacityLease(self.gate if ok else None), ("" if ok else why)
+
 
     def group_of(self, real_model: str) -> str:
         """上游真实模型名 → 分组名。没设映射就是它自己。"""
@@ -557,6 +737,8 @@ class Upstream:
                 "last_used": self.last_used or None,
                 "last_check": self.last_check,
                 "last_checks": dict(self.last_checks),
+                # 容量：配了多少、现在用了多少（前端卡片要显示实时占用）
+                "capacity": self.capacity_state(),
             }
 
     def state(self) -> dict:
@@ -574,6 +756,9 @@ class Upstream:
             "models_error": self.models_error,
             "last_check": self.last_check,
             "last_checks": dict(self.last_checks),
+            # 只在上限设过时才写，保持老状态文件干净
+            **({"max_concurrent": self.max_concurrent} if self.max_concurrent else {}),
+            **({"max_per_minute": self.max_per_minute} if self.max_per_minute else {}),
         }
 
     # ---- 请求上游 ----
@@ -623,7 +808,19 @@ class Upstream:
                 resp = conn.getresponse()
                 if resp.status == 404 and len(candidates) > 1:
                     # 路径拼法不对，记下来换下一种；把响应留着，
-                    # 万一全都不行，至少能把这个 404 原样透传出去
+                    # 万一全都不行，至少能把这个 404 原样透传出去。
+                    # 之前攒下的那条要关掉，否则换候选时连接会泄漏。
+                    if last_resp is not None:
+                        self._close(last_resp[0])
+                    last_resp = (conn, resp, target, suffix)
+                    continue
+                if looks_like_html_page(resp.getheader("Content-Type") or ""):
+                    # 200 + 网页：这个地址根本没有 API（网关把首页兜底返回了），
+                    # 不能算成功，更不能把它记成「可用拼法」—— 否则后面每个
+                    # 请求都会优先打这个网页地址，表现为「测试通、调用必断」。
+                    # 留着响应，万一别的候选也不行，至少能把它透传出去。
+                    if last_resp is not None:
+                        self._close(last_resp[0])
                     last_resp = (conn, resp, target, suffix)
                     continue
                 self._prefix_hint = suffix
@@ -635,7 +832,11 @@ class Upstream:
 
         if last_resp is not None:
             conn, resp, target, suffix = last_resp
-            self._prefix_hint = suffix
+            # 走到这里说明所有候选都没成功。若手上这个只是网页（不是 404），
+            # 不要把它记成可用拼法；404 则可以记 —— 至少路径形状对，
+            # 下次还是先试它，能省一次往返。
+            if resp.status == 404:
+                self._prefix_hint = suffix
             return conn, resp, target
         if last_exc is not None:
             raise last_exc
@@ -665,6 +866,11 @@ class Upstream:
                 except Exception:
                     detail = body[:200].decode("utf-8", "replace")
                 raise RuntimeError(f"HTTP {resp.status}{': ' + str(detail) if detail else ''}")
+
+            if looks_like_html_page(resp.getheader("Content-Type") or "", body):
+                # 200 + 网页：地址/路径其实不对，网关拿首页兜底了。
+                # 直接说清楚，比「不是合法 JSON」省一轮排查。
+                raise RuntimeError("上游返回网页(HTML)而不是模型列表，地址或路径可能不对")
 
             try:
                 parsed = json.loads(body)
@@ -718,9 +924,15 @@ class Upstream:
                                       headers=self.headers())
             latency = time.time() - t0
             body = resp.read()
+            ctype = resp.getheader("Content-Type") or ""
             ok = resp.status < 400
             error = None
             rate_limited = False
+            if ok and looks_like_html_page(ctype, body):
+                # 200 但回来的是网页：地址/路径其实不对，只是网关拿首页兜底了。
+                # 只按状态码判会被骗成「通，1 秒」—— 实测正是这种情况。
+                ok = False
+                error = "上游返回了网页（HTML）而不是 API 响应，地址或路径可能不对"
             if not ok:
                 try:
                     parsed = json.loads(body)
@@ -1713,6 +1925,13 @@ class Router:
         self.default_strategy = str(router_cfg.get("default_strategy", "priority")).lower()
         if self.default_strategy not in VALID_STRATEGIES:
             self.default_strategy = "priority"
+        # 组里所有上游都「并发满」时，最多等这么久碰运气（秒）。
+        # 设 0 = 不等，直接回 429。
+        try:
+            self.queue_timeout = max(0.0, float(router_cfg.get("queue_timeout_seconds",
+                                                               QUEUE_TIMEOUT_DEFAULT)))
+        except (TypeError, ValueError):
+            self.queue_timeout = QUEUE_TIMEOUT_DEFAULT
 
         self.upstreams: list[Upstream] = []
         self.models: dict[str, ModelRoute] = {}
@@ -1743,6 +1962,9 @@ class Router:
                 "available_models": models,
                 # 配置文件里写明的模型，视为「已经选用」，不然写完配置还得去网页勾一遍
                 "selected_models": [str(m) for m in (u.get("selected_models") or models)],
+                # 容量上限也可以写在配置文件里（网页上能改，会覆盖这里）
+                "max_concurrent": u.get("max_concurrent"),
+                "max_per_minute": u.get("max_per_minute"),
             })
         models_out: dict[str, dict] = {}
         for name, mcfg in (cfg.get("models") or {}).items():
@@ -2078,6 +2300,8 @@ class Router:
             # 新加的上游默认一个模型都不选，等用户拉取后自己勾
             "available_models": [],
             "selected_models": [],
+            "max_concurrent": payload.get("max_concurrent"),
+            "max_per_minute": payload.get("max_per_minute"),
         }, len(self.upstreams))
         up.cooldown = self.cooldown_default
         self.upstreams.append(up)
@@ -2114,8 +2338,38 @@ class Router:
             up.api_key = str(payload["api_key"])
         if payload.get("enabled") is not None:
             up.enabled = bool(payload["enabled"])
+        # 容量上限：显式传 null/"" 表示清掉（回到不限量）
+        if "max_concurrent" in payload:
+            up.max_concurrent = self._pos_int(payload.get("max_concurrent"))
+        if "max_per_minute" in payload:
+            up.max_per_minute = self._pos_int(payload.get("max_per_minute"))
         self._save_state()
         return up
+
+    def set_capacity(self, uid: str, max_concurrent: Any = None,
+                     max_per_minute: Any = None) -> dict:
+        """设置某个上游的并发/速率上限（0 或空 = 不限量）。
+
+        上限挂在**上游**身上而不是某个分组：它反映的是这个账号/Key 的
+        真实配额，同一个账号被好几个分组引用时，配额是共用的一份。
+        按分组各记一套的话，两个分组各给 5 并发，实际就会同时打进 10 个，
+        等于上限根本没生效。
+        """
+        up = self.find_upstream(uid)
+        if up is None:
+            raise KeyError(f"找不到上游 {uid!r}")
+        up.max_concurrent = self._pos_int(max_concurrent)
+        up.max_per_minute = self._pos_int(max_per_minute)
+        self._save_state()
+        return {"ok": True, "id": up.id, "name": up.name,
+                "max_concurrent": up.max_concurrent,
+                "max_per_minute": up.max_per_minute,
+                "capacity": up.capacity_state()}
+
+    @staticmethod
+    def _pos_int(value: Any) -> Optional[int]:
+        """把传入的上限读成正整数；空/0/负数/看不懂的一律当「不限」。"""
+        return Upstream._pos_int(value)
 
     def delete_upstream(self, uid: str) -> dict:
         up = self.find_upstream(uid)
@@ -2896,9 +3150,6 @@ class Router:
 
     # ---- 快照 ----
     def snapshot(self) -> dict:
-        with self.lock:
-            history = list(self.history)
-
         # 上游卡片上的「请求/成功/失败」改用**落盘聚合**的数字（跨重启不归零）。
         # 以前用 Upstream.requests 这种内存计数，重启就回零，于是
         # 左侧说 375、右侧说 188 —— 两个口径必然打架。
@@ -2934,7 +3185,6 @@ class Router:
             "failure_threshold": self.failure_threshold,
             "cooldown_seconds": self.cooldown_default,
             "default_strategy": self.default_strategy,
-            "history": history,
             "suppressed_models": sorted(self.suppressed_models),
             "upstreams": ups_out,
             "models": {
@@ -3030,6 +3280,673 @@ def rewrite_json_model(body: bytes, effective: str, requested: str) -> bytes:
         except Exception:
             return body
     return body
+
+
+# ---------------------------------------------------------------------------
+# Anthropic Messages API 适配（/v1/messages）
+#
+# 上游绝大多数只认 OpenAI 的 /v1/chat/completions，而 Claude Code 这类客户端
+# 说的是 Anthropic 的 Messages API。所以两个方向都要转：
+#   请求：Anthropic → OpenAI（system / 内容块 / 图片 / 工具调用）
+#   响应：OpenAI → Anthropic（content 块、stop_reason、usage 字段名、SSE 事件）
+# 只转请求不转响应的话，客户端拿到的是 choices 结构，直接解析失败 ——
+# 那等于这个端点对外声称支持、实际不能用。
+# ---------------------------------------------------------------------------
+
+# 这些请求参数两家是通用的，原样透传（名字一样、含义一样）
+ANTHROPIC_PASSTHROUGH = ("temperature", "top_p", "stop", "presence_penalty",
+                         "frequency_penalty", "seed", "user", "n")
+
+# Anthropic 的 stop_reason → OpenAI 的 finish_reason（请求方向不用，反向用）
+OPENAI_STOP_TO_ANTHROPIC = {
+    "stop": "end_turn",
+    "length": "max_tokens",
+    "tool_calls": "tool_use",
+    "function_call": "tool_use",
+    "content_filter": "end_turn",
+}
+
+
+def _anthropic_system_text(system: Any) -> str:
+    """Anthropic 的 system 既可以是字符串，也可以是内容块数组。"""
+    if isinstance(system, str):
+        return system
+    if isinstance(system, list):
+        parts: list[str] = []
+        for block in system:
+            if isinstance(block, str):
+                parts.append(block)
+            elif isinstance(block, dict) and block.get("type") == "text":
+                parts.append(str(block.get("text") or ""))
+        return "\n".join(p for p in parts if p)
+    return ""
+
+
+def _anthropic_image_to_openai(block: dict) -> Optional[dict]:
+    """Anthropic 的 image 块 → OpenAI 的 image_url 块。"""
+    source = block.get("source")
+    if not isinstance(source, dict):
+        return None
+    stype = source.get("type")
+    if stype == "base64":
+        media = str(source.get("media_type") or "image/png")
+        data = source.get("data") or ""
+        if not data:
+            return None
+        return {"type": "image_url",
+                "image_url": {"url": f"data:{media};base64,{data}"}}
+    if stype == "url":
+        url = source.get("url")
+        if not url:
+            return None
+        return {"type": "image_url", "image_url": {"url": str(url)}}
+    return None
+
+
+def anthropic_tools_to_openai(tools: Any) -> list[dict]:
+    """Anthropic 的 tools → OpenAI 的 tools（都是 function 风格，字段名不同）。"""
+    out: list[dict] = []
+    if not isinstance(tools, list):
+        return out
+    for tool in tools:
+        if not isinstance(tool, dict):
+            continue
+        name = str(tool.get("name") or "")
+        if not name:
+            continue
+        out.append({
+            "type": "function",
+            "function": {
+                "name": name,
+                "description": str(tool.get("description") or ""),
+                # Anthropic 用的是 input_schema，OpenAI 叫 parameters
+                "parameters": tool.get("input_schema") or {"type": "object", "properties": {}},
+            },
+        })
+    return out
+
+
+def anthropic_tool_choice_to_openai(choice: Any) -> Any:
+    """Anthropic 的 tool_choice → OpenAI 的 tool_choice。
+
+    auto→auto；any→required（必须调一个）；tool→指定某个函数。
+    """
+    if not isinstance(choice, dict):
+        return None
+    ctype = choice.get("type")
+    if ctype == "auto":
+        return "auto"
+    if ctype == "any":
+        return "required"
+    if ctype == "none":
+        return "none"
+    if ctype == "tool":
+        name = str(choice.get("name") or "")
+        if name:
+            return {"type": "function", "function": {"name": name}}
+    return None
+
+
+def anthropic_to_openai(body: dict) -> tuple[dict, list[str]]:
+    """把 Anthropic /v1/messages 的请求体转成 OpenAI /v1/chat/completions 的请求体。
+
+    返回 (payload, notes)。notes 是「有哪些东西没法完整表达」的说明，
+    会被记进请求流水 —— 静默丢字段是最难查的那种问题，宁可留下痕迹。
+    """
+    notes: list[str] = []
+    msgs: list[dict] = []
+
+    system_text = _anthropic_system_text(body.get("system"))
+    if system_text:
+        msgs.append({"role": "system", "content": system_text})
+
+    for m in body.get("messages") or []:
+        if not isinstance(m, dict):
+            continue
+        role = str(m.get("role") or "user")
+        content = m.get("content")
+
+        if isinstance(content, str):
+            msgs.append({"role": role, "content": content})
+            continue
+        if not isinstance(content, list):
+            msgs.append({"role": role, "content": ""})
+            continue
+
+        # 内容块数组。一个 Anthropic 消息可能展开成多个 OpenAI 消息：
+        # 比如 user 消息里夹着 tool_result，那在 OpenAI 那边是独立的 role=tool 消息。
+        text_parts: list[dict] = []      # 文本/图片，合成一个 content 数组
+        tool_calls: list[dict] = []      # assistant 的工具调用
+        tool_results: list[dict] = []    # role=tool 的返回
+        thinking_parts: list[str] = []
+
+        for block in content:
+            if not isinstance(block, dict):
+                if isinstance(block, str):
+                    text_parts.append({"type": "text", "text": block})
+                continue
+            btype = block.get("type")
+
+            if btype == "text":
+                text_parts.append({"type": "text", "text": str(block.get("text") or "")})
+            elif btype == "image":
+                img = _anthropic_image_to_openai(block)
+                if img is not None:
+                    text_parts.append(img)
+                else:
+                    notes.append("有 1 张图片没能转换（source 格式不认识），已忽略")
+            elif btype == "tool_use":
+                args = block.get("input")
+                try:
+                    arg_text = json.dumps(args if args is not None else {},
+                                          ensure_ascii=False)
+                except Exception:  # noqa: BLE001
+                    arg_text = "{}"
+                tool_calls.append({
+                    "id": str(block.get("id") or f"call_{uuid.uuid4().hex[:12]}"),
+                    "type": "function",
+                    "function": {"name": str(block.get("name") or ""),
+                                 "arguments": arg_text},
+                })
+            elif btype == "tool_result":
+                result = block.get("content")
+                if isinstance(result, list):
+                    chunks: list[str] = []
+                    for part in result:
+                        if isinstance(part, dict) and part.get("type") == "text":
+                            chunks.append(str(part.get("text") or ""))
+                        elif isinstance(part, dict) and part.get("type") == "image":
+                            notes.append("工具返回里的图片没法转，已忽略")
+                        elif isinstance(part, str):
+                            chunks.append(part)
+                    result_text = "\n".join(chunks)
+                elif isinstance(result, str):
+                    result_text = result
+                else:
+                    result_text = "" if result is None else json.dumps(result, ensure_ascii=False)
+                tool_results.append({
+                    "role": "tool",
+                    "tool_call_id": str(block.get("tool_use_id") or ""),
+                    "content": result_text,
+                })
+            elif btype == "thinking":
+                # 思维链：记下来但**不**回传给上游（上游多半不认这个字段），
+                # 客户端下次带回来的 thinking 块也只做记录。
+                thinking_parts.append(str(block.get("thinking") or ""))
+            else:
+                notes.append(f"未知内容块 {btype!r} 已忽略")
+
+        # 组装顺序：先 tool 返回（它们对应上一条 assistant 的调用），
+        # 再是普通内容。这样 OpenAI 那边的对话顺序才是对的。
+        for tr in tool_results:
+            if not tr["tool_call_id"]:
+                notes.append("有条 tool_result 没带 tool_use_id，上游可能配不上")
+            msgs.append(tr)
+
+        if tool_calls:
+            out_msg: dict = {"role": role, "tool_calls": tool_calls}
+            # 有工具调用时 content 仍要带上（可能是空串）
+            out_msg["content"] = _blocks_to_content(text_parts) if text_parts else None
+            msgs.append(out_msg)
+        elif text_parts:
+            msgs.append({"role": role, "content": _blocks_to_content(text_parts)})
+
+    payload: dict = {
+        "model": str(body.get("model") or ""),
+        "messages": msgs,
+    }
+    # max_tokens 两家同名；Anthropic 必填，缺了给个稳妥的默认值
+    payload["max_tokens"] = body.get("max_tokens") or 4096
+    if body.get("stream") is not None:
+        payload["stream"] = bool(body.get("stream"))
+
+    tools = anthropic_tools_to_openai(body.get("tools"))
+    if tools:
+        payload["tools"] = tools
+        tc = anthropic_tool_choice_to_openai(body.get("tool_choice"))
+        if tc is not None:
+            payload["tool_choice"] = tc
+    elif body.get("tool_choice"):
+        notes.append("传了 tool_choice 但没传 tools，已忽略")
+
+    for key in ANTHROPIC_PASSTHROUGH:
+        if key in body and body[key] is not None:
+            payload[key] = body[key]
+
+    # 流式时主动要 usage：Anthropic 客户端要看 token 数，而上游默认
+    # 不在流里带 usage（除非显式要求），不注入的话最后只能报 0。
+    if payload.get("stream"):
+        payload["stream_options"] = {"include_usage": True}
+
+    for key in ("top_k", "metadata", "thinking", "context_management"):
+        if body.get(key):
+            notes.append(f"Anthropic 的 {key} 上游不支持，已忽略")
+    return payload, notes
+
+
+def _blocks_to_content(parts: list[dict]) -> Any:
+    """内容块数组 → OpenAI 的 content。只有纯文本时退化成字符串，
+    兼容那些不认数组形式的老上游。"""
+    if all(p.get("type") == "text" for p in parts):
+        return "".join(str(p.get("text") or "") for p in parts)
+    return parts
+
+
+def _strict_int(value: Any) -> Optional[int]:
+    """usage 里的数字：只接受真正的数字，字符串数字也认，其余当没有。"""
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float)):
+        return int(value)
+    if isinstance(value, str):
+        try:
+            return int(float(value))
+        except (TypeError, ValueError):
+            return None
+    return None
+
+
+def openai_to_anthropic_response(body: bytes, model: str,
+                                 fallback_id: str = "") -> bytes:
+    """把上游的 OpenAI 非流式响应转成 Anthropic Messages 响应。
+
+    上游返回的不是 JSON（网关 HTML 错误页之类）时原样返回，让调用方
+    自己决定怎么处理 —— 在这里硬造一个 Anthropic 结构反而会掩盖真实错误。
+    """
+    try:
+        obj = json.loads(body)
+    except Exception:
+        return body
+    if not isinstance(obj, dict):
+        return body
+
+    choice: dict = {}
+    choices = obj.get("choices")
+    if isinstance(choices, list) and choices and isinstance(choices[0], dict):
+        choice = choices[0]
+    message = choice.get("message") if isinstance(choice.get("message"), dict) else {}
+
+    content: list[dict] = []
+    text = message.get("content")
+    if isinstance(text, str) and text:
+        content.append({"type": "text", "text": text})
+    elif isinstance(text, list):
+        for part in text:
+            if isinstance(part, dict) and part.get("type") == "text":
+                content.append({"type": "text", "text": str(part.get("text") or "")})
+
+    for call in (message.get("tool_calls") or []):
+        if not isinstance(call, dict):
+            continue
+        fn = call.get("function") if isinstance(call.get("function"), dict) else {}
+        raw_args = fn.get("arguments")
+        try:
+            parsed_args = json.loads(raw_args) if isinstance(raw_args, str) and raw_args else {}
+        except Exception:  # noqa: BLE001
+            # 参数不是合法 JSON：Anthropic 要求 input 是对象，
+            # 塞个原始串进去至少不丢信息，客户端能看见到底收到了什么。
+            parsed_args = {"_raw_arguments": raw_args}
+        if not isinstance(parsed_args, dict):
+            parsed_args = {"_raw_arguments": parsed_args}
+        content.append({
+            "type": "tool_use",
+            "id": str(call.get("id") or f"toolu_{uuid.uuid4().hex[:20]}"),
+            "name": str(fn.get("name") or ""),
+            "input": parsed_args,
+        })
+
+    if not content:
+        # Anthropic 的 content 不允许为空数组，至少给一个空文本块
+        content.append({"type": "text", "text": ""})
+
+    usage = extract_usage(obj)
+    finish = choice.get("finish_reason")
+    stop_reason = OPENAI_STOP_TO_ANTHROPIC.get(str(finish), None) if finish else None
+    if stop_reason is None and content and content[-1].get("type") == "tool_use":
+        stop_reason = "tool_use"
+
+    out = {
+        "id": str(obj.get("id") or fallback_id or f"msg_{uuid.uuid4().hex[:24]}"),
+        "type": "message",
+        "role": "assistant",
+        "model": model,
+        # 顺序不能反：Anthropic 的约定是 input 在前、output 在后
+        "content": content,
+        "stop_reason": stop_reason or "end_turn",
+        "stop_sequence": None,
+        "usage": {
+            "input_tokens": _strict_int(usage.get("input")) or 0,
+            "output_tokens": _strict_int(usage.get("output")) or 0,
+        },
+    }
+    cache_read = _strict_int(usage.get("cache_read"))
+    cache_write = _strict_int(usage.get("cache_write"))
+    if cache_read:
+        out["usage"]["cache_read_input_tokens"] = cache_read
+    if cache_write:
+        out["usage"]["cache_creation_input_tokens"] = cache_write
+    try:
+        return json.dumps(out, ensure_ascii=False).encode("utf-8")
+    except Exception:  # noqa: BLE001
+        return body
+
+
+def openai_error_to_anthropic(body: bytes, status: int) -> bytes:
+    """错误体也换成 Anthropic 的形状，否则客户端的报错信息会很难看。"""
+    message = ""
+    etype = ""
+    try:
+        obj = json.loads(body)
+        if isinstance(obj, dict):
+            err = obj.get("error")
+            if isinstance(err, dict):
+                message = str(err.get("message") or "")
+                etype = str(err.get("type") or "")
+            elif isinstance(err, str):
+                message = err
+            if not message:
+                message = str(obj.get("message") or "")
+    except Exception:  # noqa: BLE001
+        message = body[:300].decode("utf-8", "replace") if body else ""
+
+    if not message:
+        message = f"上游返回 HTTP {status}"
+    # Anthropic 的错误类型是有限几个，把上游那套映射过去
+    mapping = {
+        400: ("invalid_request_error", "invalid_request_error"),
+        401: ("authentication_error", "authentication_error"),
+        403: ("permission_error", "permission_error"),
+        404: ("not_found_error", "not_found_error"),
+        413: ("request_too_large", "invalid_request_error"),
+        429: ("rate_limit_error", "rate_limit_error"),
+        500: ("api_error", "api_error"),
+        529: ("overloaded_error", "overloaded_error"),
+    }
+    atype, _ = mapping.get(status, ("api_error", "api_error"))
+    out = {"type": "error", "error": {"type": atype, "message": message}}
+    try:
+        return json.dumps(out, ensure_ascii=False).encode("utf-8")
+    except Exception:  # noqa: BLE001
+        return body
+
+
+def estimate_tokens(text: str) -> int:
+    """粗略估 token 数。
+
+    这里没有上游的分词器（也不该为了估个数去加载一个几百 MB 的 BPE 表），
+    所以按经验估算：英文约 4 字符一个 token，中文约 1.5 字符一个。
+    真实的 count_tokens 各家算法不同，这个值只用于「大概多少」的参考，
+    比如客户端做上下文压缩判断；实际计费/统计一律以流水里上游回报的为准。
+    """
+    if not text:
+        return 0
+    cjk = 0
+    other = 0
+    for ch in text:
+        if "\u4e00" <= ch <= "\u9fff" or "\u3040" <= ch <= "\u30ff" \
+                or "\uac00" <= ch <= "\ud7af":
+            cjk += 1
+        else:
+            other += 1
+    return int(cjk / 1.5 + other / 4) + 1
+
+
+def count_anthropic_tokens(body: dict) -> int:
+    """给 /v1/messages/count_tokens 用：把请求里所有文本加起来估一下。"""
+    chunks: list[str] = [_anthropic_system_text(body.get("system"))]
+    for m in body.get("messages") or []:
+        if not isinstance(m, dict):
+            continue
+        content = m.get("content")
+        if isinstance(content, str):
+            chunks.append(content)
+        elif isinstance(content, list):
+            for block in content:
+                if not isinstance(block, dict):
+                    continue
+                btype = block.get("type")
+                if btype == "text":
+                    chunks.append(str(block.get("text") or ""))
+                elif btype == "tool_use":
+                    chunks.append(str(block.get("name") or ""))
+                    try:
+                        chunks.append(json.dumps(block.get("input") or {}, ensure_ascii=False))
+                    except Exception:  # noqa: BLE001
+                        pass
+                elif btype == "tool_result":
+                    result = block.get("content")
+                    if isinstance(result, str):
+                        chunks.append(result)
+                    elif isinstance(result, list):
+                        for part in result:
+                            if isinstance(part, dict) and part.get("type") == "text":
+                                chunks.append(str(part.get("text") or ""))
+    for tool in (body.get("tools") or []):
+        if isinstance(tool, dict):
+            chunks.append(str(tool.get("name") or ""))
+            chunks.append(str(tool.get("description") or ""))
+            try:
+                chunks.append(json.dumps(tool.get("input_schema") or {}, ensure_ascii=False))
+            except Exception:  # noqa: BLE001
+                pass
+    return estimate_tokens("\n".join(c for c in chunks if c))
+
+
+class AnthropicStreamConverter:
+    """OpenAI 的 SSE 分片 → Anthropic 的 SSE 事件序列。
+
+    上游流里长这样（每条 data 一个 chunk）：
+        {"choices":[{"delta":{"content":"你"}}]}
+        {"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"name":"f","arguments":"{"}}]}}]}
+    客户端要的是这样：
+        event: message_start  / content_block_start / content_block_delta …
+    逐块转，同时处理跨分片断行（SSE 的一行可能被切成两半）。
+    """
+
+    def __init__(self, model: str, msg_id: str = ""):
+        self.model = model
+        self.msg_id = msg_id or f"msg_{uuid.uuid4().hex[:24]}"
+        self.buf = b""
+        self.started = False
+        self.finished = False
+        self.block_index = -1          # 当前正在写的内容块序号
+        self.block_kind: Optional[str] = None   # "text" / "tool_use"
+        # OpenAI 的 tool_calls 用 index 区分同一个回复里的多个调用，
+        # 这里记 OpenAI index → Anthropic block index 的映射
+        self.tool_blocks: dict[int, int] = {}
+        self.usage: dict = {}
+        self.stop_reason: Optional[str] = None
+        self.saw_tool_use = False
+
+    # ---- 事件拼装 ----
+    def _event(self, name: str, payload: dict) -> bytes:
+        data = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+        return f"event: {name}\ndata: {data}\n\n".encode("utf-8")
+
+    def _message_start(self) -> bytes:
+        self.started = True
+        return self._event("message_start", {
+            "type": "message_start",
+            "message": {
+                "id": self.msg_id,
+                "type": "message",
+                "role": "assistant",
+                "model": self.model,
+                "content": [],
+                "stop_reason": None,
+                "stop_sequence": None,
+                # 此刻还不知道真实用量（OpenAI 流末尾才给），
+                # 最终数字在 message_delta 里补齐
+                "usage": {"input_tokens": 0, "output_tokens": 0},
+            },
+        })
+
+    def _close_block(self) -> bytes:
+        if self.block_index < 0 or self.block_kind is None:
+            return b""
+        out = self._event("content_block_stop",
+                          {"type": "content_block_stop", "index": self.block_index})
+        self.block_kind = None
+        return out
+
+    def _open_text_block(self) -> bytes:
+        if self.block_kind == "text":
+            return b""
+        out = self._close_block()
+        self.block_index += 1
+        self.block_kind = "text"
+        out += self._event("content_block_start", {
+            "type": "content_block_start",
+            "index": self.block_index,
+            "content_block": {"type": "text", "text": ""},
+        })
+        return out
+
+    def _open_tool_block(self, oai_index: int, tool_id: str, name: str) -> bytes:
+        out = self._close_block()
+        self.block_index += 1
+        self.block_kind = "tool_use"
+        self.saw_tool_use = True
+        self.tool_blocks[oai_index] = self.block_index
+        out += self._event("content_block_start", {
+            "type": "content_block_start",
+            "index": self.block_index,
+            "content_block": {
+                "type": "tool_use",
+                "id": tool_id or f"toolu_{uuid.uuid4().hex[:20]}",
+                "name": name,
+                # Anthropic 要求这里给空对象，实际参数走后续的 input_json_delta
+                "input": {},
+            },
+        })
+        return out
+
+    def _finish(self) -> bytes:
+        if self.finished:
+            return b""
+        self.finished = True
+        out = self._close_block()
+        stop = self.stop_reason
+        if stop is None:
+            stop = "tool_use" if self.saw_tool_use else "end_turn"
+        out += self._event("message_delta", {
+            "type": "message_delta",
+            "delta": {"stop_reason": stop, "stop_sequence": None},
+            "usage": {"output_tokens": _strict_int(self.usage.get("output")) or 0},
+        })
+        out += self._event("message_stop", {"type": "message_stop"})
+        return out
+
+    # ---- 主入口 ----
+    def feed(self, data: bytes, final: bool = False) -> bytes:
+        if self.finished:
+            return b""
+        self.buf += data
+        if final:
+            block, self.buf = self.buf, b""
+        else:
+            idx = self.buf.rfind(b"\n")
+            if idx < 0:
+                return b""
+            block, self.buf = self.buf[: idx + 1], self.buf[idx + 1:]
+        if not block and not final:
+            return b""
+        return self._convert(block)
+
+    def _convert(self, block: bytes) -> bytes:
+        out = b""
+        for line in block.split(b"\n"):
+            stripped = line.strip()
+            if not stripped.startswith(b"data:"):
+                continue
+            payload = stripped[5:].strip()
+            if not payload or payload == b"[DONE]":
+                continue
+            try:
+                obj = json.loads(payload)
+            except Exception:  # noqa: BLE001
+                continue
+            if not isinstance(obj, dict):
+                continue
+
+            if not self.started:
+                out += self._message_start()
+
+            got_usage = extract_usage(obj)
+            if got_usage:
+                self.usage = got_usage
+
+            choices = obj.get("choices")
+            if not isinstance(choices, list) or not choices:
+                continue
+            first = choices[0]
+            if not isinstance(first, dict):
+                continue
+
+            if first.get("finish_reason"):
+                self.stop_reason = OPENAI_STOP_TO_ANTHROPIC.get(
+                    str(first["finish_reason"]), self.stop_reason)
+
+            delta = first.get("delta")
+            if not isinstance(delta, dict):
+                delta = first.get("message") if isinstance(first.get("message"), dict) else {}
+
+            text = delta.get("content")
+            if isinstance(text, str) and text:
+                out += self._open_text_block()
+                out += self._event("content_block_delta", {
+                    "type": "content_block_delta",
+                    "index": self.block_index,
+                    "delta": {"type": "text_delta", "text": text},
+                })
+            elif isinstance(text, list):
+                for part in text:
+                    if isinstance(part, dict) and part.get("type") == "text" and part.get("text"):
+                        out += self._open_text_block()
+                        out += self._event("content_block_delta", {
+                            "type": "content_block_delta",
+                            "index": self.block_index,
+                            "delta": {"type": "text_delta", "text": str(part["text"])},
+                        })
+
+            for call in (delta.get("tool_calls") or []):
+                if not isinstance(call, dict):
+                    continue
+                oai_index = call.get("index")
+                if not isinstance(oai_index, int):
+                    oai_index = len(self.tool_blocks)
+                fn = call.get("function") if isinstance(call.get("function"), dict) else {}
+                if oai_index not in self.tool_blocks:
+                    out += self._open_tool_block(oai_index, str(call.get("id") or ""),
+                                                 str(fn.get("name") or ""))
+                else:
+                    self.block_kind = "tool_use"   # 回到这个工具块继续写参数
+                    self.block_index = self.tool_blocks[oai_index]
+                args = fn.get("arguments")
+                if isinstance(args, str) and args:
+                    out += self._event("content_block_delta", {
+                        "type": "content_block_delta",
+                        "index": self.tool_blocks.get(oai_index, self.block_index),
+                        "delta": {"type": "input_json_delta", "partial_json": args},
+                    })
+        return out
+
+    def close(self) -> bytes:
+        """上游流结束：补上收尾事件。"""
+        out = b""
+        if not self.started:
+            # 上游一个字都没吐，也得给客户端一个结构完整的空回复
+            out += self._message_start()
+        out += self._finish()
+        return out
+
+    def error(self, message: str, atype: str = "api_error") -> bytes:
+        """已经发出 message_start 之后才出错：按 Anthropic 的约定，
+        在流里发一个 error 事件收尾（而不是直接断连）。"""
+        return self._event("error", {
+            "type": "error",
+            "error": {"type": atype, "message": message},
+        })
 
 
 # ---------------------------------------------------------------------------
@@ -3171,6 +4088,7 @@ class Handler(BaseHTTPRequestHandler):
                 "/admin/upstream/add": self._h_upstream_add,
                 "/admin/upstream/update": self._h_upstream_update,
                 "/admin/upstream/delete": self._h_upstream_delete,
+                "/admin/upstream/capacity": self._h_upstream_capacity,
                 "/admin/fetch-models": self._h_fetch_models,
                 "/admin/select-models": self._h_select_models,
                 "/admin/set-group": self._h_set_group,
@@ -3203,6 +4121,8 @@ class Handler(BaseHTTPRequestHandler):
                     return self._handle_models()
                 if path == "/v1/messages" and method == "POST":
                     return self._handle_anthropic_messages()
+                if path == "/v1/messages/count_tokens" and method == "POST":
+                    return self._handle_count_tokens()
                 return self._proxy(method, path)
             return self._send_json(404, {"error": {"message": f"未知路径 {path}"}})
         except BrokenPipeError:
@@ -3223,7 +4143,8 @@ class Handler(BaseHTTPRequestHandler):
 
     # 哪些管理接口前后会改变状态，值得记一笔审计
     AUDIT_DETAIL_KEYS = ("id", "name", "upstream", "model", "models", "from", "to",
-                         "enabled", "mapping", "entries", "label", "strategy")
+                         "enabled", "mapping", "entries", "label", "strategy",
+                         "max_concurrent", "max_per_minute")
 
     def _audit(self, path: str) -> None:
         """把这次管理调用记进审计日志（读 body 前先缓存，免得流被消费掉）。"""
@@ -3539,6 +4460,21 @@ class Handler(BaseHTTPRequestHandler):
         status, out = self._result(go)
         self._send_json(status, out)
 
+    def _h_upstream_capacity(self) -> None:
+        """设置某个上游的并发/速率上限（0 或空 = 不限量）。"""
+        def go():
+            payload = self._read_json_body()
+            uid = str(payload.get("id") or "")
+            if not uid:
+                raise ValueError("缺少 id")
+            return self.router.set_capacity(
+                uid,
+                payload.get("max_concurrent"),
+                payload.get("max_per_minute"),
+            )
+        status, out = self._result(go)
+        self._send_json(status, out)
+
     def _h_rename_group(self) -> None:
         def go():
             payload = self._read_json_body()
@@ -3711,44 +4647,59 @@ class Handler(BaseHTTPRequestHandler):
         # 落盘放在锁外，磁盘写不拖住并发的请求
         self.router.stats.record(entry)
 
-    # ---- 核心代理 ----
-    def _handle_anthropic_messages(self) -> None:
-        """Anthropic (/v1/messages) -> OpenAI (/v1/chat/completions) 适配"""
+    def _handle_count_tokens(self) -> None:
+        """Anthropic 的 count_tokens：本地估算，不真去调上游。
+
+        Claude Code 这类客户端会用它在发请求前判断上下文还能不能塞下。
+        我们手里没有上游的分词器，硬要精确只能把请求先发给上游 ——
+        那样每次估算都变成一次真实调用（还计费），代价太大。
+        这里按经验公式估个量级，够客户端做「要不要压缩」的决策。
+        """
         raw_body = self._read_body()
         try:
             body = json.loads(raw_body)
         except Exception:
-            return self._send_json(400, {"error": {"message": "Invalid JSON"}})
+            return self._send_json(400, {"type": "error", "error": {
+                "type": "invalid_request_error", "message": "请求体不是合法 JSON"}})
+        if not isinstance(body, dict):
+            return self._send_json(400, {"type": "error", "error": {
+                "type": "invalid_request_error", "message": "请求体必须是 JSON 对象"}})
+        return self._send_json(200, {"input_tokens": count_anthropic_tokens(body)})
 
-        # 核心转换逻辑：Anthropic Messages -> OpenAI Chat
-        msgs = []
-        # 处理 system prompt
-        if "system" in body:
-            msgs.append({"role": "system", "content": body["system"]})
-        
-        # 处理消息体
-        for m in body.get("messages", []):
-            role = m.get("role")
-            content = m.get("content")
-            # 简单的内容块转换（目前仅处理文本）
-            text_content = ""
-            if isinstance(content, str):
-                text_content = content
-            elif isinstance(content, list):
-                for part in content:
-                    if part.get("type") == "text":
-                        text_content += part.get("text", "")
-            msgs.append({"role": role, "content": text_content})
+    # ---- 核心代理 ----
+    def _handle_anthropic_messages(self) -> None:
+        """Anthropic Messages API（/v1/messages）→ OpenAI Chat Completions。
 
-        openai_payload = {
-            "model": body.get("model", "claude-3-5-sonnet"),
-            "messages": msgs,
-            "stream": body.get("stream", False),
-            "max_tokens": body.get("max_tokens", 4096)
-        }
-        self._proxy("POST", "/v1/chat/completions", custom_payload=openai_payload)
+        请求和响应两个方向都要转：上游只认 OpenAI 格式，客户端说的是
+        Anthropic 格式。只转一半的话客户端会拿到 choices 结构而解析失败。
+        """
+        raw_body = self._read_body()
+        try:
+            body = json.loads(raw_body)
+        except Exception:
+            return self._send_json(400, {"type": "error", "error": {
+                "type": "invalid_request_error", "message": "请求体不是合法 JSON"}})
+        if not isinstance(body, dict):
+            return self._send_json(400, {"type": "error", "error": {
+                "type": "invalid_request_error", "message": "请求体必须是 JSON 对象"}})
 
-    def _proxy(self, method: str, path: str, custom_payload: Any = None) -> None:
+        if not body.get("model"):
+            return self._send_json(400, {"type": "error", "error": {
+                "type": "invalid_request_error", "message": "缺少 model"}})
+        if not body.get("messages"):
+            return self._send_json(400, {"type": "error", "error": {
+                "type": "invalid_request_error", "message": "缺少 messages"}})
+
+        openai_payload, notes = anthropic_to_openai(body)
+        if notes:
+            # 哪些字段没能完整表达，留在日志里，免得静默丢东西查不出来
+            self.log_message("Anthropic 适配提示: %s", "；".join(notes))
+        self._proxy("POST", "/v1/chat/completions", custom_payload=openai_payload,
+                    anthropic=True, adapt_notes=notes)
+
+    def _proxy(self, method: str, path: str, custom_payload: Any = None,
+               anthropic: bool = False,
+               adapt_notes: Optional[list[str]] = None) -> None:
         if custom_payload:
             payload = custom_payload
             raw_body = json.dumps(custom_payload).encode("utf-8")
@@ -3783,23 +4734,66 @@ class Handler(BaseHTTPRequestHandler):
         # 这次请求试过谁、结果如何。失败的上游也记进来，
         # 左侧统计靠它才能和右侧卡片的「请求/成功/失败」对上。
         trail: list[dict] = []
-        for i, (up, eff_model) in enumerate(pairs):
-            try:
-                self._try_upstream(up, eff_model, method, path, payload, raw_body,
-                                   requested_model, route_source, attempts=len(pairs),
-                                   trail=trail)
-                return
-            except Retryable as exc:
-                last = exc
-                attempts_log.append((up, exc.reason))
-                trail.append({"upstream": up.name, "upstream_id": up.id, "ok": False,
-                              "model": eff_model, "status": exc.status,
-                              "reason": exc.reason})
-                remaining = len(pairs) - i - 1
-                if remaining > 0:
-                    self.log_message("上游 %s 失败(%s)，换下一个（还剩 %d 个）",
-                                     up.name, exc.reason, remaining)
-                continue
+        queue_deadline = t_start + self.router.queue_timeout
+        tried: set[int] = set()
+        # 这一轮里因为「并发/速率满了」被挡下的上游：它们没坏，只是这会儿排不上。
+        # 单独记着，等所有能试的都试完了再回头等它们腾出容量。
+        cap_full: dict[int, str] = {}
+
+        while True:
+            cap_full.clear()
+            for i, (up, eff_model) in enumerate(pairs):
+                if i in tried:
+                    continue
+                lease, denied = up.acquire()
+                if denied:
+                    cap_full[i] = denied
+                    continue
+                tried.add(i)
+                try:
+                    self._try_upstream(up, eff_model, method, path, payload, raw_body,
+                                       requested_model, route_source, attempts=len(pairs),
+                                       trail=trail, anthropic=anthropic,
+                                       adapt_notes=adapt_notes)
+                    return
+                except Retryable as exc:
+                    last = exc
+                    attempts_log.append((up, exc.reason))
+                    trail.append({"upstream": up.name, "upstream_id": up.id, "ok": False,
+                                  "model": eff_model, "status": exc.status,
+                                  "reason": exc.reason})
+                    remaining = len(pairs) - i - 1
+                    if remaining > 0:
+                        self.log_message("上游 %s 失败(%s)，换下一个（还剩 %d 个）",
+                                         up.name, exc.reason, remaining)
+                    continue
+                finally:
+                    # 流式请求要一直占着坑，所以在这里才释放 ——
+                    # _try_upstream 返回时流已经转发完了。
+                    lease.release()
+
+            # 到这儿说明这一轮能试的都试完了。
+            # 若剩下的全是「排不上队」且还没到等待上限，就歇一下再来一轮 ——
+            # 那些上游没坏，只是此刻并发满了，等一下通常就能进去。
+            if not cap_full or time.time() >= queue_deadline:
+                break
+            time.sleep(0.1)
+
+        # 一条都没发出去，全卡在容量上限上：这既不是「上游坏了」也不是
+        # 「没配置」，得说清楚，否则客户端会以为是自己参数不对。
+        if last is None and not tried and cap_full:
+            detail = "；".join(f"{pairs[i][0].name}（{why}）" for i, why in sorted(cap_full.items()))
+            reason = f"所有上游都达到并发/速率上限：{detail}"
+            self._record_history(None, requested_model, "-", 429,
+                                 time.time() - t_start, reason,
+                                 attempts=len(pairs), route_source=route_source)
+            self.log_message("容量已满，%d 个上游都没排上：%s", len(cap_full), detail)
+            return self._send_json(429, {"error": {
+                "message": reason,
+                "type": "capacity_exhausted",
+                "retry_after_seconds": 1,
+                "upstreams": [{"name": pairs[i][0].name, "reason": why}
+                              for i, why in sorted(cap_full.items())]}})
 
         if last is not None:
             self._record_history(last.upstream, requested_model, "-", last.status,
@@ -3814,6 +4808,12 @@ class Handler(BaseHTTPRequestHandler):
                 body = json.dumps({"error": {
                     "message": last.reason or "上游不可用", "type": "upstream_error",
                     "upstream": last.upstream.name}}, ensure_ascii=False).encode("utf-8")
+            # 全都试过还是失败：错误体也要换成客户端那边认识的形状。
+            # 否则 Anthropic 客户端拿到的是上游的 new_api_error 这类结构，
+            # 它只会报「解析失败」，真正的错因（Key 无效 / 限流）就看不见了。
+            if anthropic:
+                body = openai_error_to_anthropic(
+                    body, last.status if 400 <= last.status < 600 else 502)
             self.send_response(last.status if 400 <= last.status < 600 else 502)
             self.send_header("Content-Type", "application/json")
             self.send_header("Content-Length", str(len(body)))
@@ -3830,7 +4830,9 @@ class Handler(BaseHTTPRequestHandler):
     def _try_upstream(self, up: Upstream, eff_model: str, method: str, path: str,
                       payload: Optional[dict], raw_body: bytes,
                       requested_model: Optional[str], route_source: str,
-                      attempts: int, trail: Optional[list[dict]] = None) -> None:
+                      attempts: int, trail: Optional[list[dict]] = None,
+                      anthropic: bool = False,
+                      adapt_notes: Optional[list[str]] = None) -> None:
         trail = trail if trail is not None else []
         data = raw_body or None
         if payload is not None and requested_model and eff_model != requested_model:
@@ -3876,7 +4878,14 @@ class Handler(BaseHTTPRequestHandler):
                 body = b""
             up._close(conn)
             up.record_neutral(f"HTTP {status}")
-            self._relay_json(status, resp, body, up.name, time.time() - t0)
+            if anthropic:
+                # 错误体也换成 Anthropic 的形状，否则客户端只会说「解析失败」，
+                # 真正的错因（Key 无效 / 参数不对）就看不见了
+                body = openai_error_to_anthropic(body, status)
+                self._relay_json(status, resp, body, up.name, time.time() - t0,
+                                 content_type="application/json")
+            else:
+                self._relay_json(status, resp, body, up.name, time.time() - t0)
             trail.append({"upstream": up.name, "upstream_id": up.id, "ok": False,
                           "model": eff_model, "status": status, "client_error": True,
                           "reason": f"客户端错误 HTTP {status}"})
@@ -3886,10 +4895,36 @@ class Handler(BaseHTTPRequestHandler):
                                  trail=trail)
             return
 
+        # 2.5) 200 但回来的是网页：很多网关（New API / one-api 这类）
+        # 对认不出的路径不报 404，而是回 200 + 首页 HTML。
+        # 这永远不是合法的 API 响应，必须当上游故障处理：换下一个，
+        # 或最终回 502 + JSON 错因 —— 绝不能把 HTML 当模型回复甩给客户端
+        # （要 SSE/JSON 的客户端一解析就断，而且 200 让所有状态码检查全绿）。
+        # 判定以正文开头为准，标错 Content-Type 的真流式/真 JSON 不能误杀。
+        if looks_like_html_page(ctype):
+            try:
+                head = resp.peek(256)
+            except Exception:  # noqa: BLE001
+                head = b""
+            if _looks_like_sse_head(head):
+                ctype = "text/event-stream"          # 其实是流，只是标错了
+            elif (head or b"").lstrip()[:1] in (b"{", b"["):
+                ctype = "application/json"           # 其实是 JSON，只是标错了
+            else:
+                try:
+                    resp.read()
+                except Exception:  # noqa: BLE001
+                    pass
+                up._close(conn)
+                reason = "上游返回网页(HTML)而不是 API 响应"
+                up.record_failure(reason, self.router.failure_threshold, up.cooldown)
+                raise Retryable(up, 502, b"", reason)
+
         # 3) 流式
         if "text/event-stream" in ctype:
             self._relay_stream(conn, resp, up, requested_model, eff_model, t0,
-                               route_source, attempts, payload, trail)
+                               route_source, attempts, payload, trail,
+                               anthropic=anthropic)
             return
 
         # 4) 非流式
@@ -3903,12 +4938,25 @@ class Handler(BaseHTTPRequestHandler):
         latency = time.time() - t0
         up._close(conn)
 
-        if eff_model and requested_model and eff_model != requested_model:
+        # 正文其实也是网页（上面 Content-Type 检查没抓到的那种）：同样别放行
+        # 正文其实也是网页（上面 Content-Type 检查没抓到的那种）：同样别放行
+        if looks_like_html_page("", body):
+            reason = "上游返回网页(HTML)而不是 API 响应"
+            up.record_failure(reason, self.router.failure_threshold, up.cooldown)
+            raise Retryable(up, 502, b"", reason)
+
+        if anthropic:
+            # 客户端要的是 Anthropic 格式：模型名不用单独改了，
+            # 转换函数会把 model 一步写成客户端请求的那个名字。
+            body = openai_to_anthropic_response(body, requested_model or eff_model or "",
+                                                fallback_id=resp.getheader("x-request-id") or "")
+        elif eff_model and requested_model and eff_model != requested_model:
             body = rewrite_json_model(body, eff_model, requested_model)
 
         resp_text, usage, reasoning = response_to_text(body)
         up.record_success(latency)
-        self._relay_json(status, resp, body, up.name, latency=latency, effective=eff_model)
+        self._relay_json(status, resp, body, up.name, latency=latency,
+                         effective=eff_model, content_type="application/json")
         trail.append({"upstream": up.name, "upstream_id": up.id, "ok": True,
                       "model": eff_model, "status": status, "reason": ""})
         self._record_history(up, requested_model, eff_model or "-", status, latency,
@@ -3920,9 +4968,13 @@ class Handler(BaseHTTPRequestHandler):
                              trail=trail)
 
     def _relay_json(self, status: int, resp, body: bytes, upstream_name: str,
-                    latency: float = 0.0, effective: Optional[str] = None) -> None:
+                    latency: float = 0.0, effective: Optional[str] = None,
+                    content_type: str = "") -> None:
         self.send_response(status)
-        self.send_header("Content-Type", resp.getheader("Content-Type") or "application/json")
+        # 转成 Anthropic 结构后不能再沿用上游的 Content-Type（那边是 OpenAI 的），
+        # 统一按 JSON 发，客户端只认自己那套。
+        self.send_header("Content-Type",
+                         content_type or resp.getheader("Content-Type") or "application/json")
         self.send_header("Content-Length", str(len(body)))
         self.send_header("X-Upstream", upstream_name)
         self.send_header("X-Upstream-Latency", f"{latency:.3f}")
@@ -3938,12 +4990,20 @@ class Handler(BaseHTTPRequestHandler):
     def _relay_stream(self, conn, resp, up: Upstream, requested_model: Optional[str],
                       eff_model: Optional[str], t0: float, route_source: str,
                       attempts: int, payload: Optional[dict] = None,
-                      trail: Optional[list[dict]] = None) -> None:
+                      trail: Optional[list[dict]] = None,
+                      anthropic: bool = False) -> None:
         trail = trail if trail is not None else []
         headers_sent = False
         acc = make_sse_collector()      # 边转发边攒文本和 token 用量
+        conv: Any = None
         try:
-            rewriter = SSEModelRewriter(requested_model or "", eff_model or "")
+            if anthropic:
+                # Anthropic 客户端要的是 message_start / content_block_delta 这套
+                # 事件序列，不是上游那套 OpenAI chunk
+                conv = AnthropicStreamConverter(requested_model or eff_model or "")
+            else:
+                rewriter = SSEModelRewriter(requested_model or "", eff_model or "")
+                conv = rewriter
 
             # 先偷看第一块：有些上游返回 200 后立刻断流，
             # 提前拿到首块才能判定失败并切换，而不是把空流甩给客户端。
@@ -3962,7 +5022,7 @@ class Handler(BaseHTTPRequestHandler):
 
             first_byte_at = time.time()
             self.send_response(resp.status)
-            self.send_header("Content-Type", resp.getheader("Content-Type") or "text/event-stream")
+            self.send_header("Content-Type", "text/event-stream")
             self.send_header("Cache-Control", "no-cache")
             self.send_header("Connection", "keep-alive")
             self.send_header("X-Accel-Buffering", "no")
@@ -3975,7 +5035,7 @@ class Handler(BaseHTTPRequestHandler):
             headers_sent = True
 
             collect_sse(first_chunk, acc)
-            out = rewriter.feed(first_chunk)
+            out = conv.feed(first_chunk)
             if out:
                 self._write_chunk(out)
 
@@ -3984,10 +5044,14 @@ class Handler(BaseHTTPRequestHandler):
                 if not chunk:
                     break
                 collect_sse(chunk, acc)
-                out = rewriter.feed(chunk)
+                out = conv.feed(chunk)
                 if out:
                     self._write_chunk(out)
-            tail = rewriter.feed(b"", final=True)
+
+            if anthropic:
+                tail = conv.close()
+            else:
+                tail = conv.feed(b"", final=True)
             if tail:
                 self._write_chunk(tail)
             self.wfile.write(b"0\r\n\r\n")
@@ -4020,6 +5084,15 @@ class Handler(BaseHTTPRequestHandler):
                 raise Retryable(up, 502, b"", f"流式响应失败: {exc}") from exc
             # 响应头已经发出去了，没法再换上游，但这个失败也要留在记录里，
             # 否则右侧卡片记了失败、左侧统计却没有，两边又对不上
+            if anthropic:
+                # 客户端已经收到 message_start 了，按 Anthropic 的约定
+                # 用一个 error 事件收尾，客户端才知道这次是失败的。
+                try:
+                    self._write_chunk(conv.error(reason, "api_error"))
+                    self.wfile.write(b"0\r\n\r\n")
+                    self.wfile.flush()
+                except Exception:  # noqa: BLE001
+                    pass
             trail.append({"upstream": up.name, "upstream_id": up.id, "ok": False,
                           "model": eff_model, "status": 502, "reason": reason})
             self._record_history(up, requested_model, eff_model or "-", 502,

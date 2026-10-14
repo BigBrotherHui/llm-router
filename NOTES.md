@@ -1,5 +1,186 @@
 # NOTES
 
+## 2026-10-14 v2.4.1：修「ZCode 回复总是中断，但测试都是通的」
+
+现象（用户报的）：ZCode 把 provider 指向本路由（`http://127.0.0.1:8010/v1`）后，
+回复**总是**中途断掉；但网页上点「测试」，每个上游都显示「通、1 秒延迟」。
+
+根因（在本机完整复现）：**上游把网页当 API 响应回，而路由把它当成功转发了。**
+
+- 上游29（`metapi.lilililwan.xyz`，New API 网关）对认不出的路径不报 404，
+  而是回 `200 + text/html` 的**首页**（1166 字节，`<title>New API</title>`）。
+- `Upstream.open()` 判定「成功」只看一条：不是 404。于是这个 HTML 页
+  被当成可用路径，写进 `_prefix_hint`（记「哪种拼法可用」）——**从这里开始
+  每个请求都优先打这个网页地址**，不会自愈（除非重启或编辑一次上游）。
+- `_try_upstream` 看不到 `text/event-stream` 就走非流式分支，把 HTML
+  原样 relay 给客户端，记录还记成 `200 成功`。ZCode 要的是 SSE，
+  收到 HTML 一解析就断 —— 这就是「回复中断」。
+- 「测试都是通的」也是同一个根因：`ping()` 的成功判据是 `status < 400`，
+  从不看响应体，于是那个 HTML 页（实测 0.61s）稳定报「通、0.7 秒」。
+  真实调用要 1.5s+，所以那个「1 秒延迟」本身就是假成功的指纹。
+
+复现证据：经 8010 发 `stream:true` 请求，拿回
+`Content-Type: text/html` + 1166 字节 HTML，与直连错误路径
+`/chat/completions`（少 `/v1`）的响应 **md5 完全一致**（`b6003e56…`）；
+直连正确路径 `/v1/chat/completions` 连测 8 次全部正常。
+
+**做法**（三处，都在 `router.py`）：
+
+- 新增 `looks_like_html_page(ctype, body)`：Content-Type 含 `text/html`，
+  或正文以 `<!doctype html` / `<html` 开头，即判为网页而非 API 响应。
+- `Upstream.open()`：200+HTML **不算成功**，继续试下一个候选路径；
+  且不把这种后缀记进 `_prefix_hint`（404 仍可记，路径形状至少对）。
+  顺带修了换候选时旧连接不关闭的泄漏。
+- `_try_upstream`：200+HTML 一律按上游故障走 `Retryable`（换下一个上游，
+  全都不行则回 502 + JSON 错因）。判定**以正文为准**，标错 Content-Type
+  的真 SSE（`data:`/`event:` 开头）和真 JSON（`{`/`[` 开头）不误杀。
+- `ping()` / `fetch_models()`：同样校验响应体，HTML 判失败并给出明确错因
+  （「上游返回了网页（HTML）而不是 API 响应」），不再让假成功通过。
+
+验证：
+- `python selftest.py` **411 项全过**（含新增 `bad_html` 回归：假上游
+  回 200+HTML 时必须切到下一个上游，且网页内容不得透传给客户端）。
+- 注：本次与另一并行会话撞车（`router.py` 在调查途中从 2.3.6 被改到 2.4.0，
+  加了 Anthropic 适配与容量闸门）。改动已叠加在 2.4.0 之上，版本号 2.4.1。
+
+## 2026-10-14 v2.4.0：修好 Anthropic 端点（只转了一半）+ 上游并发/速率上限
+
+两件事，都是先诊断后动手。
+
+### 一、`/v1/messages` 原来「声称支持、实际不能用」
+
+上一步加的 Anthropic 端点只做了**请求方向**的转换，响应方向原样透传 OpenAI 的
+`choices` 结构。实测（改动前）：
+
+```
+POST /v1/messages → {"choices":[{"finish_reason":"stop","message":{...}}],
+                     "object":"chat.completion","usage":{"prompt_tokens":...}}
+```
+
+真正的 Anthropic 客户端要的是 `type:"message"` + `content:[{type:"text"}]` +
+`stop_reason` + `usage.input_tokens`。全文件搜 `content_block` / `stop_reason` 是零命中，
+`selftest.py` 里 `/v1/messages` 也是零覆盖 —— 所以它坏着没人发现（既没测也没文档）。
+任何用 anthropic-sdk 的客户端都会解析失败。
+
+同一条路径上还有几个连带问题，都出在原来的 `_handle_anthropic_messages`：
+`tools`/`tool_choice` 被整个丢掉、只挑 `system`/`messages`/`stream`/`max_tokens`
+四个字段；`content` 数组里只挑 `type=="text"`，图片块静默消失；
+`system` 是数组形式时不处理。基本决定了这个端点对它的目标用户（Claude Code 这类）不可用。
+
+**做法**：把适配层整体补齐，两个方向都转。
+
+- 新增 `anthropic_to_openai()`：system（字符串/块数组都认）、内容块
+  （text / image→`image_url` data-URL / tool_use→`tool_calls` /
+  tool_result→独立的 `role=tool` 消息）、tools+tool_choice 映射、
+  通用参数透传（temperature/top_p/stop/…）。流式时**主动注入**
+  `stream_options.include_usage`，否则上游不在流里带 usage，客户端最后只能看到 0。
+- 新增 `openai_to_anthropic_response()`：`content` 块（text / tool_use，参数从
+  JSON 串解析成对象）、`finish_reason`→`stop_reason` 映射、usage 换名
+  （`input_tokens`/`output_tokens` + 缓存字段）。工具参数不是合法 JSON 时塞
+  `_raw_arguments` 而不是丢掉。
+- 新增 `AnthropicStreamConverter`：OpenAI chunk → Anthropic 事件序列
+  （message_start / content_block_start·delta·stop / message_delta / message_stop），
+  工具参数按 `input_json_delta` 分片。逐字节喂过一遍（最坏的分片切断），
+  文本能完整重建。已经发出 message_start 之后才出错的话，补一个 `error` 事件收尾。
+- 错误体也换形状（`type:"error"` + `invalid_request_error` 这类），
+  否则客户端只会报「解析失败」，真正的错因（Key 无效/参数不对）看不见。
+- 新增 `/v1/messages/count_tokens`：本地估算，不真去调上游（否则每次估算都是一次
+  计费调用）。公式：中文 ≈ 1.5 字/token、英文 ≈ 4 字符/token。是估算，够客户端
+  判断「上下文还塞不塞得下」；真实计费一律以上游回报的为准。
+- 没法转的字段（`top_k`/`thinking`/`metadata`）记进日志说明，不静默丢 ——
+  静默丢字段是最难查的那种问题。
+
+### 二、上游并发 / 速率上限
+
+需求：同一个账号被多个分组引用时，光靠上游自己回 429 已经太晚（它先拒绝你了）。
+路由器手里有整个组的信息，可以先挑还有容量的那家发，从源头少撞墙。
+
+- 新增 `CapacityGate`：并发占用 + **最近 60 秒滑动窗口**速率。
+  特意不做「整点清零」——那样整点瞬间会双倍放行。
+- 上限存在 **Upstream** 上（不是分组）：它反映那个账号的真实配额，
+  同一账号被多个分组引用时是共用的一份。按分组各存一套的话，两个分组各写 5 并发，
+  实际就会同时打进 10 个，等于上限没生效。界面上也是这么说的。
+- `_proxy` 的循环重写：撞上限的上游**跳过并换下一家**，请求照样成功；
+  只有整组都满才短暂排队（`queue_timeout_seconds`，默认 15s），等不到回
+  429 `capacity_exhausted`，错误里说清是哪家卡在什么限制上。
+- **被容量挡下不算失败**：不记失败数、不触发冷却 —— 它只是没轮到。
+  selftest 里专门断言了「失败数没再增加」。
+- 凭据用 `CapacityLease`（with 语义）释放，异常路径也不漏。流式请求全程占坑，
+  转发完才还 —— 否则「并发上限」对最吃并发的流式场景根本没意义。
+- 前端：模型路由弹窗每行右边一列「并发 / /分」输入 + 实时占用（`0/3 并发`，满了标「满」）；
+  上游卡片上也有一个 badge。改完**立刻生效**（不用点保存）——它属于上游的容量配置，
+  和这个分组的路由是两件事。弹窗开着时只就地刷新那几个数字，不重建 DOM（免得打断输入）。
+- 一行里动作变多了，`.pick` 加 `flex-wrap`，否则窗口窄时上游名字被挤成两行。
+
+### 三、顺带发现的两件事
+
+- **工作区里有一批未提交的既有改动**（上一轮会话留下的 HTML 检测）：`router.py` 里
+  `looks_like_html_page()` 把「200 + 网页」判成上游故障。这**故意改变**了老测试
+  「解析不了的内容原样透传」的预期（原来 `bad_json` 用例喂的就是 HTML）。
+  处理：把那个用例改成喂 `text/plain`（保住「非 JSON 不能打成 500」这个原始回归），
+  另加一个 `bad_html` 用例来验新行为（换下一个上游、不把网页当模型回复透传）。
+  两个不混在一起，才分得清在测哪条。
+- 假上游原来只按**路径** `endswith("/stream")` 触发流式，而 Anthropic 适配走的是
+  `/v1/chat/completions`（路径里没有 stream）。改成**也认 `body.stream`**，
+  这才符合真实厂商行为。顺手给假上游加了 `bodies` 记录（原来只记模型名，
+  验「请求转换对不对」时看不到真正发上去的东西）。
+
+### 验证
+
+- `selftest.py`：**413 项全过**。新增第 31 组（Anthropic 适配，31 项）和第 32 组
+  （并发/速率，13 项）。第 32 组用「人工延迟 + 上限 2」发 6 个并发：
+  既验同时不超上限（耗时 ≥1.4s，呈分批特征），又验跑完 `in_flight` 归零（凭据没泄漏）。
+- 另写了一个独立端口的验证脚本（假上游 + 真 HTTP 报文，不碰 8010）跑 **54 项**，
+  覆盖非流式/流式/工具调用/图片/错误体/count_tokens/并发分流/全满 429/
+  容量状态可见/普通 OpenAI 路径没被改坏。
+  期间有两项「失败」查出来是**脚本自身的 bug**（假上游的 inflight 字典少了 up2 的 key，
+  分流的请求在假上游里 KeyError 崩了；另一处是断言取了非增量值），已修。
+- 浏览器实测（`webui.html`）：上游卡片显示 `0/3 并发 · 每分钟 0/60`；
+  弹窗两行分别显示 `0/3 并发 · 每分钟 0/60` 和 `0/2 并发`；
+  在弹窗里把 B 的并发改成 2 → toast 确认、落盘、下一个轮询周期实时占用补上 `0/2 并发`。
+  线上 8010 的 deepseek 分组（17 行）每行也都渲染出了「并发 / /分」两个输入。
+- **线上实测又抓到一处漏转**（本地假上游测不出来）：真实调用 `/v1/messages` 时
+  上游回 `401 {"type":"new_api_error"}`，客户端拿到的是**上游原样结构** ——
+  因为「所有上游都失败」走的是 `_proxy` 末尾那条重试耗尽分支，
+  而我最初只在「单家客户端错误」分支里转了错误体。已修并补了用例
+  （得把三个上游全置失败：这份配置是自动兜底模式，只挡一两家剩下的照样把请求接走）。
+  修后线上实测：`type=error` / `error.type=authentication_error`。
+- 版本号这里有个插曲：改到一半时发现工作区被**另一个会话同时编辑**
+  （它加了 HTML 检测的修复、把版本推到 2.4.1，还重启了 8010）。
+  我的改动都在合并后的文件里，411 项测试在那份合并结果上全绿；
+  在此基础上我又加了错误体转换，共 413 项。重启仍走 `_restart.py`
+  （健康检查 + 自动回滚），重启后确认只有一个 LISTENING 进程。
+
+## 2026-10-13 v2.3.6：修「手机上请求记录不显示」——/stats 体积过大拖垮手机轮询
+
+现象：桌面浏览器能看到记录，**手机（经 Tailscale）记录列表空白**。用户先以为是
+「记录没同步」。
+
+根因（实测确认）：`refresh（）` 每 2.5s 调一次 `GET /stats?range=all`，该响应
+**2.85 MB**，其中 `history` 字段（内存最近 500 条，含 request/response 正文）
+占 **2.59 MB**。手机上这份 payload 要么慢到超时、要么被中断，`refresh（）` 的
+try 块在 `await /stats` 处抛出 → 后面的 `loadJournal（）` 根本不执行 →
+记录列表永远空。桌面走 localhost 快，掩盖了问题。
+
+- 前端早已不用 `state.history`（v2.3.0 起列表改读 `/admin/journal`），
+  这个字段纯属死重。`snapshot（）` 里删掉 `history` 字段及其 `list（self.history)`。
+- 改动后 `/stats?range=all`：**2.85 MB → 192 KB**（`history` 不再返回）。
+- `selftest.py` 第 24 组原读 `snap["history"]`，改从 `/admin/history` 取 trail。
+- 版本号 2.3.5 → 2.3.6（前端轮询发现版本变化会自动 reload，清掉旧 JS）。
+
+另一处并行问题（本次会话造成）：8010 上曾同时有两个 python 进程
+（用户 `启动.cmd` 起的 73752 + 助手早先 `Start-Process` 起的 41856）都在 LISTENING。
+用 `_restart.py` 统一收敛为单实例。
+
+验证：
+- `python selftest.py` **367 项全过**。
+- `_restart.py` 重启后：8010 仅 1 个 LISTENING（60112），health=2.3.6。
+- 经 Tailscale IP 实测：`/stats` 110ms/192KB、`/admin/journal/index` 105ms
+  （total 3876）、`/admin/journal?limit=100` 132ms/100 条。
+- 注意：本会话推理走 `opencode.jsonc` 的 `localrouter` provider →
+  `http://127.0.0.1:8010/v1`，所以重启 8010 会掐断自身推理；必须用带健康检查
+  与自动回滚的 `_restart.py`，并在工具内**同步等待**其完成。
+
 ## 2026-10-13 上游「测速」改成按勾选的每个模型各发一个请求
 
 需求：上游来源卡片的「测速」以前只测 `available_models[0]`，一个上游勾了

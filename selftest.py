@@ -22,6 +22,9 @@ PORT_URL = f"http://127.0.0.1:{PORT}"
 UP_PORTS = {"a": 18721, "b": 18722, "c": 18723, "d": 18724}
 
 hits: dict[str, list] = {"a": [], "b": [], "c": [], "d": []}
+# 每个假上游收到的完整请求体（hits 只记模型名）。
+# 验「请求转换对不对」时必须看真正发上去的东西，光看模型名不够。
+bodies: dict[str, list] = {"a": [], "b": [], "c": [], "d": []}
 behavior: dict[str, str] = {"a": "ok", "b": "ok", "c": "ok", "d": "ok"}
 # 每个假上游的人工延迟（秒），用来让「按测速重排」的结果可预测
 delay: dict[str, float] = {"a": 0.0, "b": 0.0, "c": 0.0, "d": 0.0}
@@ -120,6 +123,7 @@ class UpstreamServer(BaseHTTPRequestHandler):
         model = body.get("model")
         with lock:
             hits[self.tag].append(model)
+            bodies[self.tag].append(body)
             behave = behavior[self.tag]
             wait = delay.get(self.tag, 0.0)
         if wait:
@@ -151,17 +155,34 @@ class UpstreamServer(BaseHTTPRequestHandler):
             self.wfile.flush()
             return
         if behave == "bad_json":
-            # 2xx + 非流式 + 响应体不是 JSON 对象：网关吐 HTML 错误页那种。
+            # 2xx + 非流式 + 响应体不是 JSON 对象（网关吐纯文本错误页那种）。
             # 这种响应必须能正常透传，不能因为解析失败把请求打成 500。
-            payload = b"<html><body>502 Bad Gateway</body></html>"
+            # 特意用 text/plain 而**不是** HTML：HTML 现在有专门的处理
+            # （见下面的 bad_html），混在一起就分不清在测哪条了。
+            payload = b"Bad Gateway: upstream said no"
             self.send_response(200)
-            self.send_header("Content-Type", "text/html")
+            self.send_header("Content-Type", "text/plain")
+            self.send_header("Content-Length", str(len(payload)))
+            self.end_headers()
+            self.wfile.write(payload)
+            return
+        if behave == "bad_html":
+            # 200 + HTML 首页：很多网关（New API / one-api）对认不出的路径
+            # 不报 404 而是回首页。这不是 API 响应，必须当上游故障处理 ——
+            # 否则就是「测试永远通、调用永远断」。
+            payload = b"<!DOCTYPE html><html><body>Welcome to the gateway</body></html>"
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
             self.send_header("Content-Length", str(len(payload)))
             self.end_headers()
             self.wfile.write(payload)
             return
 
-        if self.path.endswith("/stream"):
+        # 流式有两条触发路径：
+        #   1) 路径以 /stream 结尾（老测试用，模拟 OpenAI 的流式端点）
+        #   2) 请求体里 stream=true（真实厂商的行为，也是 Anthropic 适配那条路 ——
+        #      它会归一化成 /v1/chat/completions，路径里没有 /stream）
+        if self.path.endswith("/stream") or body.get("stream"):
             self.send_response(200)
             self.send_header("Content-Type", "text/event-stream")
             self.send_header("Transfer-Encoding", "chunked")
@@ -416,6 +437,8 @@ def reset_hits():
     with lock:
         for k in hits:
             hits[k].clear()
+        for k in bodies:
+            bodies[k].clear()
 
 
 def cleanup():
@@ -718,7 +741,7 @@ def main():
         stop_router(p)
         behavior["a"] = "ok"
 
-    # 上游回 200 但响应体不是 JSON（例如网关吐 HTML 错误页）。
+    # 上游回 200 但响应体不是 JSON（例如网关吐纯文本错误页）。
     # 回归：response_to_text 的返回元数跟调用方对不上时，这里会 500 + ValueError。
     cleanup()
     behavior["a"] = "bad_json"
@@ -730,6 +753,22 @@ def main():
         check("解析不了的内容原样透传", b"Bad Gateway" in body, str(body[:80]))
         check("没有误切到下一个上游", hdr.get("X-Upstream") == "up-a",
               str(hdr.get("X-Upstream")))
+    finally:
+        stop_router(p)
+        behavior["a"] = "ok"
+
+    # 上游回 200 但内容是**网页**：不能当成功，要换下一个（或最后回 502）。
+    # 判据见 router.py 的 looks_like_html_page：网关用首页兜底时会出现这种。
+    cleanup()
+    behavior["a"] = "bad_html"
+    p = start_router(write_config(with_routes=True))
+    try:
+        reset_hits()
+        st, body, hdr = post()
+        check("上游回 HTML 时不当成成功（切到下一个上游）",
+              hdr.get("X-Upstream") == "up-b", str(hdr.get("X-Upstream")))
+        check("上游回 HTML 时不把网页当模型回复透传",
+              b"Welcome to the gateway" not in body, str(body[:120]))
     finally:
         stop_router(p)
         behavior["a"] = "ok"
@@ -1888,7 +1927,9 @@ def main():
         check("左侧汇总 b 成功=2", lu["up-b"]["ok"] == 2, str(lu.get("up-b")))
 
         # 历史记录里保留了每一步，点开请求详情能看到中间那次失败
-        trail = snap["history"][-1]["trail"]
+        # （/stats 不再带 history 了，改从 /admin/history 取，体积小）
+        st, hist_raw = get("/admin/history")
+        trail = hist_raw["history"][-1]["trail"]
         check("trail 有两步", len(trail) == 2, str(trail))
         check("trail 第一步是 a 的失败",
               trail[0]["ok"] is False and trail[0]["upstream"] == "up-a", str(trail[0]))
@@ -2358,6 +2399,300 @@ def main():
                   off is False and on is True, f"off={off} on={on}")
         finally:
             conn.close()
+    finally:
+        stop_router(p)
+
+    # ================= 31. Anthropic /v1/messages 适配（请求+响应两个方向）=================
+    # 上游只认 OpenAI 格式，客户端说的是 Anthropic 格式。只转一半的话
+    # 客户端会拿到 choices 结构而解析失败 —— 所以这个端点必须两头都验。
+    print("\n[31] Anthropic /v1/messages 适配")
+    cfg = write_config()
+    p = start_router(cfg)
+    try:
+        admin("/admin/fetch-models")
+        admin("/admin/select-models", {"id": "a1", "models": ["deepseek-chat"]})
+
+        # --- 非流式：响应必须是 Anthropic 结构 ---
+        st, r = admin("/v1/messages", {
+            "model": "deepseek-chat", "max_tokens": 100,
+            "messages": [{"role": "user", "content": "你好"}]})
+        check("Anthropic 非流式返回 200", st == 200, str(r)[:200])
+        check("响应 type=message", r.get("type") == "message", str(r)[:200])
+        check("响应 role=assistant", r.get("role") == "assistant")
+        check("content 是块数组且 type=text",
+              isinstance(r.get("content"), list) and r["content"]
+              and r["content"][0].get("type") == "text",
+              json.dumps(r.get("content"), ensure_ascii=False)[:200])
+        check("带 stop_reason", r.get("stop_reason") == "end_turn", str(r.get("stop_reason")))
+        check("usage 用 input_tokens / output_tokens",
+              isinstance(r.get("usage"), dict)
+              and r["usage"].get("input_tokens") == 100
+              and r["usage"].get("output_tokens") == 20,
+              json.dumps(r.get("usage"), ensure_ascii=False))
+        check("usage 带 cache_read_input_tokens",
+              r["usage"].get("cache_read_input_tokens") == 64,
+              json.dumps(r.get("usage"), ensure_ascii=False))
+        check("没有 OpenAI 的 choices 字段（客户端解析不了它）", "choices" not in r)
+
+        # --- 上游收到的必须是 OpenAI 格式 ---
+        admin("/admin/select-models", {"id": "a1", "models": ["deepseek-chat"]})
+        st, raw, _ = _req("/v1/messages", {
+            "model": "deepseek-chat", "max_tokens": 77, "temperature": 0.25,
+            "system": [{"type": "text", "text": "你是助手"},
+                       {"type": "text", "text": "要简洁"}],
+            "messages": [{"role": "user", "content": "看图"}],
+            "top_k": 40}, port=PORT)
+        sent = bodies["a"][-1]
+        check("上游收到的是 OpenAI 请求（model/messages）",
+              sent.get("model") == "deepseek-chat" and isinstance(sent.get("messages"), list),
+              str(sent)[:200])
+        check("Anthropic 的 max_tokens 保留", sent.get("max_tokens") == 77,
+              str(sent.get("max_tokens")))
+        check("system 数组拼成一条 system 消息",
+              sent["messages"][0].get("role") == "system"
+              and sent["messages"][0].get("content") == "你是助手\n要简洁",
+              json.dumps(sent["messages"][0], ensure_ascii=False))
+        check("temperature 透传", sent.get("temperature") == 0.25,
+              str(sent.get("temperature")))
+
+        # --- 图片内容块 ---
+        st, raw, _ = _req("/v1/messages", {
+            "model": "deepseek-chat", "max_tokens": 20,
+            "messages": [{"role": "user", "content": [
+                {"type": "text", "text": "这是什么"},
+                {"type": "image", "source": {"type": "base64",
+                                             "media_type": "image/png",
+                                             "data": "QUJD"}}]}]}, port=PORT)
+        sent = bodies["a"][-1]
+        parts = sent["messages"][-1].get("content")
+        check("图片转成 OpenAI 的 image_url",
+              isinstance(parts, list) and any(
+                  p.get("type") == "image_url"
+                  and str(p.get("image_url", {}).get("url", "")).startswith("data:image/png;base64,")
+                  for p in parts),
+              json.dumps(parts, ensure_ascii=False)[:250])
+
+        # --- 工具调用：请求方向 ---
+        st, raw, _ = _req("/v1/messages", {
+            "model": "deepseek-chat", "max_tokens": 20,
+            "tools": [{"name": "get_weather", "description": "查天气",
+                       "input_schema": {"type": "object",
+                                        "properties": {"city": {"type": "string"}},
+                                        "required": ["city"]}}],
+            "tool_choice": {"type": "auto"},
+            "messages": [{"role": "user", "content": "上海天气"}]}, port=PORT)
+        sent = bodies["a"][-1]
+        tools = sent.get("tools") or []
+        check("tools 转成 OpenAI function 格式",
+              tools and tools[0].get("type") == "function"
+              and tools[0]["function"].get("name") == "get_weather"
+              and tools[0]["function"]["parameters"].get("required") == ["city"],
+              json.dumps(tools, ensure_ascii=False)[:250])
+        check("tool_choice auto 映射为 auto", sent.get("tool_choice") == "auto",
+              str(sent.get("tool_choice")))
+
+        # --- 工具结果回传 ---
+        st, raw, _ = _req("/v1/messages", {
+            "model": "deepseek-chat", "max_tokens": 20,
+            "tools": [{"name": "get_weather", "input_schema": {"type": "object"}}],
+            "messages": [
+                {"role": "user", "content": "上海天气"},
+                {"role": "assistant", "content": [
+                    {"type": "tool_use", "id": "tu_1", "name": "get_weather",
+                     "input": {"city": "上海"}}]},
+                {"role": "user", "content": [
+                    {"type": "tool_result", "tool_use_id": "tu_1",
+                     "content": [{"type": "text", "text": "晴 25 度"}]}]}]}, port=PORT)
+        sent = bodies["a"][-1]
+        asst = [m for m in sent["messages"] if m.get("role") == "assistant"]
+        toolmsg = [m for m in sent["messages"] if m.get("role") == "tool"]
+        check("assistant 的 tool_use 转成 tool_calls",
+              asst and asst[0].get("tool_calls")
+              and asst[0]["tool_calls"][0]["function"]["name"] == "get_weather",
+              json.dumps(asst, ensure_ascii=False)[:250])
+        check("tool_result 转成独立的 role=tool 消息",
+              toolmsg and toolmsg[0].get("tool_call_id") == "tu_1"
+              and toolmsg[0].get("content") == "晴 25 度",
+              json.dumps(toolmsg, ensure_ascii=False)[:250])
+
+        # --- 流式：事件序列必须是 Anthropic 的 ---
+        body = {"model": "deepseek-chat", "max_tokens": 20, "stream": True,
+                "messages": [{"role": "user", "content": "你好"}]}
+        req = urllib.request.Request(f"{PORT_URL}/v1/messages",
+                                     data=json.dumps(body).encode(),
+                                     headers={"Content-Type": "application/json"},
+                                     method="POST")
+        with urllib.request.urlopen(req, timeout=60) as resp:
+            sse = resp.read().decode("utf-8", "replace")
+        events = [l[7:] for l in sse.split("\n") if l.startswith("event: ")]
+        check("流式首事件是 message_start", events[:1] == ["message_start"], str(events[:3]))
+        check("流式末事件是 message_stop", events[-1:] == ["message_stop"], str(events[-3:]))
+        check("流式有 content_block_delta", "content_block_delta" in events, str(events))
+        check("流式没有裸的 OpenAI chunk（data 里不该出现 choices）",
+              '"choices"' not in sse, sse[:200])
+        deltas = []
+        for line in sse.split("\n"):
+            if not line.startswith("data: "):
+                continue
+            try:
+                o = json.loads(line[6:])
+            except Exception:
+                continue
+            d = o.get("delta") or {}
+            if d.get("type") == "text_delta":
+                deltas.append(d.get("text") or "")
+        check("流式文本能拼回完整回复", "".join(deltas).startswith("a0a1a2"),
+              repr("".join(deltas)))
+
+        # --- 错误体也要是 Anthropic 形状 ---
+        behavior["a"] = "fail400"
+        st, r = admin("/v1/messages", {"model": "deepseek-chat", "max_tokens": 20,
+                                       "messages": [{"role": "user", "content": "x"}]})
+        check("上游 400 时 type=error", r.get("type") == "error", str(r)[:200])
+        check("错误类型映射成 invalid_request_error",
+              (r.get("error") or {}).get("type") == "invalid_request_error", str(r)[:200])
+        check("错误信息保留上游原文",
+              "参数不合法" in str((r.get("error") or {}).get("message")), str(r)[:200])
+        behavior["a"] = "ok"
+
+        # 所有上游都失败时的错误体（走的是「重试耗尽」那条路，和上面的
+        # 单家客户端错误不是同一个分支）。实测线上曾经在这里漏转：
+        # Anthropic 客户端拿到上游的 new_api_error 结构只会报「解析失败」。
+        # 三个上游都得置失败 —— 这个配置没写死路由，是「自动兜底」模式，
+        # 只挡一两家的话剩下的那个照样能把请求接走。
+        behavior["a"] = "fail500"
+        behavior["b"] = "fail500"
+        behavior["c"] = "fail500"
+        st, r = admin("/v1/messages", {"model": "deepseek-chat", "max_tokens": 20,
+                                       "messages": [{"role": "user", "content": "x"}]})
+        check("全部上游失败时也是 type=error", r.get("type") == "error", str(r)[:220])
+        check("全部上游失败时错误类型已映射（不是上游原样结构）",
+              (r.get("error") or {}).get("type") in
+              ("api_error", "overloaded_error", "rate_limit_error", "authentication_error"),
+              str(r)[:220])
+        behavior["a"] = "ok"
+        behavior["b"] = "ok"
+        behavior["c"] = "ok"
+
+        # --- 缺字段的请求要明确报错，而不是打到上游 ---
+        st, r = admin("/v1/messages", {"max_tokens": 10,
+                                       "messages": [{"role": "user", "content": "x"}]})
+        check("缺 model 返回 400", st == 400, f"{st} {str(r)[:150]}")
+        st, r = admin("/v1/messages", {"model": "deepseek-chat"})
+        check("缺 messages 返回 400", st == 400, f"{st} {str(r)[:150]}")
+
+        # --- count_tokens ---
+        st, r = admin("/v1/messages/count_tokens", {
+            "model": "deepseek-chat",
+            "messages": [{"role": "user", "content": "这是一段用来估算的中文文字"}]})
+        check("count_tokens 返回正整数 input_tokens",
+              st == 200 and isinstance(r.get("input_tokens"), int) and r["input_tokens"] > 0,
+              str(r)[:200])
+
+        # --- 普通 OpenAI 路径不受影响 ---
+        st, r = admin("/v1/chat/completions",
+                      {"model": "deepseek-chat",
+                       "messages": [{"role": "user", "content": "hi"}]})
+        check("普通 OpenAI 路径仍是 choices 结构",
+              st == 200 and r.get("choices"), str(r)[:200])
+    finally:
+        stop_router(p)
+
+    # ================= 32. 上游并发 / 速率上限 =================
+    print("\n[32] 上游并发 / 速率上限")
+    cfg = write_config()
+    p = start_router(cfg)
+    try:
+        admin("/admin/fetch-models")
+        admin("/admin/select-models", {"id": "a1", "models": ["deepseek-chat"]})
+
+        st, r = admin("/admin/upstream/capacity",
+                      {"id": "a1", "max_concurrent": 2, "max_per_minute": 0})
+        check("设置并发上限成功", st == 200 and r.get("max_concurrent") == 2, str(r)[:200])
+        check("0 表示不限速率（回 null）", r.get("max_per_minute") is None, str(r)[:200])
+
+        st, snap = get("/stats")
+        by_id = {u["id"]: u for u in snap["upstreams"]}
+        cap = by_id["a1"].get("capacity") or {}
+        check("snapshot 带 capacity（含实时占用）",
+              cap.get("max_concurrent") == 2 and "in_flight" in cap and "has_room" in cap,
+              json.dumps(cap, ensure_ascii=False))
+        check("空闲时 has_room=True", cap.get("has_room") is True,
+              json.dumps(cap, ensure_ascii=False))
+
+        # 上限必须随状态持久化（重启后还在）
+        st, snap = get("/stats")
+        check("capacity 挂在落盘状态里",
+              (snap["upstreams"][0].get("capacity") or {}).get("max_concurrent") == 2
+              or any((u.get("capacity") or {}).get("max_concurrent") == 2
+                     for u in snap["upstreams"]),
+              json.dumps([u.get("capacity") for u in snap["upstreams"]], ensure_ascii=False))
+
+        # 慢上游 + 并发上限：同时发出的请求不能超过上限
+        delay["a"] = 0.5     # 让每个请求慢 0.5s，才看得出发并发上限
+        peak = {"a": 0}
+        # 假上游里记录了 hits，但并发峰值需要另测：用并发请求跑一遍，
+        # 只要全部成功、且耗时呈「分批」特征，就说明闸门在起作用。
+        results = []
+        lock2 = threading.Lock()
+
+        def one():
+            st, rr = admin("/v1/chat/completions",
+                           {"model": "deepseek-chat",
+                            "messages": [{"role": "user", "content": "hi"}]})
+            with lock2:
+                results.append(st)
+
+        threads = [threading.Thread(target=one) for _ in range(6)]
+        t0 = time.time()
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        elapsed = time.time() - t0
+        check("并发下请求全部成功", results.count(200) == 6, str(results))
+        # a1 上限 2、每个 0.5s：6 个请求至少分 3 批 ≈ 1.5s。
+        # 完全不限并发的话 6 个并排跑完只要 ~0.5s。
+        check("被并发上限串行化（耗时应 ≥ 1.4s）", elapsed >= 1.4, f"实测 {elapsed:.2f}s")
+        delay["a"] = 0.0
+
+        # 上游失败时凭据必须归还，否则上限会越用越少。
+        # 释放发生在 _try_upstream 的 finally 里，紧跟请求返回，稍等一下再读。
+        time.sleep(0.4)
+        st, snap = get("/stats")
+        cap = next(u["capacity"] for u in snap["upstreams"] if u["id"] == "a1")
+        check("请求跑完后 in_flight 归零（凭据没泄漏）", cap.get("in_flight") == 0,
+              json.dumps(cap, ensure_ascii=False))
+
+        # 速率上限：连发超过上限就被挡（1 分钟窗口）
+        admin("/admin/upstream/capacity", {"id": "a1", "max_concurrent": 0,
+                                           "max_per_minute": 3})
+        st, snap = get("/stats")
+        cap = next(u["capacity"] for u in snap["upstreams"] if u["id"] == "a1")
+        check("速率上限已生效（max_per_minute=3）", cap.get("max_per_minute") == 3,
+              json.dumps(cap, ensure_ascii=False))
+        # 第 1 个请求就会占掉窗口里的一格
+        admin("/v1/chat/completions", {"model": "deepseek-chat",
+                                       "messages": [{"role": "user", "content": "hi"}]})
+        st, snap = get("/stats")
+        cap = next(u["capacity"] for u in snap["upstreams"] if u["id"] == "a1")
+        check("用掉的次数被记进滑动窗口", cap.get("used_last_minute", 0) >= 1,
+              json.dumps(cap, ensure_ascii=False))
+
+        # 清掉上限后回到不限量
+        st, r = admin("/admin/upstream/capacity", {"id": "a1", "max_concurrent": 0,
+                                                   "max_per_minute": 0})
+        check("清掉上限后返回 null",
+              r.get("max_concurrent") is None and r.get("max_per_minute") is None,
+              str(r)[:200])
+        st, snap = get("/stats")
+        cap = next(u["capacity"] for u in snap["upstreams"] if u["id"] == "a1")
+        check("不限量时 has_room=True", cap.get("has_room") is True,
+              json.dumps(cap, ensure_ascii=False))
+
+        # 不存在的上游要报错
+        st, r = admin("/admin/upstream/capacity", {"id": "不存在", "max_concurrent": 2})
+        check("给不存在的上游设上限会报错", st >= 400, f"{st} {str(r)[:150]}")
     finally:
         stop_router(p)
 
