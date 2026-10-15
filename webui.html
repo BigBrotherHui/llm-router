@@ -84,6 +84,8 @@
   .up.open{grid-column:1/-1}
   .up.off{opacity:.55}
   .up.cool{border-color:var(--warn)}
+  .up.match-avail{border-color:#f59e0b;border-width:2px;box-shadow:0 0 0 1px #fef3c7}
+  .up.match-sel{border-color:#22c55e;border-width:2px;box-shadow:0 0 0 1px #dcfce7}
   .up-head{display:flex;align-items:center;gap:10px;flex-wrap:wrap}
   .up-name{font-weight:600;font-size:15px}
   .up-actions{display:flex;gap:7px;align-items:center;flex-wrap:wrap;margin-left:auto}
@@ -230,6 +232,17 @@
   .req-head{display:flex;align-items:center;gap:8px;padding:8px 10px;cursor:pointer;
     flex-wrap:wrap}
   .req-head:hover{background:var(--panel3)}
+  .req.recovered{border-color:var(--warn)}
+  .req.failed{border-color:var(--bad)}
+  .req-path{flex-basis:100%;min-width:0;display:flex;align-items:center;flex-wrap:wrap;
+    gap:5px;font-size:11px;line-height:1.6}
+  .req-hop{display:inline-flex;align-items:baseline;flex-wrap:wrap;gap:4px;
+    max-width:100%;min-width:0;padding:2px 6px;border:1px solid currentColor;border-radius:5px;
+    overflow-wrap:anywhere}
+  .req-hop.good{color:var(--ok)}
+  .req-hop.bad{color:var(--bad)}
+  .req-hop-name{min-width:0;overflow-wrap:anywhere}
+  .req-arrow{color:var(--dim)}
   .req.open .req-head{background:var(--panel3);border-bottom:1px solid var(--line)}
   .req-idx{color:var(--dim);font-size:10.5px;font-variant-numeric:tabular-nums;
     min-width:34px}
@@ -420,10 +433,17 @@
         </div>
 
         <div class="up-tools">
-          <input id="upSearch" class="filterbox" placeholder="搜索上游 / 模型…"
+          <input id="upSearch" class="filterbox" placeholder="搜索上游 / 模型（含未选的）…"
                  style="min-width:200px">
           <span class="hint" id="upCount"></span>
           <div class="grow"></div>
+          <select id="upEnabledFilter" style="font-size:12px;padding:5px 8px" title="按启用状态筛选">
+            <option value="hide">不含停用</option>
+            <option value="all">包含停用</option>
+            <option value="only">只看停用</option>
+          </select>
+          <button class="mini" id="upSortAsc" title="正向排序（按原始顺序)">↑</button>
+          <button class="mini" id="upSortDesc" title="逆向排序（倒过来显示)">↓</button>
           <button class="mini" id="enableAllBtn">全部启用</button>
           <button class="mini" id="disableAllBtn">全部停用</button>
         </div>
@@ -585,10 +605,17 @@
         <span class="hint">地址 (base_url)</span>
         <input id="eUrl" class="mono">
       </label>
-      <label class="grid" style="gap:5px">
-        <span class="hint">API Key <span id="eKeyHint" class="muted"></span></span>
-        <input id="eKey" class="mono" type="password" autocomplete="off"
-               placeholder="留空表示不改">
+      <div class="grid" style="gap:5px">
+        <span class="hint">API Keys <span id="eKeyHint" class="muted"></span></span>
+        <div id="eKeyList" style="display:grid;gap:6px"></div>
+        <button class="mini" id="eAddKey" type="button" style="justify-self:start;margin-top:2px">+ 添加 Key</button>
+      </div>
+      <label class="grid" style="gap:5px" id="eKeyStrategyWrap">
+        <span class="hint">多 Key 使用方式</span>
+        <select id="eKeyStrategy" style="font-size:13px">
+          <option value="failover">一个用完/出错再切下一个（failover）</option>
+          <option value="round_robin">每次请求轮流用（round-robin）</option>
+        </select>
       </label>
       <label class="row" style="gap:7px;cursor:pointer">
         <input type="checkbox" id="eEnabled"> <span style="font-size:13px">启用这个上游</span>
@@ -638,6 +665,7 @@ function dayKeyOf(atSeconds) {
 // 哪些上游卡片展开了模型勾选面板；以及各面板里输入的筛选词
 const expanded = {};
 const pickFilter = {};
+let upSortDir = 1;   // 上游来源卡片排序方向：1 = 原始顺序，-1 = 倒过来
 
 function toast(msg, kind = "") {
   const el = document.createElement("div");
@@ -724,11 +752,14 @@ function modelCheckEntry(u, m) {
 function checkBadge(c) {
   if (!c) return "";
   let label, color;
-  if (c.rate_limited) { label = "限流"; color = "var(--warn)"; }
-  else if (c.ok) { label = "可用"; color = "var(--ok)"; }
-  else { label = "不可用"; color = "var(--bad)"; }
-  const lat = (c.ok && c.latency_seconds != null) ? " " + fmtLat(c.latency_seconds) : "";
-  return `<span class="badge mono" style="color:${color};border-color:currentColor" title="${esc(c.error || "")}">${label}${lat}</span>`;
+  if (c.rate_limited) { label = "本次测试：限流"; color = "var(--warn)"; }
+  else if (c.ok) { label = "本次测试：成功（短请求)"; color = "var(--ok)"; }
+  else { label = "本次测试：失败"; color = "var(--bad)"; }
+  const lat = (c.ok && c.latency_seconds != null) ? " · 耗时 " + fmtLat(c.latency_seconds) : "";
+  const tip = [explainHttpError(c.error, c.status), "仅测试短请求，不代表长上下文、工具调用或流式请求一定成功"].filter(Boolean).join("；");
+  const actual = c.last_actual;
+  const history = c.warning ? `<span class="badge mono warn" title="${esc(c.warning)}">历史调用：最近一次失败${actual && actual.status ? " HTTP " + esc(actual.status) : ""}${actual && actual.at ? "(" + esc(whenText(actual.at)) + ")" : ""}</span>` : "";
+  return `<span class="badge mono" style="color:${color};border-color:currentColor" title="${esc(tip)}">${label}${lat}</span>${history}`;
 }
 // 该上游勾选的每个模型各一行测试结果(没测过的也列出来，提示去测)
 function renderCheckResults(u) {
@@ -736,7 +767,7 @@ function renderCheckResults(u) {
   if (!sel.length) return "";
   const rows = sel.map(m => {
     const c = modelCheckEntry(u, m);
-    return `<span class="mchip" style="display:inline-flex;align-items:center;gap:5px">${esc(m)} ${c ? checkBadge(c) : '<span class="badge" style="color:var(--dim)">未测</span>'}</span>`;
+    return `<span class="mchip" style="display:inline-flex;align-items:center;flex-wrap:wrap;gap:5px">${esc(m)} ${c ? checkBadge(c) : '<span class="badge" style="color:var(--dim)">未测</span>'}</span>`;
   }).join("");
   return `<div class="models-wrap" style="margin-top:8px">${rows}</div>`;
 }
@@ -753,6 +784,27 @@ function capBadge(u) {
     capLiveText(c)}</span>`;
 }
 
+// 余额标记：查过的显示金额，没查过/查不到显示「—」。
+// 各厂商余额接口不统一，只有 New API / One API 那套能查（见后端 fetch_balance)。
+function moneyText(v) {
+  if (v == null || isNaN(v)) return "—";
+  return "$" + Number(v).toFixed(2);
+}
+function balanceBadge(u) {
+  const b = u.balance;
+  if (!b) {
+    return `<span class="badge mono" title="还没查过余额，点「查余额」">余额 —</span>`;
+  }
+  if (!b.ok) {
+    return `<span class="badge" style="color:var(--dim)" title="${esc(b.error || "查不到")}">余额 —</span>`;
+  }
+  const rem = moneyText(b.remaining);
+  const tip = `总额度 ${moneyText(b.total)} · 已用 ${moneyText(b.used)}` +
+              (b.at ? ` · 更新于 ${esc(whenText(b.at))}` : "");
+  const low = (b.remaining != null && b.remaining <= 0);
+  return `<span class="badge ${low ? "warn" : "ok"}" title="${esc(tip)}">余额 ${rem}</span>`;
+}
+
 function renderUpstreams() {
   const ups = state.upstreams || [];
   // 用户正在分组输入框里操作（或下拉开着）时不要重建 DOM，
@@ -767,26 +819,72 @@ function renderUpstreams() {
     return;
   }
   const q = (($("#upSearch") && $("#upSearch").value) || "").trim().toLowerCase();
-  // 搜索：上游名字 / 地址命中，或勾选模型的真实名 / 分组名命中(模糊匹配)
+  // 搜索：上游名字 / 地址 / 已选模型 / 分组名 / available_models(支持但未选)
   const hit = u => {
     if (!q) return true;
     if ((u.name || "").toLowerCase().includes(q)) return true;
     if ((u.base_url || "").toLowerCase().includes(q)) return true;
     const sel = u.selected_models || [];
     const groups = u.model_groups || {};
-    return sel.some(m => m.toLowerCase().includes(q)
-                       || (groups[m] || "").toLowerCase().includes(q));
+    if (sel.some(m => m.toLowerCase().includes(q)
+                     || (groups[m] || "").toLowerCase().includes(q))) return true;
+    const avail = u.available_models || [];
+    return avail.some(m => m.toLowerCase().includes(q));
+  };
+  // 模型搜索时的分类：判断该上游对搜索关键词的匹配类型
+  const matchType = u => {
+    if (!q) return "none";
+    const sel = u.selected_models || [];
+    const groups = u.model_groups || {};
+    const selHit = sel.some(m => m.toLowerCase().includes(q)
+                               || (groups[m] || "").toLowerCase().includes(q));
+    if (selHit) return "selected";
+    const avail = u.available_models || [];
+    if (avail.some(m => m.toLowerCase().includes(q))) return "available";
+    if ((u.name || "").toLowerCase().includes(q)) return "name";
+    if ((u.base_url || "").toLowerCase().includes(q)) return "name";
+    return "none";
   };
   const shown = ups.filter(hit);
-  if (!shown.length) {
-    applyHtml("upstreams", $("#upstreams"), `<div class="empty">没有匹配「${esc(q)}」的上游或模型。</div>`);
+  // 启用状态筛选：hide=不含停用（默认）/ all=包含停用 / only=只看停用
+  const ef = ($("#upEnabledFilter") && $("#upEnabledFilter").value) || "hide";
+  const byEnabled = u => ef === "all" ? true : (ef === "only" ? !u.enabled : u.enabled);
+  const filtered = shown.filter(byEnabled);
+  // 模型搜索时排序：支持但未选排最前，已选其次
+  if (q) {
+    const order = { available: 0, selected: 1, name: 2, none: 3 };
+    filtered.sort((a, b) => (order[matchType(a)] ?? 3) - (order[matchType(b)] ?? 3));
+  }
+  if (upSortDir < 0) filtered.reverse();
+  if (!filtered.length) {
+    const why = q ? `没有匹配「${esc(q)}」的上游或模型。`
+                  : (ef === "only" ? "没有已停用的上游。" : "没有可显示的上游。");
+    applyHtml("upstreams", $("#upstreams"), `<div class="empty">${why}</div>`);
     return;
+  }
+  shown.length = 0; shown.push(...filtered);
+  // search active: update upCount with legend
+  const uc = $("#upCount");
+  if (uc && q) {
+    const nSel = shown.filter(u => matchType(u) === "selected").length;
+    const nAvail = shown.filter(u => matchType(u) === "available").length;
+    const nOther = shown.length - nSel - nAvail;
+    uc.innerHTML = `<span style="color:#16a34a">\u2588 \u5df2\u9009 ${nSel}</span>` +
+      ` &nbsp;<span style="color:#b45309">\u2588 \u652f\u6301\u4f46\u672a\u9009 ${nAvail}</span>` +
+      (nOther ? ` &nbsp;<span style="color:var(--dim)">\u2588 \u540d\u79f0\u5339\u914d ${nOther}</span>` : "") +
+      ` &nbsp;\u2014 \u5171 ${shown.length} / ${ups.length}`;
+  } else if (uc && !q) {
+    const nOn = ups.filter(u => u.enabled).length;
+    uc.textContent = ups.length ? `${ups.length} \u4e2a\u4e0a\u6e38\uff0c\u5176\u4e2d ${nOn} \u4e2a\u5df2\u542f\u7528` : "";
   }
   const html = shown.map(u => {
     const t = lastTest[u.id];
     const cooling = u.cooldown_remaining_seconds > 0;
+    const mt = q ? matchType(u) : "none";
     const cls = ["up", u.enabled ? "" : "off", cooling ? "cool" : "",
-                 expanded[u.id] ? "open" : ""].join(" ");
+                 expanded[u.id] ? "open" : "",
+                 mt === "available" ? "match-avail" : "",
+                 mt === "selected" ? "match-sel" : ""].join(" ");
     const nAvail = u.available_count != null ? u.available_count : (u.available_models || []).length;
     const nSel = u.selected_count != null ? u.selected_count : (u.selected_models || []).length;
     const lat = u.avg_latency_seconds;
@@ -797,15 +895,18 @@ function renderUpstreams() {
     <div class="${cls}" data-id="${esc(u.id)}">
       <div class="up-head">
         <span class="up-name">${esc(u.name)}</span>
+        ${mt === "available" ? `<span class="badge" style="background:#fef3c7;color:#b45309;font-weight:600">支持但未选 ✦</span>` : ""}
+        ${mt === "selected" ? `<span class="badge" style="background:#dcfce7;color:#16a34a;font-weight:600">已选 ✓</span>` : ""}
         ${u.enabled
           ? (cooling ? `<span class="badge warn">冷却中 ${u.cooldown_remaining_seconds}s</span>`
                      : `<span class="badge ok">启用</span>`)
           : `<span class="badge bad">已停用</span>`}
-        <span class="badge">${u.has_key ? esc(u.key_hint) : "无 Key"}</span>
+        <span class="badge" title="${u.key_count > 1 ? (u.key_strategy === "round_robin" ? "每次请求轮流用" : "一个出错再切下一个") : ""}">${u.key_count > 1 ? u.key_count + " 个 Key" + (u.key_strategy === "round_robin" ? " ↻" : " →") : (u.has_key ? esc(u.key_hint) : "无 Key")}</span>
         ${nAvail
           ? `<span class="badge ${nSel ? "blue" : "warn"}">已选用 ${nSel} / ${nAvail} 个模型</span>`
           : `<span class="badge warn">还没拉取模型</span>`}
         ${capBadge(u)}
+        ${balanceBadge(u)}
         ${u.models_fetched_at ? `<span class="badge">${whenText(u.models_fetched_at)}拉取</span>` : ""}
         <div class="up-actions">
           <button class="mini primary" data-act="models" ${nAvail ? "" : "disabled"}>
@@ -813,6 +914,7 @@ function renderUpstreams() {
           </button>
           <button class="mini" data-act="fetch">拉取模型</button>
           <button class="mini" data-act="test">测速</button>
+          <button class="mini" data-act="balance">查余额</button>
           <button class="mini" data-act="edit">编辑</button>
           <button class="mini" data-act="toggle">${u.enabled ? "停用" : "启用"}</button>
           <button class="mini danger" data-act="del">删除</button>
@@ -1019,6 +1121,7 @@ function bindDelegatedEvents() {
     }
     else if (act === "fetch") fetchModels([id]);
     else if (act === "test") testUpstream(id);
+    else if (act === "balance") checkBalance(id);
     else if (act === "edit") editUpstream(id);
     else if (act === "pickall") selectModels(id, { all: true });
     else if (act === "picknone") selectModels(id, { none: true });
@@ -1275,16 +1378,48 @@ function toggleCollapsible(btn) {
 }
 
 // 一行「测试」按钮的结果：可用/不可用/限流 + 实测延迟，测的是这一行的那个模型
+// 旧流水只有状态码时补充可能原因；已带上游详情的新记录原样显示。
+function explainHttpError(reason, status) {
+  const text = String(reason || "");
+  const match = text.match(/^(?:客户端错误 )?HTTP (\d+)$/);
+  if (text && !match) return text;
+  const code = Number(status || (match && match[1]));
+  if (!(code >= 400)) return text;
+  const hint = (state && state.http_error_hints || {})[code];
+  return `HTTP ${code}：${hint || "上游请求失败；旧记录未保存具体原因"}`;
+}
+
 function pickTestBadge(p) {
-  const t = p && p.test;
-  if (!t) return "";
-  let label, color;
-  if (t.rate_limited) { label = "限流"; color = "var(--warn)"; }
-  else if (t.ok) { label = "可用"; color = "var(--ok)"; }
-  else { label = "不可用"; color = "var(--bad)"; }
-  const lat = (t.ok && t.latency_seconds != null) ? " " + fmtLat(t.latency_seconds) : "";
-  const tip = t.error ? esc(t.error) : "";
-  return `<span class="badge mono" style="color:${color};border-color:currentColor" title="${tip}">${label}${lat}</span>`;
+  return checkBadge(p && p.test);
+}
+
+function requestPathSummary(h, trail) {
+  const recovered = !!h.ok && trail.some(s => !s.ok);
+  const outcome = recovered ? "切换后成功" : h.ok ? "成功" : "最终失败";
+  const tone = recovered ? "warn" : h.ok ? "ok" : "bad";
+  const shortErrors = {400:"参数/上下文错误",401:"认证失败",402:"付费/额度限制",
+    403:"权限/访问限制",404:"接口/模型不存在",405:"请求方法错误",408:"请求超时",
+    409:"请求冲突",413:"请求过大",415:"格式不支持",422:"参数不兼容",
+    425:"暂不接受请求",429:"限流/配额限制",500:"上游内部错误",502:"网关错误",
+    503:"暂不可用",504:"网关超时",520:"源站响应异常",521:"源站拒绝连接",
+    522:"连接超时",523:"源站不可达",524:"源站响应超时"};
+  // 没有尝试链的旧记录只知道最后落点，不能从候选数量推断中间路径。
+  const hops = trail.length ? trail : [{upstream:h.upstream,ok:h.ok,status:h.status,reason:h.error}];
+  const nodes = hops.map(s => {
+    const code = s.status != null ? String(s.status) : "";
+    const reason = String(s.reason || "");
+    const brief = s.ok ? "成功" : /连接失败/.test(reason) ? "连接失败"
+      : /流.*(中断|失败|断开)|空流/.test(reason) ? "流式响应异常"
+      : Number(s.status) < 400 ? "响应异常" : shortErrors[s.status] || "调用失败";
+    return `<span class="req-hop ${s.ok ? "good" : "bad"}"><span>${s.ok ? "✓" : "✗"}</span><span class="req-hop-name">${esc(s.upstream || "未知上游")}</span><span>${esc(code)} ${brief}</span></span>`;
+  }).join('<span class="req-arrow" aria-hidden="true">→</span>');
+  return `<div class="req-path" aria-label="实际调用路径"><span class="badge ${tone}">${outcome}</span>${nodes}${!trail.length ? '<span class="hint">仅记录最终落点，完整路径未知</span>' : ""}</div>`;
+}
+
+function requestAttemptLabel(h, trail) {
+  if (trail.length) return `实际尝试 ${trail.length} 次`;
+  if (h.attempts === 0) return "未尝试上游";
+  return "实际尝试次数未知";
 }
 
 // 实时占用的文案，弹窗里和卡片上共用一份，免得两处对不上。
@@ -1326,6 +1461,22 @@ function capCell(p, i) {
       <input type="number" min="0" step="1" data-cap-m="${i}" placeholder="∞" value="${mp}">
       ${live}
     </span>`;
+}
+const detailedTests = {};
+function detailedTestReport(p, model) {
+  const t = detailedTests[`${p.id}|${model}`];
+  if (!t) return "";
+  if (t.running) return '<div class="hint" style="flex-basis:100%" role="status">详细测试中：短请求、长上下文、流式、工具调用及结果回传…</div>';
+  if (t.error) return `<div class="hint" style="flex-basis:100%;color:var(--bad)">${esc(t.error)}</div>`;
+  const checks = t.checks || [];
+  return `<details open style="flex-basis:100%;min-width:0;overflow-wrap:anywhere">
+    <summary class="hint">详细测试：${checks.filter(c => c.ok).length}/${checks.length} 项通过 · ${esc(whenText(t.at))} · 合成上下文 ${fmtNum(t.context_chars)} 字符</summary>
+    ${checks.map(c => `<div style="margin-top:8px"><span class="badge ${c.skipped ? "warn" : c.ok ? "ok" : "bad"}">${esc(c.name)}：${c.skipped ? "跳过" : c.ok ? "成功" : "失败"}</span>
+      <span class="hint">${c.status != null ? "HTTP " + esc(c.status) + " · " : ""}${c.elapsed_seconds != null ? "总耗时 " + fmtLat(c.elapsed_seconds) : ""}${c.first_chunk_seconds != null ? " · 首块 " + fmtLat(c.first_chunk_seconds) : ""}${c.request_bytes != null ? " · 请求 " + fmtNum(c.request_bytes) + " B" : ""}${c.chunks != null ? " · " + c.chunks + " 个有效块" : ""}</span>
+      ${c.error ? `<div style="color:var(--bad)">${esc(c.error)}</div>` : ""}
+      ${c.response_preview ? `<div class="hint">回复：${esc(c.response_preview)}</div>` : ""}
+    </div>`).join("")}
+  </details>`;
 }
 function renderModal() {
   if (!editing) return;
@@ -1373,10 +1524,12 @@ function renderModal() {
           </label>
           ${capCell(p, i)}
           <button class="mini" data-act="test" data-idx="${i}"
-                  title="给这家发一个最小请求，测的就是这一行那个模型">测试</button>
+                  title="测试该模型的短请求，并提示最近实际调用错误；不验证长上下文或流式兼容性">测试</button>
           ${pickTestBadge(p)}
+          <button class="mini" data-act="detailed-test" data-idx="${i}" ${detailedTests[`${p.id}|${p.model || name}`]?.running ? "disabled" : ""}>详细测试</button>
           <button class="mini danger" data-act="rm">移除</button>
         </div>
+        ${detailedTestReport(p, p.model || name)}
       </div>`).join("");
   }
 
@@ -1481,6 +1634,9 @@ function bindModal() {
   // 「测试」按钮：精确测这一行的那个模型
   document.querySelectorAll('#mPicks button[data-act="test"]').forEach(btn => {
     btn.onclick = () => testPick(Number(btn.dataset.idx), btn);
+  });
+  document.querySelectorAll('#mPicks button[data-act="detailed-test"]').forEach(btn => {
+    btn.onclick = () => testPickDetailed(Number(btn.dataset.idx));
   });
 
   // 额度输入：改完（回车或失焦）就记进 editing，顺带更新「不调用」标记
@@ -1606,7 +1762,7 @@ function pickRowAt(target) {
 // 点在按钮/输入框/复选框上是要操作，不是要排序
 function pickIsControl(target) {
   return !!(target && target.closest &&
-            target.closest("button, input, select, textarea, label, a"));
+            target.closest("button, input, select, textarea, label, a, details"));
 }
 
 // 行的位置只量一次（拖动还没开始、没有任何 transform 时）：
@@ -1883,6 +2039,29 @@ document.addEventListener("pointercancel", e => {
 /* ================= 操作 ================= */
 // 测试某一行(某上游 + 它的那个真实模型)的连通性。
 // 不重建整个弹窗 —— 只更新这一行按钮旁的结果，免得打断输入。
+async function testPickDetailed(i) {
+  if (!editing) return;
+  const group = editing;
+  const p = group.picks[i];
+  if (!p) return;
+  const model = p.model || group.name;
+  const key = `${p.id}|${model}`;
+  if (detailedTests[key]?.running) return;
+  collectQuotas();
+  detailedTests[key] = { running: true };
+  renderModal();
+  try {
+    const r = await api("/admin/speedtest", { detailed: true, tests: [{ id: p.id, model }] });
+    const t = (r.results || [])[0];
+    if (!t || !Array.isArray(t.checks)) throw new Error("没有返回详细测试结果");
+    detailedTests[key] = t;
+    toast(`${p.name} · ${model} 详细测试：${t.checks.filter(c => c.ok).length}/${t.checks.length} 项通过`, t.ok ? "ok" : "warn");
+  } catch (e) {
+    detailedTests[key] = { error: "详细测试失败：" + e.message };
+    toast(detailedTests[key].error, "bad");
+  }
+  if (editing === group) { collectQuotas(); renderModal(); }
+}
 async function testPick(i, btn) {
   if (!editing) return;
   const p = editing.picks[i];
@@ -1894,8 +2073,9 @@ async function testPick(i, btn) {
     const r = await api("/admin/speedtest", { tests: [{ id: p.id, model }] });
     const one = (r.results || [])[0] || { ok: false, error: "没有返回结果" };
     p.test = one;
-    if (one.rate_limited) toast(`${p.name} · ${model} 限流：${one.error || ""}`, "warn");
-    else if (one.ok) toast(`${p.name} · ${model} 可用，延迟 ${fmtLat(one.latency_seconds)}`, "ok");
+    if (one.ok && one.warning) toast(`${p.name} · ${model} 本次测试成功（短请求），耗时 ${fmtLat(one.latency_seconds)}。历史记录：${one.warning}`, "warn");
+    else if (one.rate_limited) toast(`${p.name} · ${model} 限流：${one.error || ""}`, "warn");
+    else if (one.ok) toast(`${p.name} · ${model} 短请求通过，延迟 ${fmtLat(one.latency_seconds)}；未验证长上下文和流式调用`, "ok");
     else toast(`${p.name} · ${model} 不可用：${one.error || ""}`, "bad");
   } catch (e) {
     toast("测试失败：" + e.message, "bad");
@@ -2085,14 +2265,47 @@ async function updateUpstream(patch, msg) {
 
 let editId = null;
 
+function renderKeyList(hints) {
+  const box = $("#eKeyList");
+  box.innerHTML = "";
+  (hints || []).forEach((h, i) => {
+    const row = document.createElement("div");
+    row.className = "row";
+    row.style.cssText = "gap:6px;align-items:center";
+    row.innerHTML = `<input class="mono ekey-input" type="password" autocomplete="off"
+      data-idx="${i}" placeholder="留空表示不改" style="flex:1">
+      <span class="muted" style="font-size:12px;min-width:80px">${esc(h)}</span>
+      <button class="mini danger ekey-del" type="button" data-idx="${i}" title="删除此 Key">x</button>`;
+    box.appendChild(row);
+  });
+  box.querySelectorAll(".ekey-del").forEach(btn => {
+    btn.onclick = () => {
+      const idx = parseInt(btn.dataset.idx);
+      editKeyHints.splice(idx, 1);
+      editKeyDeleted.add(idx);
+      renderKeyList(editKeyHints);
+      $("#eKeyStrategyWrap").style.display = editKeyHints.length > 1 ? "" : "none";
+    };
+  });
+}
+let editKeyHints = [];
+let editKeyDeleted = new Set();
+let editKeyNew = [];
+
 function editUpstream(id) {
   const u = (state.upstreams || []).find(x => x.id === id);
   if (!u) return;
   editId = id;
   $("#eName").value = u.name;
   $("#eUrl").value = u.base_url;
-  $("#eKey").value = "";
-  $("#eKeyHint").textContent = u.has_key ? `（现在：${u.key_hint}）` : "（现在没设）";
+  editKeyHints = [...(u.key_hints || (u.has_key ? [u.key_hint] : []))];
+  editKeyDeleted = new Set();
+  editKeyNew = [];
+  $("#eKeyHint").textContent = editKeyHints.length
+    ? `(${editKeyHints.length} \u4e2a Key)` : "(\u6ca1\u6709 Key)";
+  renderKeyList(editKeyHints);
+  $("#eKeyStrategy").value = u.key_strategy || "failover";
+  $("#eKeyStrategyWrap").style.display = editKeyHints.length > 1 ? "" : "none";
   $("#eEnabled").checked = u.enabled;
   const cap = u.capacity || {};
   $("#eCapC").value = cap.max_concurrent == null ? "" : cap.max_concurrent;
@@ -2102,6 +2315,14 @@ function editUpstream(id) {
   $("#eName").focus();
 }
 
+$("#eAddKey").onclick = () => {
+  editKeyHints.push("(\u65b0)  ");
+  renderKeyList(editKeyHints);
+  $("#eKeyStrategyWrap").style.display = editKeyHints.length > 1 ? "" : "none";
+  const inputs = $("#eKeyList").querySelectorAll(".ekey-input");
+  if (inputs.length) inputs[inputs.length - 1].focus();
+};
+
 async function saveUpstreamEdit() {
   if (!editId) return;
   const capNum = el => {
@@ -2110,29 +2331,35 @@ async function saveUpstreamEdit() {
     const n = Math.floor(Number(raw));
     return Number.isFinite(n) && n > 0 ? n : 0;
   };
+  // 收集 Key 列表：有输入的用新值，留空的保留原值（发空串让后端保持不变）
+  const keyInputs = $("#eKeyList").querySelectorAll(".ekey-input");
+  const keys = [];
+  keyInputs.forEach(inp => {
+    const v = inp.value.trim();
+    keys.push(v); // 空串 = 保持原值，后端会处理
+  });
   const patch = {
     id: editId,
     name: $("#eName").value.trim(),
     base_url: $("#eUrl").value.trim(),
     enabled: $("#eEnabled").checked,
-    // 0 = 清掉上限（回到不限量）
     max_concurrent: capNum($("#eCapC")),
     max_per_minute: capNum($("#eCapM")),
+    api_keys: keys,
+    key_strategy: $("#eKeyStrategy").value || "failover",
   };
-  const k = $("#eKey").value;
-  if (k !== "") patch.api_key = k;
-  if (!patch.base_url) { toast("地址不能为空", "bad"); return; }
+  if (!patch.base_url) { toast("\u5730\u5740\u4e0d\u80fd\u4e3a\u7a7a", "bad"); return; }
 
   const btn = $("#eSave");
   btn.disabled = true;
-  $("#eStatus").textContent = "保存中…";
+  $("#eStatus").textContent = "\u4fdd\u5b58\u4e2d\u2026";
   try {
     await api("/admin/upstream/update", patch);
     $("#editModal").hidden = true;
-    toast("已保存", "ok");
+    toast("\u5df2\u4fdd\u5b58", "ok");
     await refresh();
   } catch (e) {
-    toast("保存失败：" + e.message, "bad");
+    toast("\u4fdd\u5b58\u5931\u8d25\uff1a" + e.message, "bad");
     $("#eStatus").textContent = "";
   }
   btn.disabled = false;
@@ -2150,6 +2377,22 @@ async function delUpstream(id) {
   } catch (e) { toast("删除失败：" + e.message, "bad"); }
 }
 
+// 查这个上游的余额（只有 New API / One API 那套接口能查）。
+async function checkBalance(id) {
+  toast("正在查余额…");
+  try {
+    const r = await api("/admin/balance", { ids: [id] });
+    const one = (r.results || [])[0];
+    if (!one) { toast("没查到结果", "bad"); }
+    else if (one.ok) {
+      toast(`${one.name}：余额 ${moneyText(one.remaining)}（总 ${moneyText(one.total)} · 已用 ${moneyText(one.used)}）`, "ok");
+    } else {
+      toast(`${one.name}：查不到余额（${one.error || "上游不支持"}）`, "warn");
+    }
+  } catch (e) { toast("查余额失败：" + e.message, "bad"); }
+  await refresh();
+}
+
 async function testUpstream(id) {
   const u = (state.upstreams || []).find(x => x.id === id);
   const n = u ? ((u.selected_models || []).length || 1) : 1;
@@ -2162,9 +2405,12 @@ async function testUpstream(id) {
     res.forEach(x => { if (x && x.id) lastTestByModel[`${x.id}|${x.model}`] = x; });
     if (sum) lastTest[id] = sum;
     if (!res.length) { toast("这个上游还没勾选任何模型，先拉取并勾选", "bad"); }
-    else if (sum && sum.ok) {
+    else if (res.some(x => x.warning)) {
       const nOk = res.filter(x => x.ok).length;
-      toast(`${sum.name}：${nOk}/${res.length} 个模型可用，最快 ${fmtLat(sum.latency_seconds)}`, "ok");
+      toast(`${sum ? sum.name : ""}：本次短请求测试 ${nOk}/${res.length} 个成功。历史记录：` + res.filter(x => x.warning).map(x => `${x.model}：${x.warning}`).join("；"), "warn");
+    } else if (sum && sum.ok) {
+      const nOk = res.filter(x => x.ok).length;
+      toast(`${sum.name}：${nOk}/${res.length} 个模型短请求通过，最快 ${fmtLat(sum.latency_seconds)}`, "ok");
     } else if (sum && sum.rate_limited) {
       toast(`${sum.name} 限流(暂时不可用)`, "warn");
     } else {
@@ -2647,7 +2893,7 @@ function renderSide() {
     const full = reqTextCache.get(key);
     const loadingTxt = open && !full;
     return `
-    <div class="req ${open ? "open" : ""}" data-key="${key}">
+    <div class="req ${open ? "open" : ""} ${h.ok && trail.some(s => !s.ok) ? "recovered" : !h.ok ? "failed" : ""}" data-key="${key}">
       <div class="req-head">
         <span class="req-idx mono">${esc(h.time)}</span>
         ${badge}
@@ -2658,6 +2904,7 @@ function renderSide() {
         ${use.total != null ? `<span class="badge">${fmtNum(use.total)} tok</span>` : ""}
         <span class="hint">${fmtLat(h.elapsed_seconds)}</span>
         ${h.stream ? `<span class="badge blue">流式</span>` : ""}
+        ${requestPathSummary(h, trail)}
       </div>
       ${open ? `
       <div class="req-body">
@@ -2669,8 +2916,8 @@ function renderSide() {
           <h5>详情</h5>
           <div class="hint" style="line-height:1.8">
             实际发往上游的模型：<code>${esc(h.effective_model || "-")}</code><br>
-            路由来源：${esc(h.route_source || "-")}${h.attempts > 1 ? `　·　试了 ${h.attempts} 个上游` : ""}
-            ${h.error ? `<br><span style="color:var(--bad)">错误：${esc(h.error)}</span>` : ""}
+            路由来源：${esc(h.route_source || "-")}　·　${requestAttemptLabel(h, trail)}
+            ${h.error || h.status >= 400 ? `<br><span style="color:var(--bad)">错误：${esc(explainHttpError(h.error, h.status))}</span>` : ""}
           </div>
         </div>
         ${trail.length ? `<div class="req-sec">
@@ -2682,7 +2929,7 @@ function renderSide() {
             const parts = [esc(s.upstream || "-")];
             if (s.status != null) parts.push(String(s.status));
             if (s.model) parts.push(`<code>${esc(s.model)}</code>`);
-            if (s.reason) parts.push(`<span style="color:var(--bad)">${esc(s.reason)}</span>`);
+            if (s.reason || s.status >= 400) parts.push(`<span style="color:var(--bad)">${esc(explainHttpError(s.reason, s.status))}</span>`);
             return `${mark} ${parts.join(" · ")}`;
           }).join("<br>")}</div>
         </div>` : ""}
@@ -2957,6 +3204,7 @@ $("#sideReqs").addEventListener("click", async e => {
 $("#addBtn").onclick = addUpstream;
 // 上游来源搜索：输入即筛(名字 / 地址 / 勾选模型的真实名 / 分组名)
 if ($("#upSearch")) $("#upSearch").addEventListener("input", renderUpstreams);
+if ($("#upEnabledFilter")) $("#upEnabledFilter").addEventListener("change", renderUpstreams);
 ["newName", "newUrl", "newKey"].forEach(id => {
   $("#" + id).addEventListener("keydown", e => { if (e.key === "Enter") addUpstream(); });
 });
@@ -2975,6 +3223,8 @@ async function setAllUpstreams(enabled) {
 }
 $("#enableAllBtn").onclick = () => setAllUpstreams(true);
 $("#disableAllBtn").onclick = () => setAllUpstreams(false);
+$("#upSortAsc").onclick = () => { upSortDir = 1; renderUpstreams(); };
+$("#upSortDesc").onclick = () => { upSortDir = -1; renderUpstreams(); };
 $("#autoBtn").onclick = autoConfigure;
 
 // 「拉取全部模型」「测速」「记录与快照」三个顶部按钮已去掉：
@@ -3101,7 +3351,7 @@ $("#editModal").addEventListener("click", e => {
   if (e.target === $("#editModal")) { $("#editModal").hidden = true; editId = null; }
 });
 $("#eSave").onclick = saveUpstreamEdit;
-["eName", "eUrl", "eKey"].forEach(id => {
+["eName", "eUrl"].forEach(id => {
   $("#" + id).addEventListener("keydown", e => { if (e.key === "Enter") saveUpstreamEdit(); });
 });
 document.addEventListener("keydown", e => {

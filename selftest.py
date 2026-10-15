@@ -55,6 +55,14 @@ UP_MODELS_ABCD = {
     "d": ["ds4", "other"],
 }
 
+# 假上游的余额参数：total = 总额度（美元），used_cents = 已用（分）。
+BALANCE = {
+    "a": {"total": 100.0, "used_cents": 2500},   # 剩 75.00
+    "b": {"total": 50.0, "used_cents": 1000},    # 剩 40.00
+    "c": {"total": 0.0, "used_cents": 0},
+    "d": {"total": 0.0, "used_cents": 0},
+}
+
 
 class UpstreamServer(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
@@ -96,6 +104,16 @@ class UpstreamServer(BaseHTTPRequestHandler):
         if not self._path_ok():
             return self._json(404, {"error": {"message": "404 page not found"}})
         path = urllib.parse.urlsplit(self.path).path
+        if path.endswith("/dashboard/billing/subscription"):
+            if behavior[self.tag] == "balance_fail":
+                return self._json(200, {"error": {"message": "无权查询", "type": "new_api_error"}})
+            total = BALANCE[self.tag]["total"]
+            return self._json(200, {"object": "billing_subscription",
+                                    "has_payment_method": True,
+                                    "soft_limit_usd": total, "hard_limit_usd": total})
+        if path.endswith("/dashboard/billing/usage"):
+            used = BALANCE[self.tag]["used_cents"]
+            return self._json(200, {"object": "list", "total_usage": used})
         if path.endswith("/models"):
             with lock:
                 behave = behavior[self.tag]
@@ -135,6 +153,8 @@ class UpstreamServer(BaseHTTPRequestHandler):
             return self._json(429, {"error": {"message": f"{self.tag} 限流"}})
         if behave == "fail401":
             return self._json(401, {"error": {"message": f"{self.tag} key 无效"}})
+        if behave == "size_limit" and len(raw) > 1024:
+            return self._json(413, {"error": {"message": "request body exceeds limit"}})
         if behave == "fail400":
             payload = json.dumps({"error": {"message": "参数不合法", "type": "invalid_request_error"}},
                                  ensure_ascii=False).encode("utf-8")
@@ -187,10 +207,23 @@ class UpstreamServer(BaseHTTPRequestHandler):
             self.send_header("Content-Type", "text/event-stream")
             self.send_header("Transfer-Encoding", "chunked")
             self.end_headers()
+            if body.get("tool_choice") and behave != "ignore_tools":
+                ev = {"choices": [{"delta": {"tool_calls": [{"index": 0, "id": "call_test", "type": "function",
+                       "function": {"name": "diagnostic_echo", "arguments": '{"value":"OK"}'}}]},
+                       "finish_reason": "tool_calls"}]}
+                self._write_chunk(f"data: {json.dumps(ev)}\n\n".encode())
+                self._write_chunk(b"data: [DONE]\n\n")
+                self.wfile.write(b"0\r\n\r\n")
+                self.wfile.flush()
+                return
             for i in range(3):
                 ev = json.dumps({"model": model,
                                  "choices": [{"delta": {"content": f"{self.tag}{i}"}}]})
                 self._write_chunk(f"data: {ev}\n\n".encode())
+            if behave == "truncated_stream":
+                self.wfile.write(b"0\r\n\r\n")
+                self.wfile.flush()
+                return
             # 流式的 usage 通常在最后单独一个 chunk 里（带 DeepSeek 风格缓存字段）
             final = json.dumps({
                 "model": model, "choices": [],
@@ -475,6 +508,19 @@ def cleanup():
 
 
 def main():
+    from router import describe_http_error, HTTP_ERROR_HINTS
+    for status in HTTP_ERROR_HINTS:
+        message = describe_http_error(status)
+        check(f"HTTP {status} 带中文原因", message.startswith(f"HTTP {status}：")
+              and len(message) > 20, message)
+    check("429 保留上游具体配额原因", "TPM quota exhausted" in describe_http_error(
+        429, b'{"error":{"message":"TPM quota exhausted"}}'))
+    check("兼容顶层错误详情", "account suspended" in describe_http_error(
+        403, b'{"message":"account suspended"}'))
+    check("兼容纯文本错误", "backend down" in describe_http_error(502, b'backend down'))
+    check("HTML 错误不灌入流水", "<html>" not in describe_http_error(502, b'<html>bad gateway</html>'))
+    check("未知状态码仍有说明", "HTTP 499：" in describe_http_error(499))
+    check("上游错误详情截断", len(describe_http_error(500, b'x' * 10000)) < 650)
     print("启动假上游 …")
     start_upstreams()
     cleanup()
@@ -632,6 +678,9 @@ def main():
         reset_hits()
         st, body, hdr = post()
         check("按配置走第一个上游", hdr.get("X-Upstream") == "up-a", str(hdr.get("X-Upstream")))
+        _, history = get("/admin/history")
+        entry = history["history"][-1]
+        check("三个候选首家成功只算一次尝试", entry["attempts"] == len(entry["trail"]) == 1, str(entry))
     finally:
         stop_router(p)
 
@@ -650,6 +699,18 @@ def main():
         check("模型名映射生效（上游收到 V3 名）", "deepseek-ai/DeepSeek-V3" in hits["b"], str(hits))
         j = json.loads(body)
         check("返回给客户端的模型名被改回来", j.get("model") == "deepseek-chat", str(j))
+        _, history = get("/admin/history")
+        entry = history["history"][-1]
+        check("三个候选第二家成功只算两次尝试", entry["attempts"] == len(entry["trail"]) == 2
+              and not hits["c"], str(entry))
+        st, _, _ = post(body={"model": "deepseek-chat", "stream": True,
+                             "messages": [{"role": "user", "content": "hi"}]})
+        _, history = get("/admin/history")
+        entry = history["history"][-1]
+        check("流式第二家成功也只算两次尝试", st == 200 and entry["stream"]
+              and entry["attempts"] == len(entry["trail"]) == 2, str(entry))
+        # 新增尝试次数用例不能把后续 429 用例的首家上游推入冷却。
+        admin("/admin/reset")
 
         # 429 也该切换：让 a 也挂，这样必然要落到 c；同时验证 b 的 429 被识别
         behavior["a"] = "fail500"
@@ -659,6 +720,14 @@ def main():
         check("429 也被当成失败并继续切换",
               st == 200 and hdr.get("X-Upstream") == "up-c" and hits["b"],
               f"status={st} up={hdr.get('X-Upstream')} hits={hits}")
+        _, history = get("/admin/history")
+        reason = history["history"][-1]["trail"][1]["reason"]
+        check("429 尝试链显示可能原因和上游详情", "Token 速率" in reason
+              and "上游详情：b 限流" in reason, reason)
+        _, result = admin("/admin/speedtest", {"tests": [{"id": "b1", "model": "deepseek-ai/DeepSeek-V3"}]})
+        check("429 测试与实际调用使用相同解释", result["results"][0]["error"] == reason, str(result))
+        _, snapshot = get("/stats")
+        check("旧流水可使用统一错误解释", "429" in snapshot.get("http_error_hints", {}))
     finally:
         stop_router(p)
         behavior["a"] = behavior["b"] = behavior["c"] = "ok"
@@ -678,6 +747,33 @@ def main():
         check("错误体逐字节透传", body == expect and expect != b"", f"got={body[:80]!r}")
         st, snap = get("/stats")
         check("400 不触发冷却", snap["upstreams"][0]["cooldown_remaining_seconds"] == 0, "")
+
+        # 小请求通过、长上下文被上游拒绝：测试必须同时提示实际失败。
+        behavior["a"] = "size_limit"
+        st, _, _ = post(body={"model": "deepseek-chat", "messages": [
+            {"role": "user", "content": "x" * 2048}]})
+        check("大请求被上游拒绝 413", st == 413, str(st))
+        st, r = admin("/admin/speedtest", {"tests": [{"id": "a1", "model": "deepseek-chat"}]})
+        result = r["results"][0]
+        check("短请求通过不掩盖实际 413", result["ok"] and "413" in result.get("warning", "")
+              and result.get("scope") == "short_request", str(result))
+        check("请求体超限不误判限流", not result.get("rate_limited"), str(result))
+        st, snap = get("/admin/history")
+        entry = snap["history"][-1]
+        check("413 历史解释请求过大且只试过一家", "请求体过大" in entry.get("error", "")
+              and entry["attempts"] == 1, str(entry))
+        st, r = admin("/admin/speedtest", {"tests": [{"id": "a1", "model": "glm-4.6"},
+                                                            {"id": "b1", "model": "deepseek-chat"}]})
+        check("实际错误不串到其他模型或上游", all(not x.get("warning") for x in r["results"]), str(r))
+        # 流水恢复后仍能看到错误，不能因重启把它伪装成全面可用。
+        stop_router(p)
+        p = start_router(cfg)
+        st, r = admin("/admin/speedtest", {"tests": [{"id": "a1", "model": "deepseek-chat"}]})
+        check("重启后仍提示最近实际 413", "413" in r["results"][0].get("warning", ""), str(r))
+        post()
+        st, r = admin("/admin/speedtest", {"tests": [{"id": "a1", "model": "deepseek-chat"}]})
+        check("后续实际成功清除旧失败提示", not r["results"][0].get("warning")
+              and r["results"][0].get("last_actual", {}).get("ok"), str(r))
     finally:
         stop_router(p)
         behavior["a"] = "ok"
@@ -999,6 +1095,31 @@ def main():
         one = (r.get("results") or [{}])[0]
         check("坏上游测速报告失败", one.get("ok") is False and one.get("error"), str(one))
         behavior["b"] = "ok"
+
+        reset_hits()
+        st, r = admin("/admin/speedtest", {"detailed": True, "tests": [{"id": "a1", "model": "glm-4.6"}]})
+        detailed = r["results"][0]
+        check("详细测试完整五项通过", st == 200 and detailed["ok"] and len(detailed["checks"]) == 5, str(detailed))
+        check("详细测试只调用指定上游和真实模型", hits["a"] == ["glm-4.6"] * 5 and not hits["b"] and not hits["c"], str(hits))
+        check("详细测试使用长上下文并回传工具结果", detailed["context_chars"] > 80000
+              and bodies["a"][-1]["messages"][2]["role"] == "tool", str(detailed))
+        behavior["a"] = "size_limit"
+        _, r = admin("/admin/speedtest", {"detailed": True, "tests": [{"id": "a1", "model": "glm-4.6"}]})
+        checks = r["results"][0]["checks"]
+        check("短测试成功但详细测试检出长上下文413", checks[0]["ok"] and not checks[1]["ok"]
+              and checks[1]["status"] == 413 and checks[2]["status"] == 413, str(checks))
+        behavior["a"] = "truncated_stream"
+        _, r = admin("/admin/speedtest", {"detailed": True, "tests": [{"id": "a1", "model": "glm-4.6"}]})
+        checks = r["results"][0]["checks"]
+        check("详细测试检出HTTP200流提前结束", checks[0]["ok"] and not checks[2]["ok"]
+              and "流提前结束" in checks[2].get("error", ""), str(checks))
+        behavior["a"] = "ignore_tools"
+        _, r = admin("/admin/speedtest", {"detailed": True, "tests": [{"id": "a1", "model": "glm-4.6"}]})
+        checks = r["results"][0]["checks"]
+        check("工具调用被忽略时失败且跳过回传", not checks[3]["ok"] and checks[4].get("skipped"), str(checks))
+        behavior["a"] = "ok"
+        st, _ = admin("/admin/speedtest", {"detailed": True, "tests": []})
+        check("详细测试校验上游模型参数", st == 400)
 
         # 精确测某个上游上的某个模型(模型路由弹窗每行的「测试」按钮)
         st, r = admin("/admin/speedtest", {"tests": [{"id": "a1", "model": "glm-4.6"}]})
@@ -2693,6 +2814,41 @@ def main():
         # 不存在的上游要报错
         st, r = admin("/admin/upstream/capacity", {"id": "不存在", "max_concurrent": 2})
         check("给不存在的上游设上限会报错", st >= 400, f"{st} {str(r)[:150]}")
+    finally:
+        stop_router(p)
+
+    print("\n[33] 上游余额查询")
+    cfg = write_config()
+    p = start_router(cfg)
+    try:
+        st, r = admin("/admin/balance", {"ids": ["a1"]})
+        one = (r.get("results") or [{}])[0]
+        check("查余额返回 ok 和金额",
+              st == 200 and one.get("ok") is True and one.get("total") == 100.0,
+              str(r)[:200])
+        check("剩余 = 总额度 - 已用/100", one.get("remaining") == 75.0,
+              str(one)[:200])
+        check("已用按分换算成元", one.get("used") == 25.0, str(one)[:200])
+
+        # 余额随状态持久化，且 snapshot 带出来
+        st, snap = get("/stats")
+        bal = next((u.get("balance") for u in snap["upstreams"] if u["id"] == "a1"), None)
+        check("snapshot 带出余额", bool(bal) and bal.get("remaining") == 75.0,
+              json.dumps(bal, ensure_ascii=False))
+
+        # 不支持余额的上游：返回 ok:False，不报错
+        behavior["b"] = "balance_fail"
+        st, r = admin("/admin/balance", {"ids": ["b1"]})
+        one = (r.get("results") or [{}])[0]
+        check("不支持余额的上游返回 ok:False",
+              st == 200 and one.get("ok") is False and one.get("error"),
+              str(r)[:200])
+        behavior["b"] = "ok"
+
+        # 不存在的 id 不会让整个请求失败
+        st, r = admin("/admin/balance", {"ids": ["不存在"]})
+        check("不存在的上游返回空结果", st == 200 and r.get("results") == [],
+              str(r)[:200])
     finally:
         stop_router(p)
 

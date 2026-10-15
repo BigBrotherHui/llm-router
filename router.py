@@ -37,7 +37,7 @@ import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any, Optional
 
-__version__ = "2.4.2"
+__version__ = "2.4.3"
 
 WEBUI_FILENAME = "webui.html"
 
@@ -86,6 +86,55 @@ DEFAULT_RETRY_STATUS = {401, 403, 408, 409, 425, 429, 500, 502, 503, 504, 520, 5
 
 VALID_STRATEGIES = ("priority", "round_robin", "random")
 
+HTTP_ERROR_HINTS = {
+    400: "请求不被接受：可能是参数格式、模型不支持的功能或上下文超限",
+    401: "身份验证失败：可能是 API Key 无效、过期或未正确传递",
+    402: "付费或额度限制：可能是余额不足、套餐到期或需要充值",
+    403: "访问被拒绝：可能是模型权限、账号状态、IP 或地区限制",
+    404: "资源不存在：可能是接口路径错误、模型名错误或模型已下线",
+    405: "请求方法不支持：请检查接口路径和 HTTP 方法",
+    408: "请求超时：可能是网络缓慢或上游未及时收到完整请求",
+    409: "请求冲突：可能是重复请求或上游资源状态冲突",
+    413: "请求体过大：请缩短上下文、减少附件或工具定义，并检查上游大小限制",
+    415: "请求格式不支持：请检查 Content-Type 和请求体格式",
+    422: "参数校验失败：可能是字段、工具定义或模型参数不兼容",
+    425: "上游暂不接受此请求：可稍后重试",
+    429: "限流或配额限制：可能是请求频率、并发、Token 速率超限，或额度/余额不足",
+    500: "上游内部错误：可能是服务异常或模型执行失败",
+    502: "上游网关错误：可能是后端连接失败或返回了无效响应",
+    503: "上游暂不可用：可能是过载、维护或没有可用模型通道",
+    504: "上游网关超时：模型服务未在限定时间内响应",
+    520: "上游代理收到异常响应：可能是源站故障",
+    521: "源站拒绝连接：可能是服务停机或防火墙拦截",
+    522: "连接源站超时：可能是网络或源站负载问题",
+    523: "源站不可达：可能是 DNS、路由或源站地址问题",
+    524: "源站响应超时：连接已建立但处理时间过长",
+}
+
+
+def describe_http_error(status: int, body: bytes = b"") -> str:
+    """展示用诊断；保留状态码，可能原因与上游原文分开，不改变重试策略。"""
+    hint = HTTP_ERROR_HINTS.get(status, "上游拒绝请求，请结合上游详情检查" if status < 500
+                                else "上游服务异常，可稍后重试或切换上游")
+    detail = ""
+    try:
+        obj = json.loads(body)
+        if isinstance(obj, dict):
+            err = obj.get("error")
+            if isinstance(err, dict):
+                detail = err.get("message") or err.get("detail") or err.get("code") or ""
+            elif isinstance(err, str):
+                detail = err
+            detail = detail or obj.get("message") or obj.get("detail") or ""
+        elif isinstance(obj, str):
+            detail = obj
+    except (ValueError, UnicodeError):
+        if not looks_like_html_page("", body):
+            detail = body[:2000].decode("utf-8", "replace")
+    # 控制长度及换行；避免把整个 HTML 网关页灌进流水和提示。
+    detail = " ".join(str(detail).split())[:500]
+    return f"HTTP {status}：{hint}" + (f"；上游详情：{detail}" if detail else "")
+
 
 class Retryable(Exception):
     """表示这个上游没成功、应该换下一个。"""
@@ -105,6 +154,16 @@ def mask_key(key: str) -> str:
     if len(key) <= 10:
         return key[:2] + "*" * max(0, len(key) - 2)
     return f"{key[:6]}…{key[-4:]}"
+
+
+def _to_float(value: Any) -> Optional[float]:
+    """把上游返回里的额度字段读成浮点数；读不出来返回 None。"""
+    if value is None or isinstance(value, bool):
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
 
 
 # 历史记录里输入/输出的截断长度：够看清内容，又不至于把内存吃满
@@ -495,7 +554,21 @@ class Upstream:
         self.id: str = str(cfg.get("id") or f"u{index + 1}")
         self.name: str = str(cfg.get("name") or self.id)
         self.base_url: str = norm_base_url(cfg.get("base_url") or "")
-        self.api_key: str = str(cfg.get("api_key") or "")
+        # 多 Key 轮转：api_keys 是完整列表，api_key 向后兼容取第一个
+        raw_keys = cfg.get("api_keys") or []
+        single = str(cfg.get("api_key") or "")
+        if raw_keys:
+            self.api_keys: list[str] = [str(k) for k in raw_keys if str(k).strip()]
+        elif single:
+            self.api_keys = [single]
+        else:
+            self.api_keys = []
+        self.api_key: str = self.api_keys[0] if self.api_keys else ""
+        self._key_index: int = 0  # 当前使用的 Key 下标
+        # Key 策略：failover = 一直用当前的，出错才切；round_robin = 每次轮转
+        self.key_strategy: str = str(cfg.get("key_strategy") or "failover")
+        if self.key_strategy not in ("failover", "round_robin"):
+            self.key_strategy = "failover"
         self.enabled: bool = bool(cfg.get("enabled", True))
 
         # 拉取到的模型列表（运行时状态，会持久化）
@@ -503,6 +576,8 @@ class Upstream:
         self.available_models: list[str] = [str(m) for m in raw_models]
         self.models_fetched_at: float = float(cfg.get("models_fetched_at") or 0.0)
         self.models_error: Optional[str] = cfg.get("models_error")
+        # 最近一次余额查询结果（持久化，重启后还在）
+        self.balance: Optional[dict] = cfg.get("balance")
         # 最近一次连通性测试结果(持久化，重启后还在)
         self.last_check: Optional[dict] = cfg.get("last_check")
         # 每个模型各测一次的结果(model -> {ok/latency/at/...})，持久化
@@ -700,6 +775,9 @@ class Upstream:
             "error": result.get("error"),
             "rate_limited": bool(result.get("rate_limited")),
             "model": result.get("model"),
+            "scope": result.get("scope", "short_request"),
+            "warning": result.get("warning"),
+            "last_actual": result.get("last_actual"),
         }
         with self._lock:
             self.last_check = entry
@@ -715,8 +793,11 @@ class Upstream:
                 "name": self.name,
                 "base_url": self.base_url,
                 "enabled": self.enabled,
-                "key_hint": mask_key(self.api_key),
-                "has_key": bool(self.api_key),
+                "key_hint": mask_key(self.api_keys[0]) if self.api_keys else "",
+                "has_key": bool(self.api_keys),
+                "key_count": len(self.api_keys),
+                "key_hints": [mask_key(k) for k in self.api_keys],
+                "key_strategy": self.key_strategy,
                 "available_models": list(self.available_models),
                 "selected_models": list(self.selected()),
                 "selected_count": len(self.selected()),
@@ -739,6 +820,8 @@ class Upstream:
                 "last_checks": dict(self.last_checks),
                 # 容量：配了多少、现在用了多少（前端卡片要显示实时占用）
                 "capacity": self.capacity_state(),
+                # 最近一次余额查询结果（没查过就是 None）
+                "balance": self.balance,
             }
 
     def state(self) -> dict:
@@ -747,7 +830,8 @@ class Upstream:
             "id": self.id,
             "name": self.name,
             "base_url": self.base_url,
-            "api_key": self.api_key,
+            "api_keys": list(self.api_keys),
+            "key_strategy": self.key_strategy,
             "enabled": self.enabled,
             "available_models": list(self.available_models),
             "selected_models": list(self.selected()),
@@ -756,10 +840,38 @@ class Upstream:
             "models_error": self.models_error,
             "last_check": self.last_check,
             "last_checks": dict(self.last_checks),
+            "balance": self.balance,
             # 只在上限设过时才写，保持老状态文件干净
             **({"max_concurrent": self.max_concurrent} if self.max_concurrent else {}),
             **({"max_per_minute": self.max_per_minute} if self.max_per_minute else {}),
         }
+
+    def _next_key(self) -> str:
+        """根据 key_strategy 取 Key。failover 一直用当前的，round_robin 每次换。"""
+        keys = self.api_keys
+        if not keys:
+            return ""
+        if len(keys) == 1:
+            return keys[0]
+        with self._lock:
+            if self.key_strategy == "round_robin":
+                idx = self._key_index % len(keys)
+                self._key_index = idx + 1
+                return keys[idx]
+            else:  # failover: 一直用当前的
+                return keys[self._key_index % len(keys)]
+
+    def rotate_key(self, failed_key: str) -> bool:
+        """failover 模式下，当前 Key 出错时切到下一个。返回是否还有别的 Key 可试。"""
+        keys = self.api_keys
+        if len(keys) <= 1:
+            return False
+        with self._lock:
+            cur = self._key_index % len(keys)
+            if keys[cur] == failed_key:
+                self._key_index = cur + 1
+                return True
+            return False
 
     # ---- 请求上游 ----
     def headers(self, content_type: str = "application/json",
@@ -771,12 +883,13 @@ class Upstream:
             "Accept-Encoding": "identity",
             "User-Agent": f"llm-router/{__version__}",
         }
-        if self.api_key:
-            h["Authorization"] = f"Bearer {self.api_key}"
+        key = self._next_key()
+        if key:
+            h["Authorization"] = f"Bearer {key}"
         return h
 
     def open(self, method: str, path: str, data: Optional[bytes] = None,
-             headers: Optional[dict] = None):
+             headers: Optional[dict] = None, read_timeout: Optional[float] = None):
         """连上游发一个请求。返回 (conn, resp, target_path)。"""
         parts = urllib.parse.urlsplit(self.base_url)
         if parts.scheme not in ("http", "https") or not parts.hostname:
@@ -801,7 +914,7 @@ class Upstream:
                 conn = cls(parts.hostname, port, timeout=self.connect_timeout)
                 conn.connect()
                 try:
-                    conn.sock.settimeout(self.read_timeout)
+                    conn.sock.settimeout(self.read_timeout if read_timeout is None else read_timeout)
                 except Exception:
                     pass
                 conn.request(method, target, body=data, headers=headers or {})
@@ -858,14 +971,7 @@ class Upstream:
             conn, resp, _ = self.open("GET", "/models", headers=self.headers())
             body = resp.read()
             if resp.status >= 400:
-                detail = ""
-                try:
-                    err = json.loads(body)
-                    e = err.get("error")
-                    detail = (e.get("message") if isinstance(e, dict) else e) or err.get("message") or ""
-                except Exception:
-                    detail = body[:200].decode("utf-8", "replace")
-                raise RuntimeError(f"HTTP {resp.status}{': ' + str(detail) if detail else ''}")
+                raise RuntimeError(describe_http_error(resp.status, body))
 
             if looks_like_html_page(resp.getheader("Content-Type") or "", body):
                 # 200 + 网页：地址/路径其实不对，网关拿首页兜底了。
@@ -900,6 +1006,212 @@ class Upstream:
             return {"ok": False, "error": msg, "models": list(self.available_models)}
         finally:
             self._close(conn)
+
+    # ---- 余额查询 ----
+    #
+    # 没有统一接口。这里只做一件事：试 New API / One API 那套 OpenAI 兼容的
+    # 计费接口（/dashboard/billing/subscription + /usage）。实测 aaawinn 等
+    # 中转站可用：subscription 回总额度（hard_limit_usd），usage 回已用量
+    # （total_usage，单位是「分」）。剩余 = 总额度 - 已用/100。
+    # 官方 OpenAI / Anthropic 没有公开余额接口，会失败——失败就返回 ok:False，
+    # 界面上显示「—」，不影响正常调用。
+    def fetch_balance(self) -> dict:
+        """查这个上游的余额。返回 {ok, remaining, total, used, error, at}。"""
+        conn = None
+        try:
+            conn, resp, _ = self.open(
+                "GET", "/v1/dashboard/billing/subscription", headers=self.headers())
+            body = resp.read(65536)
+            if resp.status >= 400:
+                raise RuntimeError(describe_http_error(resp.status, body))
+            if looks_like_html_page(resp.getheader("Content-Type") or "", body):
+                raise RuntimeError("上游没有余额接口（返回了网页)")
+            try:
+                sub = json.loads(body)
+            except Exception as exc:  # noqa: BLE001
+                raise RuntimeError(f"返回的不是合法 JSON: {exc}") from exc
+            if not isinstance(sub, dict) or sub.get("error"):
+                raise RuntimeError("上游不支持余额查询")
+            total = _to_float(sub.get("hard_limit_usd"))
+            if total is None:
+                total = _to_float(sub.get("soft_limit_usd"))
+            if total is None:
+                raise RuntimeError("返回里没有额度字段")
+            self._close(conn)
+            conn = None
+
+            # 已用量在另一个接口；拿不到就只显示总额度
+            used = None
+            try:
+                conn, resp, _ = self.open(
+                    "GET", "/v1/dashboard/billing/usage", headers=self.headers())
+                body = resp.read(65536)
+                if resp.status < 400 and not looks_like_html_page(
+                        resp.getheader("Content-Type") or "", body):
+                    usage = json.loads(body)
+                    if isinstance(usage, dict) and not usage.get("error"):
+                        u = _to_float(usage.get("total_usage"))
+                        # total_usage 单位是「分」，换回和总额度同单位
+                        if u is not None:
+                            used = u / 100.0
+            except Exception:  # noqa: BLE001
+                used = None
+
+            remaining = total - used if used is not None else None
+            self.balance = {
+                "ok": True, "at": time.time(),
+                "total": round(total, 4),
+                "used": round(used, 4) if used is not None else None,
+                "remaining": round(remaining, 4) if remaining is not None else None,
+            }
+            return dict(self.balance)
+        except Exception as exc:  # noqa: BLE001
+            msg = f"{type(exc).__name__}: {exc}"
+            self.balance = {"ok": False, "at": time.time(), "error": msg}
+            return dict(self.balance)
+        finally:
+            self._close(conn)
+
+    def detailed_test(self, model: str) -> dict:
+        """Exercise context, SSE completion and a tool round trip on this upstream."""
+        context = "\n".join(f"Record {i:04d}: sample project data for context compatibility." for i in range(1500))
+        long_messages = [{"role": "user", "content": context + "\nReply with OK."}]
+        tool = {"type": "function", "function": {
+            "name": "diagnostic_echo", "description": "Echo the diagnostic value.",
+            "parameters": {"type": "object", "properties": {"value": {"type": "string"}},
+                           "required": ["value"], "additionalProperties": False}}}
+        tool_messages = [{"role": "user", "content": context + "\nCall diagnostic_echo with value OK."}]
+        cases = [
+            ("short", "短请求基线", [{"role": "user", "content": "Reply with OK."}], False, False),
+            ("context", "长上下文", long_messages, False, False),
+            ("stream", "长上下文 + 流式", long_messages, True, False),
+            ("tools", "流式工具调用", tool_messages, True, True),
+        ]
+
+        def run(key, name, messages, stream=False, tools=False):
+            payload = {"model": model, "messages": messages, "max_tokens": 512, "stream": stream}
+            if tools:
+                payload.update(tools=[tool], tool_choice={"type": "function", "function": {"name": "diagnostic_echo"}})
+            elif key == "tool_result":
+                payload["tools"] = [tool]
+            raw = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+            result = {"key": key, "name": name, "ok": False, "request_bytes": len(raw)}
+            conn = None
+            start = time.monotonic()
+            calls = {}
+            try:
+                conn, resp, path = self.open("POST", "/chat/completions", data=raw,
+                                              headers=self.headers(accept="text/event-stream" if stream else "application/json"), read_timeout=30)
+                result.update(status=resp.status, path=path,
+                              headers_seconds=round(time.monotonic() - start, 3))
+                ctype = resp.getheader("Content-Type") or ""
+                if resp.status >= 400:
+                    raise ValueError(describe_http_error(resp.status, resp.read(65536)))
+                if looks_like_html_page(ctype):
+                    raise ValueError("上游返回 HTML 网页，不是 API 响应")
+                text = ""
+                if stream:
+                    if "text/event-stream" not in ctype.lower():
+                        raise ValueError("请求流式响应，但上游未返回 text/event-stream")
+                    done = False
+                    finished = False
+                    size = 0
+                    chunks = 0
+                    data_lines = []
+                    while True:
+                        if time.monotonic() - start > 120:
+                            raise TimeoutError("详细测试超过 120 秒，流未正常结束")
+                        if conn.sock:
+                            conn.sock.settimeout(min(30, max(0.1, 120 - (time.monotonic() - start))))
+                        line = resp.readline(65537)
+                        if not line:
+                            break
+                        size += len(line)
+                        if len(line) > 65536 or size > 2 * 1024 * 1024:
+                            raise ValueError("流式响应超过诊断大小上限")
+                        if line.strip():
+                            if line.startswith(b"data:"):
+                                data_lines.append(line[5:].strip())
+                            continue
+                        if not data_lines:
+                            continue
+                        data = b"\n".join(data_lines)
+                        data_lines = []
+                        if data == b"[DONE]":
+                            done = True
+                            break
+                        event = json.loads(data)
+                        if not isinstance(event, dict):
+                            raise ValueError("流式事件不是 JSON 对象")
+                        if event.get("error"):
+                            raise ValueError("流中返回错误：" + json.dumps(event["error"], ensure_ascii=False))
+                        for choice in event.get("choices") or []:
+                            delta = choice.get("delta") or {}
+                            content = delta.get("content") or ""
+                            text += content
+                            for call in delta.get("tool_calls") or []:
+                                slot = calls.setdefault(call.get("index", 0), {"id": "", "type": "function", "function": {"name": "", "arguments": ""}})
+                                slot["id"] += call.get("id") or ""
+                                for field in ("name", "arguments"):
+                                    slot["function"][field] += (call.get("function") or {}).get(field) or ""
+                            if content or delta.get("tool_calls"):
+                                chunks += 1
+                                result.setdefault("first_chunk_seconds", round(time.monotonic() - start, 3))
+                            if choice.get("finish_reason"):
+                                finished = True
+                                result["finish_reason"] = choice["finish_reason"]
+                                if choice["finish_reason"] in ("length", "content_filter"):
+                                    raise ValueError("响应未完整完成：finish_reason=" + choice["finish_reason"])
+                        if event.get("usage"):
+                            result["usage"] = event["usage"]
+                    result.update(chunks=chunks, done=done, finished=finished)
+                    if not (done or finished):
+                        raise ValueError("流提前结束：缺少 [DONE] 或 finish_reason")
+                else:
+                    body = resp.read(2 * 1024 * 1024 + 1)
+                    if len(body) > 2 * 1024 * 1024:
+                        raise ValueError("响应超过诊断大小上限")
+                    parsed = json.loads(body)
+                    if not isinstance(parsed, dict) or parsed.get("error"):
+                        raise ValueError("返回无效响应或错误：" + str(parsed)[:500])
+                    choices = parsed.get("choices") or []
+                    message = (choices[0].get("message") or {}) if choices else {}
+                    text = message.get("content") or ""
+                    result["usage"] = parsed.get("usage")
+                if tools:
+                    call = calls.get(0)
+                    if len(calls) != 1 or not call or not call["id"] or call["function"]["name"] != "diagnostic_echo":
+                        raise ValueError("未收到完整的 diagnostic_echo 工具调用")
+                    args = json.loads(call["function"]["arguments"])
+                    if not isinstance(args, dict) or args.get("value") != "OK":
+                        raise ValueError("工具参数未正确返回 value=OK")
+                elif not isinstance(text, str) or not text.strip():
+                    raise ValueError("没有收到非空回复正文")
+                result.update(ok=True, response_preview=text[:300])
+            except Exception as exc:  # noqa: BLE001
+                result["error"] = f"{type(exc).__name__}: {exc}"[:2000]
+            finally:
+                result["elapsed_seconds"] = round(time.monotonic() - start, 3)
+                self._close(conn)
+            return result, calls.get(0)
+
+        checks = []
+        call = None
+        for key, name, messages, stream, tools in cases:
+            result, call = run(key, name, messages, stream, tools)
+            checks.append(result)
+        if checks[-1]["ok"]:
+            messages = tool_messages + [{"role": "assistant", "content": None, "tool_calls": [call]},
+                                        {"role": "tool", "tool_call_id": call["id"], "content": "OK"},
+                                        {"role": "user", "content": "Reply with the tool result."}]
+            result, _ = run("tool_result", "工具结果回传 + 流式", messages, True)
+            checks.append(result)
+        else:
+            checks.append({"key": "tool_result", "name": "工具结果回传 + 流式", "ok": False,
+                           "skipped": True, "error": "前一步工具调用失败，无法回传工具结果"})
+        return {"id": self.id, "name": self.name, "model": model, "scope": "detailed",
+                "ok": all(c["ok"] for c in checks), "checks": checks, "at": time.time(),
+                "context_chars": len(long_messages[0]["content"])}
 
     # ---- 测速 ----
     def ping(self, model: Optional[str] = None) -> dict:
@@ -947,9 +1259,11 @@ class Upstream:
                     error = f"HTTP {resp.status}"
                 # 429、或错误体里点了配额/限流的名，都算「暂时调不了」
                 blob = f"{error} {body[:400].decode('utf-8', 'replace')}".lower()
-                rate_limited = resp.status == 429 or any(
+                rate_limited = resp.status == 429 or (resp.status != 413 and any(
                     k in blob for k in ("rate limit", "ratelimit", "tpm", "rpm",
-                                        "rps", "quota", "exceed"))
+                                        "rps", "quota", "exceed")))
+                if resp.status >= 400:
+                    error = describe_http_error(resp.status, body)
             result = {"id": self.id, "name": self.name, "ok": ok, "status": resp.status,
                       "latency_seconds": round(latency, 3), "model": target,
                       "error": error, "rate_limited": rate_limited, "at": time.time()}
@@ -2296,6 +2610,8 @@ class Router:
         up = Upstream({
             "id": uid, "name": name, "base_url": base_url,
             "api_key": payload.get("api_key") or "",
+            "api_keys": payload.get("api_keys") or [],
+            "key_strategy": payload.get("key_strategy") or "failover",
             "enabled": payload.get("enabled", True),
             # 新加的上游默认一个模型都不选，等用户拉取后自己勾
             "available_models": [],
@@ -2336,6 +2652,27 @@ class Router:
             up.base_url = new_url
         if payload.get("api_key") is not None:
             up.api_key = str(payload["api_key"])
+            # 单 Key 更新也同步到 api_keys
+            if up.api_keys:
+                up.api_keys[0] = up.api_key
+            else:
+                up.api_keys = [up.api_key]
+        if payload.get("api_keys") is not None:
+            raw = payload["api_keys"]
+            merged = []
+            for i, k in enumerate(raw):
+                v = str(k).strip()
+                if v:  # 有新值就用新值
+                    merged.append(v)
+                elif i < len(up.api_keys):  # 空串 = 保留原值
+                    merged.append(up.api_keys[i])
+                # 否则跳过（新增的空行 = 删除）
+            up.api_keys = merged
+            up.api_key = up.api_keys[0] if up.api_keys else ""
+        if payload.get("key_strategy") is not None:
+            ks = str(payload["key_strategy"])
+            if ks in ("failover", "round_robin"):
+                up.key_strategy = ks
         if payload.get("enabled") is not None:
             up.enabled = bool(payload["enabled"])
         # 容量上限：显式传 null/"" 表示清掉（回到不限量）
@@ -2562,6 +2899,32 @@ class Router:
                     r = fut.result()
                 except Exception as exc:  # noqa: BLE001
                     r = {"ok": False, "error": f"{type(exc).__name__}: {exc}", "models": []}
+                results.append({"id": u.id, "name": u.name, **r})
+        order = {u.id: i for i, u in enumerate(self.upstreams)}
+        results.sort(key=lambda r: order.get(r["id"], 999))
+        self._save_state()
+        return results
+
+    # ---- 查余额 ----
+    def fetch_balance(self, ids: Optional[list[str]] = None) -> list[dict]:
+        """查上游余额。ids 为空则查全部启用中的上游。
+
+        各厂商接口不统一，这里只试 New API / One API 那套 OpenAI 兼容接口，
+        查不到就返回 ok:False(界面上显示「—」），不影响正常调用。
+        """
+        targets = [u for u in self.upstreams
+                   if (not ids or u.id in set(ids)) and u.enabled]
+        if not targets:
+            return []
+        results: list[dict] = []
+        with concurrent.futures.ThreadPoolExecutor(max_workers=min(8, len(targets))) as pool:
+            futures = {pool.submit(u.fetch_balance): u for u in targets}
+            for fut in concurrent.futures.as_completed(futures, timeout=60):
+                u = futures[fut]
+                try:
+                    r = fut.result()
+                except Exception as exc:  # noqa: BLE001
+                    r = {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
                 results.append({"id": u.id, "name": u.name, **r})
         order = {u.id: i for i, u in enumerate(self.upstreams)}
         results.sort(key=lambda r: order.get(r["id"], 999))
@@ -3177,6 +3540,7 @@ class Router:
 
         return {
             "version": __version__,
+            "http_error_hints": HTTP_ERROR_HINTS,
             "config_path": os.path.abspath(self.config_path),
             "state_path": os.path.abspath(self._state_path()),
             "journal": self.stats.journal_info(),
@@ -4090,6 +4454,7 @@ class Handler(BaseHTTPRequestHandler):
                 "/admin/upstream/delete": self._h_upstream_delete,
                 "/admin/upstream/capacity": self._h_upstream_capacity,
                 "/admin/fetch-models": self._h_fetch_models,
+                "/admin/balance": self._h_balance,
                 "/admin/select-models": self._h_select_models,
                 "/admin/set-group": self._h_set_group,
                 "/admin/rename-group": self._h_rename_group,
@@ -4335,6 +4700,17 @@ class Handler(BaseHTTPRequestHandler):
         status, out = self._result(go)
         self._send_json(status, out)
 
+    def _h_balance(self) -> None:
+        def go():
+            payload = self._read_json_body()
+            ids = payload.get("ids")
+            if ids is not None and not isinstance(ids, list):
+                raise ValueError("ids 必须是数组")
+            return {"ok": True, "results": self.router.fetch_balance(
+                [str(i) for i in ids] if ids else None)}
+        status, out = self._result(go)
+        self._send_json(status, out)
+
     def _h_model_save(self) -> None:
         def go():
             route = self.router.save_model(self._read_json_body())
@@ -4484,11 +4860,52 @@ class Handler(BaseHTTPRequestHandler):
         self._send_json(status, out)
 
     def _h_speedtest(self) -> None:
+        def test(up, model=None):
+            result = up.ping(model)
+            result["scope"] = "short_request"
+            # 小请求通过不能覆盖实际调用失败。只匹配同一上游、同一真实模型，
+            # 包括故障转移中失败的尝试；历史从流水恢复，重启后也可提示。
+            with self.router.lock:
+                history = list(self.router.history)
+            for entry in reversed(history):
+                attempts = entry.get("trail") or [{
+                    "upstream_id": entry.get("upstream_id"),
+                    "model": entry.get("effective_model"),
+                    "ok": entry.get("ok"), "status": entry.get("status"),
+                    "reason": entry.get("error"),
+                }]
+                actual = next((a for a in reversed(attempts)
+                               if a.get("upstream_id") == up.id
+                               and a.get("model") == result.get("model")), None)
+                if actual is None:
+                    continue
+                result["last_actual"] = {"at": entry.get("at"),
+                                         "ok": bool(actual.get("ok")),
+                                         "status": actual.get("status")}
+                if not actual.get("ok"):
+                    reason = actual.get("reason") or f"HTTP {actual.get('status')}"
+                    if re.fullmatch(r"(?:客户端错误 )?HTTP \d+", reason):
+                        reason = describe_http_error(actual["status"])
+                    result["warning"] = (
+                        f"最近实际调用失败：{reason}。本次仅测试短请求，"
+                        "未复测原请求的上下文、工具参数和流式行为。")
+                break
+            up._remember_check(result)
+            return result
+
         def go():
             payload = self._read_json_body()
             # tests: [{"id": 上游, "model": 该上游上的真实模型名}] —— 精确测某个模型
             # 模型路由弹窗里每行一个「测试」按钮走这条路径。
             tests = payload.get("tests")
+            if payload.get("detailed"):
+                if not isinstance(tests, list) or len(tests) != 1 or not isinstance(tests[0], dict):
+                    raise ValueError("详细测试每次需要指定一个上游和模型")
+                up = self.router.find_upstream(str(tests[0].get("id") or ""))
+                model = str(tests[0].get("model") or "").strip()
+                if up is None or not model:
+                    raise ValueError("详细测试需要有效的上游和模型")
+                return {"ok": True, "results": [up.detailed_test(model)]}
             if tests is not None:
                 if not isinstance(tests, list):
                     raise ValueError("tests 必须是数组")
@@ -4501,7 +4918,7 @@ class Handler(BaseHTTPRequestHandler):
                         continue
                     model = item.get("model")
                     try:
-                        results.append(up.ping(str(model) if model else None))
+                        results.append(test(up, str(model) if model else None))
                     except Exception as exc:  # noqa: BLE001
                         results.append({"id": up.id, "name": up.name, "ok": False,
                                         "latency_seconds": None,
@@ -4530,7 +4947,7 @@ class Handler(BaseHTTPRequestHandler):
             results: list[dict] = []
             with concurrent.futures.ThreadPoolExecutor(
                     max_workers=min(8, len(jobs))) as pool:
-                futures = {pool.submit(u.ping, m): (u, m) for u, m in jobs}
+                futures = {pool.submit(test, u, m): (u, m) for u, m in jobs}
                 for fut in concurrent.futures.as_completed(futures, timeout=180):
                     u, m = futures[fut]
                     try:
@@ -4626,7 +5043,8 @@ class Handler(BaseHTTPRequestHandler):
             "elapsed_seconds": round(elapsed, 3),
             "ok": 200 <= status < 400,
             "stream": stream,
-            "attempts": attempts,
+            # 候选数不是已尝试数；成功、流式及失败统一以实际尝试链为准。
+            "attempts": len(trail) if trail is not None else (attempts if upstream else 0),
             "route_source": route_source,
             "error": error,
             # token 用量：输入 / 输出 / 缓存命中 / 缓存写入 / 合计
@@ -4840,22 +5258,40 @@ class Handler(BaseHTTPRequestHandler):
             new_payload["model"] = eff_model
             data = json.dumps(new_payload, ensure_ascii=False).encode("utf-8")
 
-        headers = up.headers(
-            content_type=self.headers.get("Content-Type") or "application/json",
-            accept=self.headers.get("Accept") or "application/json",
-        )
-        conn = None
-        t0 = time.time()
-        try:
-            conn, resp, _ = up.open(method, path, data=data, headers=headers)
-        except Exception as exc:  # noqa: BLE001
-            reason = f"连接失败: {type(exc).__name__}: {exc}"
-            up.record_failure(reason, self.router.failure_threshold, up.cooldown)
-            raise Retryable(up, 502, json.dumps({"error": {
-                "message": reason, "type": "upstream_connect_error",
-                "upstream": up.name}}, ensure_ascii=False).encode("utf-8"), reason) from exc
+        # Key 级别重试：failover 策略下 401/403/429 换下一个 Key 重试同一个上游
+        _KEY_ERR = {401, 403, 429}
+        _key_tries = len(up.api_keys) if (up.key_strategy == "failover" and len(up.api_keys) > 1) else 1
 
-        status = resp.status
+        for _kt in range(_key_tries):
+            headers = up.headers(
+                content_type=self.headers.get("Content-Type") or "application/json",
+                accept=self.headers.get("Accept") or "application/json",
+            )
+            _used_key = headers.get("Authorization", "")[len("Bearer "):] if "Authorization" in headers else ""
+            conn = None
+            t0 = time.time()
+            try:
+                conn, resp, _ = up.open(method, path, data=data, headers=headers)
+            except Exception as exc:  # noqa: BLE001
+                reason = f"\u8fde\u63a5\u5931\u8d25: {type(exc).__name__}: {exc}"
+                up.record_failure(reason, self.router.failure_threshold, up.cooldown)
+                raise Retryable(up, 502, json.dumps({"error": {
+                    "message": reason, "type": "upstream_connect_error",
+                    "upstream": up.name}}, ensure_ascii=False).encode("utf-8"), reason) from exc
+
+            status = resp.status
+
+            # Key 相关错误且还有别的 Key：换 Key 重试，不算上游故障
+            if status in _KEY_ERR and _kt < _key_tries - 1 and up.rotate_key(_used_key):
+                try:
+                    resp.read()
+                except Exception:  # noqa: BLE001
+                    pass
+                up._close(conn)
+                self.log_message("\u4e0a\u6e38 %s Key #%d \u62a5 %d\uff0c\u6362\u4e0b\u4e00\u4e2a Key \u91cd\u8bd5", up.name, _kt + 1, status)
+                continue
+            break
+
         ctype = (resp.getheader("Content-Type") or "").lower()
 
         # 1) 该换下一个上游的错误
@@ -4866,7 +5302,7 @@ class Handler(BaseHTTPRequestHandler):
                 body = b""
             finally:
                 up._close(conn)
-            reason = f"HTTP {status}"
+            reason = describe_http_error(status, body)
             up.record_failure(reason, self.router.failure_threshold, up.cooldown)
             raise Retryable(up, status, body, reason)
 
@@ -4877,7 +5313,8 @@ class Handler(BaseHTTPRequestHandler):
             except Exception:  # noqa: BLE001
                 body = b""
             up._close(conn)
-            up.record_neutral(f"HTTP {status}")
+            reason = describe_http_error(status, body)
+            up.record_neutral(reason)
             if anthropic:
                 # 错误体也换成 Anthropic 的形状，否则客户端只会说「解析失败」，
                 # 真正的错因（Key 无效 / 参数不对）就看不见了
@@ -4888,10 +5325,10 @@ class Handler(BaseHTTPRequestHandler):
                 self._relay_json(status, resp, body, up.name, time.time() - t0)
             trail.append({"upstream": up.name, "upstream_id": up.id, "ok": False,
                           "model": eff_model, "status": status, "client_error": True,
-                          "reason": f"客户端错误 HTTP {status}"})
+                          "reason": reason})
             self._record_history(up, requested_model, eff_model or "-", status,
-                                 time.time() - t0, f"客户端错误 HTTP {status}",
-                                 attempts=attempts, route_source=route_source,
+                                 time.time() - t0, reason,
+                                 attempts=len(trail), route_source=route_source,
                                  trail=trail)
             return
 

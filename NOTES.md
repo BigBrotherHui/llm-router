@@ -1,5 +1,44 @@
 # NOTES
 
+## 2026-10-15 v2.4.3：上游卡片加「余额查询」
+
+需求：给每个上游面板加余额查看。
+
+结论：**余额没有统一接口**。OpenAI / Anthropic 官方都没有公开余额接口（普通
+sk- key 调不通）。能查的是 New API / One API 那类中转站，用的是 OpenAI 兼容的
+`GET /v1/dashboard/billing/subscription` + `/v1/dashboard/billing/usage`。
+
+实测（aaawinn.xyz，用户给的 key）：subscription 回 `hard_limit_usd`=总额度，
+usage 回 `total_usage`（单位是「分」）。剩余 = 总额度 - total_usage/100。
+对照 New API 源码（`controller/billing.go`）确认：hard_limit_usd = remainQuota+usedQuota（总额度），
+total_usage = usedQuota/QuotaPerUnit*100（分）。实测值：总 100.32 / 已用 40.01 / 剩 60.31。
+
+做法：
+- `router.py`：`Upstream.fetch_balance()`（只试那套接口，查不到返回 ok:False）；
+  `Router.fetch_balance(ids)`（并发查）；新接口 `POST /admin/balance`；结果存在 `Upstream.balance`，
+  随状态持久化、`snapshot()` 带出来。新增 `_to_float()` 工具。
+- `webui.html`：卡片上一个余额 badge（`balanceBadge`，查不到显示「余额 —」），
+  加一个「查余额」按钮（`checkBalance`→`/admin/balance`）。不自动轮询。
+- `selftest.py`：第 33 组 6 项（金额/换算/持久化/不支持时 ok:False/不存在返回空）。
+
+验证：`python selftest.py` **467 项全过**；线上 8010 重启到 2.4.3；
+实测 `POST /admin/balance {"ids":["u20572c"]}`（aaawinn_free）→ remaining 60.31，`/stats` 里也带出了。
+
+局限：只能查 New API / One API 那类中转站；官方与其他厂商余额显示「—」。
+其余中转站是否同样支持未逐个实测。
+
+## 2026-10-14 分组内逐上游详细测试
+
+- `router.py`: `Upstream.detailed_test()`；`/admin/speedtest` 接收 `detailed: true` 与单个 `tests` 条目。最多 5 个请求，覆盖短请求、约 9 万字符合成上下文、长上下文 SSE、流式工具调用及回传；校验流结束、工具名/参数/ID，展示 HTTP 错误及各项计时。
+- `webui.html`: 每个分组的上游行新增详细测试按钮及可折叠报告；以真实上游 ID/模型为键保留当前页面会话结果，避免重排/切组时串行；报告区域不触发拖拽。测试直接调用上游，不验证分组路由或 Anthropic 转换。
+- `selftest.py`: 增加正常五项、模型定位、长上下文 413、HTTP 200 流提前结束、忽略工具及参数校验；最终全量 461 项通过。JS 语法和报告渲染断言通过。未对真实 global workbuddy 上游发诊断请求，未做浏览器视觉实测。
+
+## 2026-10-14 测试结果与历史调用分开展示
+
+- `webui.html` 的 `checkBadge()` 将本次短请求测试与最近一次历史调用失败拆成两个标记；耗时明确属于本次测试，历史失败有时间时显示相对时间。
+- 上游测试和路由行测试的提示同时明确本次结果与历史记录，避免把历史 HTTP 503 读成本次测试失败。后端测试和历史判定保持现有逻辑。
+- 验证：内联 JavaScript 语法检查及成功、历史失败、限流、缺失时间、HTML 转义等断言通过；`git diff --check` 通过。未做浏览器实测。
+
 ## 2026-10-14 v2.4.2：修「手机上拖不动模型路由里的上游」
 
 现象（用户报的）：手机（触屏）上打开模型路由弹窗，按住上游行拖动毫无反应，
@@ -560,4 +599,3 @@ selftest 新增 3 项验证：禁用条目调用被跳过、snap 里还在、ena
   失败数只在 tooltip 里说明。`setTabNum("req", nCalls, false, ...)`。
 - 上游调用对比条：原来只要有失败就整条变红（414 次里错 16 次看起来像全挂了）。
   现在条长仍按调用量，条内按成功/失败比例分两段：`.track i.ok`（蓝）+ `.track i.fail`（红）。
-
