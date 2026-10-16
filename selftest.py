@@ -27,6 +27,8 @@ hits: dict[str, list] = {"a": [], "b": [], "c": [], "d": []}
 bodies: dict[str, list] = {"a": [], "b": [], "c": [], "d": []}
 # 每个假上游收到的 User-Agent（验「UA 覆盖」在真正发出去的请求上生效）。
 uas: dict[str, list] = {"a": [], "b": [], "c": [], "d": []}
+# 每个假上游收到的 Authorization（验多 Key 的顺序/轮转真正发了哪个 Key）。
+auths: dict[str, list] = {"a": [], "b": [], "c": [], "d": []}
 behavior: dict[str, str] = {"a": "ok", "b": "ok", "c": "ok", "d": "ok"}
 # 每个假上游的人工延迟（秒），用来让「按测速重排」的结果可预测
 delay: dict[str, float] = {"a": 0.0, "b": 0.0, "c": 0.0, "d": 0.0}
@@ -146,6 +148,7 @@ class UpstreamServer(BaseHTTPRequestHandler):
             hits[self.tag].append(model)
             bodies[self.tag].append(body)
             uas[self.tag].append(self.headers.get("User-Agent") or "")
+            auths[self.tag].append(self.headers.get("Authorization") or "")
             behave = behavior[self.tag]
             wait = delay.get(self.tag, 0.0)
         if wait:
@@ -478,6 +481,8 @@ def reset_hits():
             bodies[k].clear()
         for k in uas:
             uas[k].clear()
+        for k in auths:
+            auths[k].clear()
 
 
 def cleanup():
@@ -2908,6 +2913,203 @@ def main():
         st, r = admin("/admin/upstream/update",
                       {"id": "a1", "base_url": f"http://127.0.0.1:{UP_PORTS['b']}/v1"})
         check("改 base_url 不再 NameError 崩", st == 200, f"{st} {str(r)[:150]}")
+    finally:
+        stop_router(p)
+
+    # ================= 35. 多 Key 命名 / 排序 / 轮转顺序 =================
+    # 一个上游可以配多个 Key：每个 Key 能起名字，能上移/下移换顺序。
+    # 保存协议是整表提交 [{id, name, key}]：id = 打开编辑框时该 Key 在列表里的
+    # 下标（跟着 Key 走），key 留空 = 保留原值，条目顺序 = 保存后的顺序。
+    print("\n[35] 多 Key 命名 / 排序 / 轮转顺序")
+    cfg = write_config()
+    p = start_router(cfg)
+    try:
+        # 1) 整表替换成两个带名字的新 Key
+        st, r = admin("/admin/upstream/update", {"id": "a1", "api_keys": [
+            {"id": None, "name": "主号", "key": "sk-primary-000001"},
+            {"id": None, "name": "备用", "key": "sk-backup-000002"},
+        ]})
+        check("整表保存两个带名字的 Key", st == 200, f"{st} {str(r)[:150]}")
+        st, snap = get("/stats")
+        a1 = next(u for u in snap["upstreams"] if u["id"] == "a1")
+        check("两个 Key 都保存了", a1["key_count"] == 2, str(a1["key_count"]))
+        check("名字按序保存", a1["key_names"] == ["主号", "备用"], str(a1["key_names"]))
+        hints2 = a1["key_hints"]
+        check("打码值是两个不同 Key 且顺序正确",
+              len(set(hints2)) == 2 and hints2[0].startswith("sk-pri")
+              and hints2[1].startswith("sk-bac"), str(hints2))
+
+        # 2) 只改名：key 留空 + 带 id → Key 值保持不动
+        admin("/admin/upstream/update", {"id": "a1", "api_keys": [
+            {"id": 0, "name": "一号", "key": ""},
+            {"id": 1, "name": "二号", "key": ""},
+        ]})
+        st, snap = get("/stats")
+        a1 = next(u for u in snap["upstreams"] if u["id"] == "a1")
+        check("只改名不动 Key 值",
+              a1["key_hints"] == hints2 and a1["key_names"] == ["一号", "二号"],
+              f"{a1['key_names']} {a1['key_hints']}")
+
+        # 3) 交换顺序（id 跟着 Key 走）→ 打码值与名字一起换位
+        admin("/admin/upstream/update", {"id": "a1", "api_keys": [
+            {"id": 1, "name": "二号", "key": ""},
+            {"id": 0, "name": "一号", "key": ""},
+        ]})
+        st, snap = get("/stats")
+        a1 = next(u for u in snap["upstreams"] if u["id"] == "a1")
+        check("交换顺序后打码值换位", a1["key_hints"] == [hints2[1], hints2[0]],
+              str(a1["key_hints"]))
+
+        # 4) 真正发出的是重排后的第一个 Key（failover 先发列表第一个）
+        admin("/admin/fetch-models", {"ids": ["a1"]})
+        admin("/admin/select-models", {"id": "a1", "models": ["deepseek-chat"]})
+        reset_hits()
+        post(body={"model": "deepseek-chat",
+                   "messages": [{"role": "user", "content": "hi"}]})
+        check("failover 发的是重排后第一个 Key",
+              auths["a"] and auths["a"][-1] == "Bearer sk-backup-000002",
+              str(auths["a"]))
+
+        # 4b) 逐 Key 测试：key_index 定位已保存的 Key、model 指定测哪个模型，不碰轮转下标
+        reset_hits()
+        st, r = admin("/admin/speedtest", {"key_test": {"id": "a1", "key_index": 1,
+                                                        "model": "deepseek-chat"}})
+        check("逐 Key 测试成功返回",
+              st == 200 and (r.get("result") or {}).get("ok") is True,
+              f"{st} {str(r)[:150]}")
+        check("逐 Key 测试用的是指定的 Key",
+              auths["a"] == ["Bearer sk-primary-000001"], str(auths["a"]))
+        check("逐 Key 测试用的是指定的模型",
+              hits["a"] == ["deepseek-chat"], str(hits["a"]))
+        reset_hits()
+        post(body={"model": "deepseek-chat",
+                   "messages": [{"role": "user", "content": "hi"}]})
+        check("逐 Key 测试不动 failover 当前 Key",
+              auths["a"] and auths["a"][-1] == "Bearer sk-backup-000002",
+              str(auths["a"]))
+
+        # 4b2) 勾选第二个模型后，指定它在另一个 Key 上测
+        admin("/admin/select-models", {"id": "a1", "models": ["deepseek-chat", "glm-4.6"]})
+        reset_hits()
+        st, r = admin("/admin/speedtest", {"key_test": {"id": "a1", "key_index": 0,
+                                                        "model": "glm-4.6"}})
+        check("逐 Key 测试可指定另一个已勾选模型",
+              st == 200 and hits["a"] == ["glm-4.6"]
+              and auths["a"] == ["Bearer sk-backup-000002"],
+              f"{st} {hits['a']} {auths['a']}")
+
+        # 4c) key_value 直接测还没保存的新值；测完不落库、不写「最近测试」
+        reset_hits()
+        st, r = admin("/admin/speedtest",
+                      {"key_test": {"id": "a1", "key_value": "sk-unsaved-000009"}})
+        check("直接测未保存的新 Key 值",
+              st == 200 and (r.get("result") or {}).get("ok") is True
+              and auths["a"] == ["Bearer sk-unsaved-000009"],
+              f"{st} {str(r)[:120]} {auths['a']}")
+        st, snap = get("/stats")
+        a1 = next(u for u in snap["upstreams"] if u["id"] == "a1")
+        check("测试过的新 Key 不会被保存", a1["key_count"] == 2, str(a1["key_count"]))
+        check("逐 Key 测试不写「最近测试」", a1.get("last_check") is None,
+              str(a1.get("last_check")))
+
+        # 4d) 禁用第一个 Key：保留在列表里（不是删除），请求自动跳过它
+        admin("/admin/upstream/update", {"id": "a1", "api_keys": [
+            {"id": 0, "name": "二号", "key": "", "enabled": False},
+            {"id": 1, "name": "一号", "key": "", "enabled": True},
+        ]})
+        st, snap = get("/stats")
+        a1 = next(u for u in snap["upstreams"] if u["id"] == "a1")
+        check("禁用的 Key 仍在列表里（不是删除）",
+              a1["key_count"] == 2 and a1["key_disabled"] == [True, False],
+              f'{a1["key_count"]} {a1.get("key_disabled")}')
+        reset_hits()
+        post(body={"model": "deepseek-chat",
+                   "messages": [{"role": "user", "content": "hi"}]})
+        check("failover 自动跳过禁用的 Key",
+              auths["a"] and auths["a"][-1] == "Bearer sk-primary-000001",
+              str(auths["a"]))
+        # 禁用的 Key 也能单独测（测通了再启用）
+        reset_hits()
+        st, r = admin("/admin/speedtest", {"key_test": {"id": "a1", "key_index": 0,
+                                                        "model": "deepseek-chat"}})
+        check("禁用的 Key 也能单独测",
+              st == 200 and auths["a"] == ["Bearer sk-backup-000002"],
+              f"{st} {auths['a']}")
+
+        # 4e) round_robin 同样跳过禁用的 Key
+        admin("/admin/upstream/update", {"id": "a1", "key_strategy": "round_robin"})
+        reset_hits()
+        post(body={"model": "deepseek-chat", "messages": [{"role": "user", "content": "hi"}]})
+        post(body={"model": "deepseek-chat", "messages": [{"role": "user", "content": "hi"}]})
+        check("round_robin 跳过禁用的 Key（两次都发可用的那个）",
+              auths["a"] == ["Bearer sk-primary-000001",
+                             "Bearer sk-primary-000001"], str(auths["a"]))
+        admin("/admin/upstream/update", {"id": "a1", "key_strategy": "failover"})
+
+        # 5) 名字 + 顺序随状态持久化（重启后还在）
+        stop_router(p)
+        p = start_router(cfg)
+        st, snap = get("/stats")
+        a1 = next(u for u in snap["upstreams"] if u["id"] == "a1")
+        check("重启后名字、顺序、禁用状态都还在",
+              a1["key_names"] == ["二号", "一号"]
+              and a1["key_hints"] == [hints2[1], hints2[0]]
+              and a1["key_disabled"] == [True, False],
+              f"{a1['key_names']} {a1['key_hints']} {a1.get('key_disabled')}")
+
+        # 6) 按 id 换某个 Key 的值：该 Key 变、另一个不动
+        admin("/admin/upstream/update", {"id": "a1", "api_keys": [
+            {"id": 0, "name": "二号", "key": ""},
+            {"id": 1, "name": "一号", "key": "sk-new-000003"},
+        ]})
+        st, snap = get("/stats")
+        a1 = next(u for u in snap["upstreams"] if u["id"] == "a1")
+        check("按 id 改 Key 值只动那一个",
+              a1["key_hints"][0] == hints2[1] and a1["key_hints"][1].endswith("0003"),
+              str(a1["key_hints"]))
+
+        # 7) 老格式（纯字符串列表）兼容：空串按位置保留、新值追加
+        admin("/admin/upstream/update", {"id": "a1",
+                                         "api_keys": ["", "", "sk-appended-000004"]})
+        st, snap = get("/stats")
+        a1 = next(u for u in snap["upstreams"] if u["id"] == "a1")
+        check("老格式空串保留原值、新值追加",
+              a1["key_count"] == 3 and a1["key_hints"][0] == hints2[1]
+              and a1["key_hints"][2].endswith("0004"), str(a1["key_hints"]))
+
+        # 8) Key 出错轮转按列表顺序：a1 对任何 Key 都 401，
+        #    应依次发 列表[0] → 列表[1] → 列表[2]
+        behavior["a"] = "fail401"
+        reset_hits()
+        post(body={"model": "deepseek-chat",
+                   "messages": [{"role": "user", "content": "hi"}]})
+        check("failover 换 Key 按列表顺序",
+              auths["a"] == ["Bearer sk-backup-000002",
+                             "Bearer sk-new-000003",
+                             "Bearer sk-appended-000004"],
+              str(auths["a"]))
+        behavior["a"] = "ok"
+
+        # 8b) 禁用到只剩一个可用：401 时没有可换的 Key，不重复试
+        admin("/admin/upstream/update", {"id": "a1", "api_keys": [
+            {"id": 0, "name": "二号", "key": "", "enabled": False},
+            {"id": 1, "name": "一号", "key": "", "enabled": True},
+            {"id": 2, "name": "", "key": "", "enabled": False},
+        ]})
+        behavior["a"] = "fail401"
+        reset_hits()
+        post(body={"model": "deepseek-chat", "messages": [{"role": "user", "content": "hi"}]})
+        check("只剩一个可用 Key 时 401 不重复试",
+              auths["a"] == ["Bearer sk-new-000003"], str(auths["a"]))
+        behavior["a"] = "ok"
+
+        # 9) 删除一个 Key：条目里不带谁，谁就被删（只剩三个里的第一个）
+        admin("/admin/upstream/update", {"id": "a1",
+                                         "api_keys": [{"id": 0, "name": "二号", "key": ""}]})
+        st, snap = get("/stats")
+        a1 = next(u for u in snap["upstreams"] if u["id"] == "a1")
+        check("不带的条目被删除", a1["key_count"] == 1
+              and a1["key_hints"] == [hints2[1]], str(a1["key_hints"]))
     finally:
         stop_router(p)
 

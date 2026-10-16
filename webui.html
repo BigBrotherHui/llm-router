@@ -811,6 +811,25 @@ function balanceBadge(u) {
   return `<span class="badge ${low ? "warn" : "ok"}" title="${esc(tip)}">余额 ${rem}</span>`;
 }
 
+// 卡片上的 Key 徽标：多 Key 显示个数+策略（带禁用数），单 Key 显示名字（没名字显示打码 Key）
+function keyBadge(u) {
+  const names = u.key_names || [];
+  const hints = u.key_hints || [];
+  const dis = u.key_disabled || [];
+  const nDis = dis.filter(Boolean).length;
+  const detail = hints.map((h, i) =>
+    (names[i] ? names[i] + " " : "") + h + (dis[i] ? "（禁用）" : "")).join("\uff0c");
+  if (u.key_count > 1) {
+    const how = u.key_strategy === "round_robin" ? "\u6bcf\u6b21\u8bf7\u6c42\u8f6e\u6d41\u7528" : "\u4e00\u4e2a\u51fa\u9519\u518d\u5207\u4e0b\u4e00\u4e2a";
+    const off = nDis ? `\uff08${nDis} \u7981\u7528\uff09` : "";
+    return `<span class="badge" title="${esc(how + (detail ? "\uff1b" + detail : ""))}">${u.key_count} \u4e2a Key${off}${u.key_strategy === "round_robin" ? " \u21bb" : " \u2192"}</span>`;
+  }
+  if (!u.has_key) return `<span class="badge">\u65e0 Key</span>`;
+  const off = dis[0] ? "\uff08\u5df2\u7981\u7528\uff09" : "";
+  const label = (names[0] || u.key_hint) + off;
+  return `<span class="badge" title="${esc(names[0] ? u.key_hint : "")}">${esc(label)}</span>`;
+}
+
 function renderUpstreams() {
   const ups = state.upstreams || [];
   // 用户正在分组输入框里操作（或下拉开着）时不要重建 DOM，
@@ -909,7 +928,7 @@ function renderUpstreams() {
           ? (cooling ? `<span class="badge warn">冷却中 ${u.cooldown_remaining_seconds}s</span>`
                      : `<span class="badge ok">启用</span>`)
           : `<span class="badge bad">已停用</span>`}
-        <span class="badge" title="${u.key_count > 1 ? (u.key_strategy === "round_robin" ? "每次请求轮流用" : "一个出错再切下一个") : ""}">${u.key_count > 1 ? u.key_count + " 个 Key" + (u.key_strategy === "round_robin" ? " ↻" : " →") : (u.has_key ? esc(u.key_hint) : "无 Key")}</span>
+        ${keyBadge(u)}
         ${nAvail
           ? `<span class="badge ${nSel ? "blue" : "warn"}">已选用 ${nSel} / ${nAvail} 个模型</span>`
           : `<span class="badge warn">还没拉取模型</span>`}
@@ -2273,32 +2292,138 @@ async function updateUpstream(patch, msg) {
 
 let editId = null;
 
-function renderKeyList(hints) {
+// 编辑弹窗里的 Key 列表。每个条目：
+//   { id: 原有 Key 的下标（新增行为 null）, name: 名字, hint: 打码值, typed: 这次输入的新 Key,
+//     enabled: 启用状态（禁用 = 保留但不参与轮转）, model: 逐 Key 测试用哪个模型,
+//     test: 最近一次测试结果 }
+// 数组顺序 = 列表顺序（上移/下移直接换位置），保存时整表提交。
+let editKeys = [];
+// 这个上游勾选了的模型 —— 逐 Key 测试的模型候选（每行下拉里选）
+let editModels = [];
+
+// 把界面上输入的名字/Key 值收回到 editKeys（重排、删除前必须先收回，否则输入会丢）
+function syncEditKeys() {
+  const rows = $("#eKeyList").children;
+  editKeys.forEach((k, i) => {
+    const row = rows[i];
+    if (!row) return;
+    k.name = row.querySelector(".ekey-name").value.trim();
+    k.typed = row.querySelector(".ekey-input").value;
+    k.enabled = row.querySelector(".ekey-en").checked;
+    if (editModels.length) k.model = row.querySelector(".ekey-model").value;
+  });
+}
+
+// 逐 Key 测试结果画到行上：✓ 延迟 / 限流 / ✗ 状态码
+function paintKeyResult(el, t) {
+  if (!t) { el.textContent = ""; el.title = ""; return; }
+  el.title = (t.model ? `模型 ${t.model}；` : "") + (t.error || "") +
+             (t.key_hint ? `（Key ${t.key_hint}）` : "");
+  if (t.ok) {
+    el.textContent = "✓ " + fmtLat(t.latency_seconds);
+    el.style.color = "var(--ok)";
+  } else if (t.rate_limited) {
+    el.textContent = "限流";
+    el.style.color = "var(--warn)";
+  } else {
+    el.textContent = "✗ " + (t.status || "");
+    el.style.color = "var(--bad)";
+  }
+}
+
+function renderKeyList() {
   const box = $("#eKeyList");
   box.innerHTML = "";
-  (hints || []).forEach((h, i) => {
+  editKeys.forEach((k, i) => {
     const row = document.createElement("div");
     row.className = "row";
     row.style.cssText = "gap:6px;align-items:center";
-    row.innerHTML = `<input class="mono ekey-input" type="password" autocomplete="off"
-      data-idx="${i}" placeholder="留空表示不改" style="flex:1">
-      <span class="muted" style="font-size:12px;min-width:80px">${esc(h)}</span>
-      <button class="mini danger ekey-del" type="button" data-idx="${i}" title="删除此 Key">x</button>`;
+    row.innerHTML = `
+      <input class="ekey-en" type="checkbox" title="启用这个 Key；取消 = 禁用（保留但不参与轮转和故障切换）">
+      <button class="mini ekey-mv" type="button" title="上移" ${i === 0 ? "disabled" : ""}>↑</button>
+      <button class="mini ekey-mv" type="button" title="下移" ${i === editKeys.length - 1 ? "disabled" : ""}>↓</button>
+      <input class="ekey-name" placeholder="名字" title="给这个 Key 起个名字（可选）" style="width:88px">
+      <input class="mono ekey-input" type="password" autocomplete="off"
+        placeholder="${k.id == null ? "sk-…" : "留空表示不改"}" style="flex:1">
+      <span class="muted" style="font-size:12px;min-width:80px">${k.id == null ? "(新)" : esc(k.hint)}</span>
+      <span class="ekey-res" style="font-size:12px"></span>
+      <select class="ekey-model" title="选一个模型来测这个 Key（来自上游勾选的模型）"
+        style="max-width:170px;font-size:12px"></select>
+      <button class="mini ekey-test" type="button">测</button>
+      <button class="mini danger ekey-del" type="button" title="删除此 Key">x</button>`;
+    const nameIn = row.querySelector(".ekey-name");
+    const keyIn = row.querySelector(".ekey-input");
+    const modelSel = row.querySelector(".ekey-model");
+    const enChk = row.querySelector(".ekey-en");
+    const testBtn = row.querySelector(".ekey-test");
+    const resEl = row.querySelector(".ekey-res");
+    nameIn.value = k.name || "";
+    keyIn.value = k.typed || "";
+    enChk.checked = k.enabled !== false;
+    row.style.opacity = enChk.checked ? "" : "0.55";
+    enChk.addEventListener("change", () => {
+      row.style.opacity = enChk.checked ? "" : "0.55";
+    });
+    paintKeyResult(resEl, k.test);
+    if (editModels.length) {
+      editModels.forEach(m => {
+        const opt = document.createElement("option");
+        opt.value = m;
+        opt.textContent = m;
+        modelSel.appendChild(opt);
+      });
+      modelSel.value = (k.model && editModels.includes(k.model)) ? k.model : editModels[0];
+    } else {
+      const opt = document.createElement("option");
+      opt.textContent = "没勾选模型";
+      modelSel.appendChild(opt);
+      modelSel.disabled = true;
+    }
+    const mv = row.querySelectorAll(".ekey-mv");
+    mv[0].onclick = () => {
+      syncEditKeys();
+      if (i > 0) { [editKeys[i - 1], editKeys[i]] = [editKeys[i], editKeys[i - 1]]; renderKeyList(); }
+    };
+    mv[1].onclick = () => {
+      syncEditKeys();
+      if (i < editKeys.length - 1) { [editKeys[i + 1], editKeys[i]] = [editKeys[i], editKeys[i + 1]]; renderKeyList(); }
+    };
+    row.querySelector(".ekey-del").onclick = () => {
+      syncEditKeys();
+      editKeys.splice(i, 1);
+      renderKeyList();
+    };
+    // 能测的条件：上游勾选过模型（下拉有候选）、而且这行有 Key（已保存的，或刚输入的新值）
+    const canTest = () => editModels.length > 0 && (k.id != null || !!keyIn.value.trim());
+    testBtn.disabled = !canTest();
+    testBtn.title = editModels.length
+      ? "用这行的 Key 和选中的模型发一个最小请求"
+      : "先在上游勾选模型，再测 Key";
+    keyIn.addEventListener("input", () => { testBtn.disabled = !canTest(); });
+    testBtn.onclick = async () => {
+      syncEditKeys();
+      const kk = editKeys[i];
+      testBtn.disabled = true;
+      testBtn.textContent = "…";
+      resEl.style.color = "var(--dim)";
+      resEl.textContent = "测试中";
+      try {
+        const r = await api("/admin/speedtest", { key_test: {
+          id: editId, key_index: kk.id, key_value: (kk.typed || "").trim(),
+          model: kk.model,
+        }});
+        kk.test = r.result || { ok: false, error: "没有结果" };
+      } catch (e) {
+        kk.test = { ok: false, error: e.message };
+      }
+      renderKeyList();  // 结果记在条目上，重绘后还在
+    };
     box.appendChild(row);
   });
-  box.querySelectorAll(".ekey-del").forEach(btn => {
-    btn.onclick = () => {
-      const idx = parseInt(btn.dataset.idx);
-      editKeyHints.splice(idx, 1);
-      editKeyDeleted.add(idx);
-      renderKeyList(editKeyHints);
-      $("#eKeyStrategyWrap").style.display = editKeyHints.length > 1 ? "" : "none";
-    };
-  });
+  $("#eKeyHint").textContent = editKeys.length
+    ? `(${editKeys.length} \u4e2a Key)` : "(\u6ca1\u6709 Key)";
+  $("#eKeyStrategyWrap").style.display = editKeys.length > 1 ? "" : "none";
 }
-let editKeyHints = [];
-let editKeyDeleted = new Set();
-let editKeyNew = [];
 
 function editUpstream(id) {
   const u = (state.upstreams || []).find(x => x.id === id);
@@ -2307,14 +2432,15 @@ function editUpstream(id) {
   $("#eName").value = u.name;
   $("#eUrl").value = u.base_url;
   $("#eUA").value = u.user_agent || "";
-  editKeyHints = [...(u.key_hints || (u.has_key ? [u.key_hint] : []))];
-  editKeyDeleted = new Set();
-  editKeyNew = [];
-  $("#eKeyHint").textContent = editKeyHints.length
-    ? `(${editKeyHints.length} \u4e2a Key)` : "(\u6ca1\u6709 Key)";
-  renderKeyList(editKeyHints);
+  const hints = u.key_hints || (u.has_key ? [u.key_hint] : []);
+  const names = u.key_names || [];
+  const dis = u.key_disabled || [];
+  editModels = [...(u.selected_models || [])];
+  editKeys = hints.map((h, i) => ({ id: i, name: names[i] || "", hint: h, typed: "",
+                                    enabled: !dis[i],
+                                    model: editModels[0] || "" }));
+  renderKeyList();
   $("#eKeyStrategy").value = u.key_strategy || "failover";
-  $("#eKeyStrategyWrap").style.display = editKeyHints.length > 1 ? "" : "none";
   $("#eEnabled").checked = u.enabled;
   const cap = u.capacity || {};
   $("#eCapC").value = cap.max_concurrent == null ? "" : cap.max_concurrent;
@@ -2325,9 +2451,9 @@ function editUpstream(id) {
 }
 
 $("#eAddKey").onclick = () => {
-  editKeyHints.push("(\u65b0)  ");
-  renderKeyList(editKeyHints);
-  $("#eKeyStrategyWrap").style.display = editKeyHints.length > 1 ? "" : "none";
+  syncEditKeys();
+  editKeys.push({ id: null, name: "", hint: "", typed: "", enabled: true });
+  renderKeyList();
   const inputs = $("#eKeyList").querySelectorAll(".ekey-input");
   if (inputs.length) inputs[inputs.length - 1].focus();
 };
@@ -2340,13 +2466,13 @@ async function saveUpstreamEdit() {
     const n = Math.floor(Number(raw));
     return Number.isFinite(n) && n > 0 ? n : 0;
   };
-  // 收集 Key 列表：有输入的用新值，留空的保留原值（发空串让后端保持不变）
-  const keyInputs = $("#eKeyList").querySelectorAll(".ekey-input");
-  const keys = [];
-  keyInputs.forEach(inp => {
-    const v = inp.value.trim();
-    keys.push(v); // 空串 = 保持原值，后端会处理
-  });
+  // 收集 Key 列表：整表按当前顺序提交（名字 + 下标 + 启用状态 + 这次输入的 Key 值；
+  // 老 Key 留空 = 后端保留原值，新增行留空 = 不添加）
+  syncEditKeys();
+  const keys = editKeys
+    .map(k => ({ id: k.id, name: k.name, key: (k.typed || "").trim(),
+                 enabled: k.enabled !== false }))
+    .filter(k => k.key || k.id != null);
   const patch = {
     id: editId,
     name: $("#eName").value.trim(),

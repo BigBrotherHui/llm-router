@@ -37,7 +37,7 @@ import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any, Optional
 
-__version__ = "2.4.4"
+__version__ = "2.4.8"
 
 WEBUI_FILENAME = "webui.html"
 
@@ -564,6 +564,14 @@ class Upstream:
         else:
             self.api_keys = []
         self.api_key: str = self.api_keys[0] if self.api_keys else ""
+        # 每个 Key 的名字（可空），与 api_keys 一一对应
+        raw_names = cfg.get("api_key_names") or []
+        names = [str(n) for n in raw_names] if isinstance(raw_names, list) else []
+        self.api_key_names: list[str] = (names + [""] * len(self.api_keys))[:len(self.api_keys)]
+        # 每个 Key 是否被禁用（禁用 = 保留但不参与轮转/故障切换），同样一一对应
+        raw_dis = cfg.get("api_key_disabled") or []
+        dis = [bool(x) for x in raw_dis] if isinstance(raw_dis, list) else []
+        self.api_key_disabled: list[bool] = (dis + [False] * len(self.api_keys))[:len(self.api_keys)]
         self._key_index: int = 0  # 当前使用的 Key 下标
         # Key 策略：failover = 一直用当前的，出错才切；round_robin = 每次轮转
         self.key_strategy: str = str(cfg.get("key_strategy") or "failover")
@@ -801,6 +809,8 @@ class Upstream:
                 "has_key": bool(self.api_keys),
                 "key_count": len(self.api_keys),
                 "key_hints": [mask_key(k) for k in self.api_keys],
+                "key_names": list(self.api_key_names),
+                "key_disabled": list(self.api_key_disabled),
                 "key_strategy": self.key_strategy,
                 "available_models": list(self.available_models),
                 "selected_models": list(self.selected()),
@@ -836,6 +846,11 @@ class Upstream:
             "name": self.name,
             "base_url": self.base_url,
             "api_keys": list(self.api_keys),
+            # 名字全空就不写，老状态文件保持干净
+            **({"api_key_names": list(self.api_key_names)} if any(self.api_key_names) else {}),
+            # 一个都没禁用就不写
+            **({"api_key_disabled": list(self.api_key_disabled)}
+               if any(self.api_key_disabled) else {}),
             "key_strategy": self.key_strategy,
             "enabled": self.enabled,
             "available_models": list(self.available_models),
@@ -852,36 +867,53 @@ class Upstream:
             **({"user_agent": self.user_agent} if self.user_agent else {}),
         }
 
+    def usable_key_count(self) -> int:
+        """没被禁用的 Key 数。"""
+        return sum(1 for d in self.api_key_disabled if not d)
+
     def _next_key(self) -> str:
-        """根据 key_strategy 取 Key。failover 一直用当前的，round_robin 每次换。"""
+        """根据 key_strategy 取 Key（跳过被禁用的）。
+
+        failover 一直用当前的（当前被禁用就往后找第一个可用的）；
+        round_robin 每次从当前位置往后找下一个可用的。
+        全被禁用 = 没 Key 可用（请求不带 Authorization 发出去）。
+        """
         keys = self.api_keys
-        if not keys:
+        n = len(keys)
+        if not n:
             return ""
-        if len(keys) == 1:
-            return keys[0]
         with self._lock:
-            if self.key_strategy == "round_robin":
-                idx = self._key_index % len(keys)
-                self._key_index = idx + 1
-                return keys[idx]
-            else:  # failover: 一直用当前的
-                return keys[self._key_index % len(keys)]
+            for step in range(n):
+                idx = (self._key_index + step) % n
+                if not self.api_key_disabled[idx]:
+                    self._key_index = idx + 1 if self.key_strategy == "round_robin" else idx
+                    return keys[idx]
+            return ""
 
     def rotate_key(self, failed_key: str) -> bool:
-        """failover 模式下，当前 Key 出错时切到下一个。返回是否还有别的 Key 可试。"""
+        """failover 模式下，当前 Key 出错时切到下一个可用的（跳过禁用的）。
+
+        返回是否还有别的 Key 可试。
+        """
         keys = self.api_keys
-        if len(keys) <= 1:
+        n = len(keys)
+        if n <= 1:
             return False
         with self._lock:
-            cur = self._key_index % len(keys)
-            if keys[cur] == failed_key:
-                self._key_index = cur + 1
-                return True
+            cur = self._key_index % n
+            if keys[cur] != failed_key:
+                return False
+            for step in range(1, n):
+                idx = (cur + step) % n
+                if not self.api_key_disabled[idx]:
+                    self._key_index = idx
+                    return True
             return False
 
     # ---- 请求上游 ----
     def headers(self, content_type: str = "application/json",
-                accept: str = "application/json") -> dict[str, str]:
+                accept: str = "application/json",
+                key: Optional[str] = None) -> dict[str, str]:
         h = {
             "Content-Type": content_type,
             "Accept": accept,
@@ -889,9 +921,11 @@ class Upstream:
             "Accept-Encoding": "identity",
             "User-Agent": self.user_agent or f"llm-router/{__version__}",
         }
-        key = self._next_key()
-        if key:
-            h["Authorization"] = f"Bearer {key}"
+        # key 参数 = 指定用哪个 Key（逐 Key 测试用，不碰轮转下标）；
+        # 不传就按 key_strategy 取。
+        k = key if key is not None else self._next_key()
+        if k:
+            h["Authorization"] = f"Bearer {k}"
         return h
 
     def open(self, method: str, path: str, data: Optional[bytes] = None,
@@ -1220,12 +1254,17 @@ class Upstream:
                 "context_chars": len(long_messages[0]["content"])}
 
     # ---- 测速 ----
-    def ping(self, model: Optional[str] = None) -> dict:
+    def ping(self, model: Optional[str] = None, key: Optional[str] = None,
+             remember: bool = True) -> dict:
         """给上游发一个最小请求测延迟。
 
         不是「能连上」就叫成功：429/限流这类是**临时**状态 ——
         Key 是好的、地址也对，只是这会儿不让调。这种情况单独标成
         rate_limited，界面上和「真挂了」区分开，免得把限流误当成配置错误。
+
+        key 参数 = 用指定的 Key 测（逐 Key 测试），不传就按策略取；
+        remember=False 时结果不写进「最近测试」（逐 Key 测试不该覆盖
+        卡片上按正常轮转得到的最近结果）。
         """
         target = model or (self.available_models[0] if self.available_models else None)
         if not target:
@@ -1239,7 +1278,7 @@ class Upstream:
         t0 = time.time()
         try:
             conn, resp, _ = self.open("POST", "/chat/completions", data=payload,
-                                      headers=self.headers())
+                                      headers=self.headers(key=key))
             latency = time.time() - t0
             body = resp.read()
             ctype = resp.getheader("Content-Type") or ""
@@ -1273,13 +1312,15 @@ class Upstream:
             result = {"id": self.id, "name": self.name, "ok": ok, "status": resp.status,
                       "latency_seconds": round(latency, 3), "model": target,
                       "error": error, "rate_limited": rate_limited, "at": time.time()}
-            self._remember_check(result)
+            if remember:
+                self._remember_check(result)
             return result
         except Exception as exc:  # noqa: BLE001
             result = {"id": self.id, "name": self.name, "ok": False, "latency_seconds": None,
                       "model": target, "error": f"{type(exc).__name__}: {exc}",
                       "rate_limited": False, "at": time.time()}
-            self._remember_check(result)
+            if remember:
+                self._remember_check(result)
             return result
         finally:
             self._close(conn)
@@ -2665,17 +2706,41 @@ class Router:
                 up.api_keys[0] = up.api_key
             else:
                 up.api_keys = [up.api_key]
+                up.api_key_names = [""]
+                up.api_key_disabled = [False]
         if payload.get("api_keys") is not None:
             raw = payload["api_keys"]
-            merged = []
-            for i, k in enumerate(raw):
-                v = str(k).strip()
-                if v:  # 有新值就用新值
-                    merged.append(v)
-                elif i < len(up.api_keys):  # 空串 = 保留原值
-                    merged.append(up.api_keys[i])
-                # 否则跳过（新增的空行 = 删除）
+            merged: list[str] = []
+            merged_names: list[str] = []
+            merged_dis: list[bool] = []
+            for i, item in enumerate(raw):
+                if isinstance(item, dict):
+                    # 新格式：{id, name, key, enabled}。id 是打开编辑框时该 Key 在列表里的下标；
+                    # key 留空 = 保留原值，新增行（没有 id）留空 = 不添加；
+                    # enabled 缺省 = 启用。条目顺序 = 保存后的顺序。
+                    v = str(item.get("key") or "").strip()
+                    name = str(item.get("name") or "").strip()
+                    disabled = not bool(item.get("enabled", True))
+                    idx = item.get("id")
+                    if not v and isinstance(idx, int) and 0 <= idx < len(up.api_keys):
+                        v = up.api_keys[idx]
+                else:
+                    # 老格式：纯字符串列表，空串 = 按位置保留原 Key（兼容旧调用方）
+                    v = str(item).strip()
+                    name = ""
+                    disabled = False
+                    if not v and i < len(up.api_keys):
+                        v = up.api_keys[i]
+                if not v:
+                    continue  # 空 Key 不添加
+                merged.append(v)
+                merged_names.append(name)
+                merged_dis.append(disabled)
+            if merged != up.api_keys:
+                up._key_index = 0  # 顺序/内容变了，从第一个 Key 重新开始
             up.api_keys = merged
+            up.api_key_names = merged_names
+            up.api_key_disabled = merged_dis
             up.api_key = up.api_keys[0] if up.api_keys else ""
         if payload.get("key_strategy") is not None:
             ks = str(payload["key_strategy"])
@@ -4906,6 +4971,35 @@ class Handler(BaseHTTPRequestHandler):
 
         def go():
             payload = self._read_json_body()
+            # 逐 Key 测试（编辑弹窗每个 Key 行上的「测」按钮）：
+            # 用指定的 Key 发一个最小请求——不参与轮转（不推进 failover/round-robin
+            # 的当前下标），结果也不写「最近测试」（不覆盖卡片上的正常结果）。
+            # key_index 定位已保存的 Key；key_value 直接测还没保存的新值。
+            key_test = payload.get("key_test")
+            if isinstance(key_test, dict):
+                up = self.router.find_upstream(str(key_test.get("id") or ""))
+                if up is None:
+                    raise KeyError("找不到这个上游")
+                idx = key_test.get("key_index")
+                key = str(key_test.get("key_value") or "").strip()
+                if not key:
+                    if not isinstance(idx, int) or not (0 <= idx < len(up.api_keys)):
+                        raise ValueError("这个 Key 不存在，先保存再测")
+                    key = up.api_keys[idx]
+                # 前端每行下拉传来要测的模型（候选 = 上游勾选的模型）；
+                # 不传就退回「第一个已选，否则第一个可用」。
+                model = str(key_test.get("model") or "").strip()
+                if not model:
+                    model = (list(up.selected()) or list(up.available_models) or [None])[0]
+                if not model:
+                    raise ValueError("先拉取并勾选模型，再测 Key")
+                result = up.ping(str(model), key=key, remember=False)
+                result["key_index"] = idx if isinstance(idx, int) else None
+                result["key_hint"] = mask_key(key)
+                result["key_name"] = (up.api_key_names[idx]
+                                      if isinstance(idx, int) and 0 <= idx < len(up.api_key_names)
+                                      else "")
+                return {"ok": True, "result": result}
             # tests: [{"id": 上游, "model": 该上游上的真实模型名}] —— 精确测某个模型
             # 模型路由弹窗里每行一个「测试」按钮走这条路径。
             tests = payload.get("tests")
@@ -5270,8 +5364,9 @@ class Handler(BaseHTTPRequestHandler):
             data = json.dumps(new_payload, ensure_ascii=False).encode("utf-8")
 
         # Key 级别重试：failover 策略下 401/403/429 换下一个 Key 重试同一个上游
+        # （次数按没被禁用的 Key 算；都被禁用就没什么可换的）
         _KEY_ERR = {401, 403, 429}
-        _key_tries = len(up.api_keys) if (up.key_strategy == "failover" and len(up.api_keys) > 1) else 1
+        _key_tries = max(1, up.usable_key_count()) if up.key_strategy == "failover" else 1
 
         for _kt in range(_key_tries):
             headers = up.headers(

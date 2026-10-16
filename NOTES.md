@@ -1,5 +1,119 @@
 # NOTES
 
+## 2026-10-16 v2.4.8：Key 支持禁用/启用（不是只有删除）
+
+需求：上游里的 Key 要能禁用/启用，不能只有删除（临时坏 Key 想留着观察，不想删了重加）。
+
+做法：
+- 数据模型：`api_keys`/`api_key_names` 旁边再加平行列表 `api_key_disabled`（一一对应）；
+  构造时按 keys 长度补齐；全 false 不落盘；`snapshot()` 带 `key_disabled`。
+- 轮转：`_next_key()` 跳过禁用的（failover 当前被禁用就往后找第一个可用的；
+  round_robin 每次往后找下一个可用的；**全禁用 = 无 Key 可用，请求不带 Authorization**）。
+  `rotate_key()` 换 Key 时跳过禁用的；`_try_upstream` 的 Key 重试次数按**可用 Key 数**算
+  （只剩 1 个可用时 401 不空转）。新增 `usable_key_count()`。
+- 保存协议：`api_keys` 条目加 `enabled` 字段（缺省 = 启用，旧调用方不受影响）；`enabled:false`
+  = 禁用。禁用只影响使用，Key 本体、名字、位置都保留。
+- 逐 Key 测试不受禁用影响：禁用的 Key 也能单独测（测通了再启用）。
+- `webui.html`：每个 Key 行加启用勾选框（取消勾选 = 禁用，整行变淡）；
+  卡片徽标带「（N 禁用）」/ 单 Key「（已禁用）」，tooltip 里逐个标。
+- `selftest.py`：第 35 组补 5 项（禁用不删除 / failover 跳过 / round_robin 跳过 /
+  禁用 Key 可单测 / 禁用状态随重启持久化 + 只剩一个可用时 401 不重复试）。
+
+验证：`python selftest.py` **499 项全过**；8010 已重启到 2.4.8。未做浏览器实测。
+
+## 2026-10-16 v2.4.7：逐 Key 测试支持选模型（从该上游勾选的模型里选）
+
+需求：v2.4.6 的逐 Key 测试没得选模型，每行要能选模型测，候选 = 上游勾选的模型。
+
+做法：
+- `webui.html`：编辑弹窗每个 Key 行加模型下拉（候选 `u.selected_models`，默认第一个；
+  一行没勾选模型时下拉显示「没勾选模型」且测按钮禁用）；选中项记在条目 `k.model` 上，
+  重排/重绘不丢；测请求带上 `model`。
+- `router.py`：`/admin/speedtest` 的 `key_test` 接受 `model`（前端下拉传来）；
+  不传仍退回「第一个已选，否则第一个可用」（脚本调用兼容）。
+- `selftest.py`：第 35 组补 2 项（指定模型真发了该模型；可指定另一个已勾选模型）。
+
+验证：`python selftest.py` **494 项全过**；8010 已重启到 2.4.7。
+
+## 2026-10-16 v2.4.6：多 Key 逐个测试（编辑弹窗每行的「测」）
+
+背景：测速/详细测试/拉模型都走 `_next_key()` —— failover 下永远只用「当前 Key」
+（列表第 1 个），5 个 Key 里坏的那几个测不出来；round-robin 下每发一次换一个但不可控。
+聊天路径的 401/403/429 换 Key 重试只发生在真实调用，测试路径不换。
+
+做法：
+- `Upstream.headers(key=...)`：可指定用哪个 Key，**不碰轮转下标**（不传仍走 `_next_key()`）。
+- `Upstream.ping(model, key=..., remember=False)`：可指定 Key 测；
+  `remember=False` 时结果不写「最近测试」——逐 Key 测试不该覆盖卡片上正常轮转得到的最近结果。
+- `/admin/speedtest` 新增 `key_test` 分支：`{id, key_index}` 测已保存的 Key（按存储下标定位，
+  与编辑框里的显示位置无关）；`{id, key_value}` 直接测还没保存的新值（保存前先验证）；
+  模型取「第一个已选，否则第一个可用」。返回常规 ping 结果 + key_index/key_hint/key_name。
+- `webui.html`：编辑弹窗每个 Key 行加「测」按钮 + 结果位（✓ 延迟 / 限流 / ✗ 状态码，
+  title 里带错误详情和所用模型）；新增行没输入 Key 时按钮禁用、输入后自动可用；
+  结果记在条目上，重排/重绘不丢。
+- 安全：`key_value` 走管理接口，审计白名单不含 key_test，Key 不会进 admin.log。
+
+验证：`python selftest.py` **492 项全过**（第 35 组补 6 项：指定 Key 测/不碰轮转下标/
+测未保存值不落库/不写「最近测试」）。顺带修组 35 一处测试前置错误：选模型前要先
+`fetch-models`，否则 `select-models` 被静默忽略，聊天走了「未配置按上游顺序兜底」路径。
+8010 已重启到 2.4.6。未做浏览器实测。
+
+## 2026-10-16 v2.4.5：多 Key 支持命名与排序
+
+需求：一个上游能配多个 Key，但 Key 不能起名字、不能交换顺序。
+
+做法：
+- 数据模型：`api_keys` 仍是 `list[str]`（列表顺序就是使用顺序：failover 第一个优先、
+  round-robin 轮转序），新增**平行列表** `api_key_names`（可空，与 keys 一一对应）。
+  构造时按 keys 长度补齐/截断；`state()` 仅在有名字时落盘 `api_key_names`（老状态文件保持干净）；
+  `snapshot()` 带出 `key_names`。
+- 保存协议（`/admin/upstream/update` 的 `api_keys`）：改为**整表提交**
+  `[{id, name, key}]`——`id` = 打开编辑框时该 Key 在列表里的下标（跟着 Key 走，不跟位置走），
+  `key` 留空 = 保留该 id 的原值；**条目顺序 = 保存后的顺序**（交换顺序就是靠这个）；
+  整表里没带的 id = 删除。纯字符串旧格式仍兼容（空串按位置保留、新值追加）。
+  id 语义放在「本次请求开始时的列表」上，单用户编辑无并发问题。
+- Key 列表顺序/内容变了 → `_key_index` 重置为 0（failover 从新列表第一个重新开始）。
+- `webui.html`：编辑弹窗每行 = ↑/↓ 移动 + 名字输入 + Key 输入 + 打码值 + 删除；
+  重排/删除前先把当前输入收回 `editKeys`（否则输入的 Key 会丢）；
+  卡片 Key 徽标：单 Key 显示名字（没名字显示打码值），多 Key tooltip 列出「名字 打码值」。
+- `selftest.py`：假上游记录 `Authorization`（`auths`，验证真正发的哪个 Key）；
+  第 35 组 12 项（命名/改名/重排/按 id 改值/删除/老格式兼容/持久化/failover 顺序）。
+- 安全：审计日志白名单不含 `api_keys`，新协议不会把 Key 写进 admin.log。
+
+验证：`python selftest.py` **486 项全过**（首轮 7 项 journal 计数失败是上轮遗留的
+`_test_*` 流水脏数据，清掉后二轮全过）；webui 内联 JS 过 `node --check`。
+未做浏览器实测（上传/重排交互靠代码审查，布局沿用了原来的 `.row`（flex-wrap））。
+
+## 2026-10-16 反代「又不能用了」= 上游免费档 429 限流
+
+现象：`localrouter/deepseek-v4.1-flash-free` 报错。排查结论：**不是配置坏了**。
+8010（llm-router）与 8011（opencode2api）均在运行、健康；`python verify.py` 的链路此前已通过。
+
+根因：opencode.ai 免费档对本机返回 **HTTP 429**。反代日志明确 `legs":"anon:429:...`，
+随后代理把匿名通道判为不健康，返回 502「no healthy anonymous proxies available」。
+交叉验证：**官方 CLI 同一时刻也失败/超时** —— 说明是上游按 IP/时间窗对免费档限流，与自编译无关。
+（另注：直连上游若缺 `x-opencode-session`/`x-opencode-session-id`/`x-opencode-project` 头会得 403
+FreeTierError；反代自带这些头，所以能过门禁、只在限流时 429。）
+
+可选缓解：等限流窗口恢复；换出口 IP；给反代配 `zen_keys`（官方文档称免费模型可用配置的 key 兜底）；
+把免费模型设为手动控制以减少自动探测流量。
+
+已做（#4，仅探测 DS）：编辑 `.llmrouter/opencode2api/config.json.609206f1a8.availability.json`，
+把其余 9 个免费模型设为 `manual:true / reason:manually_enabled`（`AvailabilityStore` 调度里 `if item.Manual { continue }` 跳过探测），
+只留 `deepseek-v4.1-flash-free` 自动探测；停→改→重启（start-proxy.ps1）后验证：一个调度周期内无任何 `availability_checked` 行。
+注意：运行中的进程会覆盖该文件，改前必须先停进程。
+
+未做（#3，Zen key 兜底）：无法代注册账号（需本人邮箱/交互式登录，Console 取 key 可能需绑定计费）。待用户提供 key 后填 `zen_keys` 并重启。
+
+### 2026-10-16 已配 key，但 DS free 仍 429（按模型限流）
+
+- 用户提供 Console key，填入 `config.json` 的 `zen_keys`，重启后 `/healthz` 显示 `"zen":1`，日志确认 key 被使用（`key_id":"kfYbd"`）。
+- DS 4.1 Flash Free 仍 429：日志 `legs":"anon:429 kfYbd:429 kfYbd:429 kfYbd:429` —— **匿名与 key 两条通道都被上游 429**，key 绕不过该限流（按模型限流，与鉴权无关）。
+- key 本身有效但**账号无余额**：付费模型 `deepseek-v4.1-flash` 直连返回 `402 Insufficient account funds`。
+- 同期其他免费模型正常：`cat-jam-free`、`longcat-2.5-preview-free` 经反代实测返回 `BANANA`（内容正常）。
+- 结论：DS free 当前不可用是**上游按模型限流**，非本机配置或 key 问题。可选：等限流恢复；充值用 DS 付费版（key 已就位）；先用可用的免费模型。
+
+
 ## 2026-10-16 OpenCode Free 本地反代接入
 
 - 部署 GitHub `jasonxu114514/opencode2api` v1.4.0（25afadd30345faaa9c6f18c45c0c14b176862b89），Windows amd64 发布包 SHA256 与官方校验文件一致。
