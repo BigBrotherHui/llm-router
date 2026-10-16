@@ -37,7 +37,7 @@ import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any, Optional
 
-__version__ = "2.4.3"
+__version__ = "2.4.4"
 
 WEBUI_FILENAME = "webui.html"
 
@@ -570,6 +570,10 @@ class Upstream:
         if self.key_strategy not in ("failover", "round_robin"):
             self.key_strategy = "failover"
         self.enabled: bool = bool(cfg.get("enabled", True))
+        # 自定义 User-Agent：有些上游（如 agentrouter）按客户端 UA 放行，
+        # UA 不在它的白名单里直接 401（"unauthorized client detected"）。
+        # 留空用默认 llm-router/<版本>。
+        self.user_agent: str = str(cfg.get("user_agent") or "").strip()
 
         # 拉取到的模型列表（运行时状态，会持久化）
         raw_models = cfg.get("available_models") or []
@@ -822,6 +826,7 @@ class Upstream:
                 "capacity": self.capacity_state(),
                 # 最近一次余额查询结果（没查过就是 None）
                 "balance": self.balance,
+                "user_agent": self.user_agent,
             }
 
     def state(self) -> dict:
@@ -844,6 +849,7 @@ class Upstream:
             # 只在上限设过时才写，保持老状态文件干净
             **({"max_concurrent": self.max_concurrent} if self.max_concurrent else {}),
             **({"max_per_minute": self.max_per_minute} if self.max_per_minute else {}),
+            **({"user_agent": self.user_agent} if self.user_agent else {}),
         }
 
     def _next_key(self) -> str:
@@ -881,7 +887,7 @@ class Upstream:
             "Accept": accept,
             # 关键：不要 gzip，否则 SSE 会被缓冲，流式就废了
             "Accept-Encoding": "identity",
-            "User-Agent": f"llm-router/{__version__}",
+            "User-Agent": self.user_agent or f"llm-router/{__version__}",
         }
         key = self._next_key()
         if key:
@@ -2618,6 +2624,7 @@ class Router:
             "selected_models": [],
             "max_concurrent": payload.get("max_concurrent"),
             "max_per_minute": payload.get("max_per_minute"),
+            "user_agent": payload.get("user_agent") or "",
         }, len(self.upstreams))
         up.cooldown = self.cooldown_default
         self.upstreams.append(up)
@@ -2628,6 +2635,7 @@ class Router:
         up = self.find_upstream(payload.get("id"))
         if up is None:
             raise KeyError(f"找不到上游 {payload.get('id')!r}")
+        uid = up.id
         if payload.get("name") is not None:
             up.name = str(payload["name"]).strip() or up.name
         if payload.get("base_url") is not None:
@@ -2680,6 +2688,9 @@ class Router:
             up.max_concurrent = self._pos_int(payload.get("max_concurrent"))
         if "max_per_minute" in payload:
             up.max_per_minute = self._pos_int(payload.get("max_per_minute"))
+        # 空串 = 回到默认 UA（llm-router/<版本>）
+        if "user_agent" in payload:
+            up.user_agent = str(payload.get("user_agent") or "").strip()
         self._save_state()
         return up
 

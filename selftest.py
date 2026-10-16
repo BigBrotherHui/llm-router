@@ -25,6 +25,8 @@ hits: dict[str, list] = {"a": [], "b": [], "c": [], "d": []}
 # 每个假上游收到的完整请求体（hits 只记模型名）。
 # 验「请求转换对不对」时必须看真正发上去的东西，光看模型名不够。
 bodies: dict[str, list] = {"a": [], "b": [], "c": [], "d": []}
+# 每个假上游收到的 User-Agent（验「UA 覆盖」在真正发出去的请求上生效）。
+uas: dict[str, list] = {"a": [], "b": [], "c": [], "d": []}
 behavior: dict[str, str] = {"a": "ok", "b": "ok", "c": "ok", "d": "ok"}
 # 每个假上游的人工延迟（秒），用来让「按测速重排」的结果可预测
 delay: dict[str, float] = {"a": 0.0, "b": 0.0, "c": 0.0, "d": 0.0}
@@ -116,6 +118,7 @@ class UpstreamServer(BaseHTTPRequestHandler):
             return self._json(200, {"object": "list", "total_usage": used})
         if path.endswith("/models"):
             with lock:
+                uas[self.tag].append(self.headers.get("User-Agent") or "")
                 behave = behavior[self.tag]
             if behave == "models_fail":
                 return self._json(500, {"error": {"message": f"{self.tag} 拉取失败"}})
@@ -142,6 +145,7 @@ class UpstreamServer(BaseHTTPRequestHandler):
         with lock:
             hits[self.tag].append(model)
             bodies[self.tag].append(body)
+            uas[self.tag].append(self.headers.get("User-Agent") or "")
             behave = behavior[self.tag]
             wait = delay.get(self.tag, 0.0)
         if wait:
@@ -472,6 +476,8 @@ def reset_hits():
             hits[k].clear()
         for k in bodies:
             bodies[k].clear()
+        for k in uas:
+            uas[k].clear()
 
 
 def cleanup():
@@ -2849,6 +2855,59 @@ def main():
         st, r = admin("/admin/balance", {"ids": ["不存在"]})
         check("不存在的上游返回空结果", st == 200 and r.get("results") == [],
               str(r)[:200])
+    finally:
+        stop_router(p)
+
+    # ================= 34. 上游 User-Agent 覆盖 =================
+    # agentrouter 这类上游按客户端 UA 放行，UA 不对直接 401
+    # （"unauthorized client detected"），所以要能按上游覆盖默认 UA。
+    print("\n[34] 上游 User-Agent 覆盖")
+    cfg = write_config()
+    p = start_router(cfg)
+    try:
+        st, r = admin("/admin/upstream/update",
+                      {"id": "a1", "user_agent": "claude-cli/2.0.30 (external, cli)"})
+        check("保存 user_agent 成功", st == 200, f"{st} {str(r)[:150]}")
+        st, snap = get("/stats")
+        ua = next(u.get("user_agent") for u in snap["upstreams"] if u["id"] == "a1")
+        check("snapshot 带出 user_agent",
+              ua == "claude-cli/2.0.30 (external, cli)", str(ua))
+
+        reset_hits()
+        admin("/admin/fetch-models", {"ids": ["a1"]})
+        check("拉取模型时发的是自定义 UA",
+              uas["a"] and uas["a"][-1] == "claude-cli/2.0.30 (external, cli)",
+              str(uas["a"]))
+
+        admin("/admin/select-models", {"id": "a1", "models": ["deepseek-chat"]})
+        reset_hits()
+        admin("/v1/chat/completions", {"model": "deepseek-chat",
+                                       "messages": [{"role": "user", "content": "hi"}]})
+        check("聊天请求也带自定义 UA",
+              uas["a"] and uas["a"][-1] == "claude-cli/2.0.30 (external, cli)",
+              str(uas["a"]))
+
+        # 清空 = 回到默认 UA
+        admin("/admin/upstream/update", {"id": "a1", "user_agent": ""})
+        reset_hits()
+        admin("/v1/chat/completions", {"model": "deepseek-chat",
+                                       "messages": [{"role": "user", "content": "hi"}]})
+        check("清空后回到默认 UA",
+              uas["a"] and uas["a"][-1].startswith("llm-router/"), str(uas["a"]))
+
+        # 自定义 UA 要随状态持久化（重启后还在）
+        admin("/admin/upstream/update", {"id": "a1", "user_agent": "Cline/3.0.0"})
+        stop_router(p)
+        p = start_router(cfg)
+        st, snap = get("/stats")
+        ua = next(u.get("user_agent") for u in snap["upstreams"] if u["id"] == "a1")
+        check("user_agent 随状态持久化（重启后还在）", ua == "Cline/3.0.0", str(ua))
+
+        # 顺带回归：老代码改 base_url 时引用未定义的 uid 会 NameError 崩，
+        # 正常行为应是换地址成功、旧模型与路由摘除。
+        st, r = admin("/admin/upstream/update",
+                      {"id": "a1", "base_url": f"http://127.0.0.1:{UP_PORTS['b']}/v1"})
+        check("改 base_url 不再 NameError 崩", st == 200, f"{st} {str(r)[:150]}")
     finally:
         stop_router(p)
 

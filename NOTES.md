@@ -1,5 +1,42 @@
 # NOTES
 
+## 2026-10-16 OpenCode Free 本地反代接入
+
+- 部署 GitHub `jasonxu114514/opencode2api` v1.4.0（25afadd30345faaa9c6f18c45c0c14b176862b89），Windows amd64 发布包 SHA256 与官方校验文件一致。
+- 文件位于 `.llmrouter/opencode2api/`；API `127.0.0.1:8011`，管理 UI 关闭，匿名免费上游。配置 `config.json`，幂等启动脚本 `start-proxy.ps1`；Startup 中 `opencode-free-proxy.cmd` 在登录时启动。
+- 使用现有 admin API 新增上游 `opencode-free`，选中 `deepseek-v4.1-flash-free`，独立同名分组。8010 不需要重启；未合并进原 deepseek 路由。
+- OpenCode 全局配置 localrouter 增加此模型；调用 ID `localrouter/deepseek-v4.1-flash-free`。
+- 验证：`python .llmrouter/opencode2api/verify.py` 文本、SSE、工具调用及结果回传全部通过；源码 OpenCode 真实请求返回 OK，cost 0。
+- 此项目直接转发上游 HTTP，并非调用官方 CLI 子进程；兼容性依赖上游请求规范。固定版本更新需重新验证。正在运行的 OpenCode 需重载配置或重启以显示新增模型。
+
+## 2026-10-16 v2.4.4：上游可配 User-Agent（agentrouter 401「unauthorized client detected」）
+
+现象：新加的 agentrouter（agentrouter.org）拉模型报
+`HTTP 401：unauthorized client detected, contact support`，key 本身没问题。
+
+根因（实测 curl 对照）：**它按客户端 UA 白名单放行**。同一 key 同一路径，
+`claude-cli/2.0.30 (external, cli)` / `Cline/3.0.0` / `Kilo-Code/4.80.0` → 200；
+`llm-router/2.4.3`、浏览器 Chrome UA、`curl/8.5.0`、`Roo-Code`、`Cherry Studio` → 401。
+注意我们本来就发 UA（`llm-router/<版本>`），只是不在它的名单里；它的余额接口不查 UA，
+所以「余额能查、模型拉不到」会同时出现。
+
+做法（每上游可选 `user_agent`，留空 = 原默认 `llm-router/<版本>`）：
+- `router.py`：`Upstream.user_agent`（from cfg）；`headers()` 用它；
+  `state()/snapshot()` 带出（空不落盘，保持老状态文件干净）；
+  `add_upstream`/`update_upstream` 透传（空串 = 回默认）。
+  对上游所有请求生效（拉模型、测试、聊天、余额同一套 headers）。
+- `webui.html`：编辑上游弹窗新增「User-Agent」输入框（占位「默认」）。
+- `config.example.toml`：注释里说明用途与 agentrouter 的填法。
+- 顺带修：`update_upstream` 改 base_url 分支引用未定义的 `uid`（NameError），
+  补 `uid = up.id`；selftest 加了回归项。
+- `selftest.py`：假上游记录收到的 UA（`uas`）；第 34 组 7 项。
+
+验证：`python selftest.py` **474 项全过**；8010 重启到 2.4.4 后，
+给 agentrouter（u5c33b6）设 `claude-cli/2.0.30 (external, cli)` →
+`/admin/fetch-models` ok=True，拉到 4 个模型（claude-opus-5-5 / deepseek-v4-flash /
+gpt-6-astra / gpt-6.1-sol）。聊天路径也带该 UA（selftest 验过），但未花额度实测。
+UA 白名单是对方随时可改的东西，再 401 就换一个它认的 UA。
+
 ## 2026-10-15 v2.4.3：上游卡片加「余额查询」
 
 需求：给每个上游面板加余额查看。

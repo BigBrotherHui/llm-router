@@ -433,8 +433,10 @@
         </div>
 
         <div class="up-tools">
-          <input id="upSearch" class="filterbox" placeholder="搜索上游 / 模型（含未选的）…"
+          <input id="upSearch" class="filterbox" placeholder="搜索上游名字 / 地址 / 已选模型…"
                  style="min-width:200px">
+          <input id="upModelFind" class="filterbox" placeholder="找支持某模型的上游…"
+                 style="min-width:180px" title="按模型名筛选：会列出所有支持这个模型的上游，包括还没勾选的（颜色区分）">
           <span class="hint" id="upCount"></span>
           <div class="grow"></div>
           <select id="upEnabledFilter" style="font-size:12px;padding:5px 8px" title="按启用状态筛选">
@@ -604,6 +606,10 @@
       <label class="grid" style="gap:5px">
         <span class="hint">地址 (base_url)</span>
         <input id="eUrl" class="mono">
+      </label>
+      <label class="grid" style="gap:5px">
+        <span class="hint">User-Agent（留空用默认 llm-router；有些上游按 UA 放行，如 agentrouter 需填 <code>claude-cli/2.0.30 (external, cli)</code>）</span>
+        <input id="eUA" class="mono" placeholder="默认">
       </label>
       <div class="grid" style="gap:5px">
         <span class="hint">API Keys <span id="eKeyHint" class="muted"></span></span>
@@ -819,68 +825,70 @@ function renderUpstreams() {
     return;
   }
   const q = (($("#upSearch") && $("#upSearch").value) || "").trim().toLowerCase();
-  // 搜索：上游名字 / 地址 / 已选模型 / 分组名 / available_models(支持但未选)
+  // 通用搜索：上游名字 / 地址 / 已选模型的真实名 / 分组名
   const hit = u => {
     if (!q) return true;
     if ((u.name || "").toLowerCase().includes(q)) return true;
     if ((u.base_url || "").toLowerCase().includes(q)) return true;
     const sel = u.selected_models || [];
     const groups = u.model_groups || {};
-    if (sel.some(m => m.toLowerCase().includes(q)
-                     || (groups[m] || "").toLowerCase().includes(q))) return true;
-    const avail = u.available_models || [];
-    return avail.some(m => m.toLowerCase().includes(q));
+    return sel.some(m => m.toLowerCase().includes(q)
+                       || (groups[m] || "").toLowerCase().includes(q));
   };
-  // 模型搜索时的分类：判断该上游对搜索关键词的匹配类型
-  const matchType = u => {
-    if (!q) return "none";
+  // 模型搜索（独立输入框）：只筛「支持这个模型」的上游，含已拉取但未勾选的。
+  // 和通用搜索分开，避免搜模型名时把名字/地址碰巧相同的上游混进来。
+  const mq = (($("#upModelFind") && $("#upModelFind").value) || "").trim().toLowerCase();
+  const supports = u => {
+    if (!mq) return true;
     const sel = u.selected_models || [];
-    const groups = u.model_groups || {};
-    const selHit = sel.some(m => m.toLowerCase().includes(q)
-                               || (groups[m] || "").toLowerCase().includes(q));
-    if (selHit) return "selected";
     const avail = u.available_models || [];
-    if (avail.some(m => m.toLowerCase().includes(q))) return "available";
-    if ((u.name || "").toLowerCase().includes(q)) return "name";
-    if ((u.base_url || "").toLowerCase().includes(q)) return "name";
+    return sel.some(m => m.toLowerCase().includes(mq))
+        || avail.some(m => m.toLowerCase().includes(mq));
+  };
+  // 模型搜索的分类：selected=已勾选，available=支持但未勾选
+  const matchType = u => {
+    if (!mq) return "none";
+    const sel = u.selected_models || [];
+    if (sel.some(m => m.toLowerCase().includes(mq))) return "selected";
+    const avail = u.available_models || [];
+    if (avail.some(m => m.toLowerCase().includes(mq))) return "available";
     return "none";
   };
-  const shown = ups.filter(hit);
+  const shown = ups.filter(hit).filter(supports);
   // 启用状态筛选：hide=不含停用（默认）/ all=包含停用 / only=只看停用
   const ef = ($("#upEnabledFilter") && $("#upEnabledFilter").value) || "hide";
   const byEnabled = u => ef === "all" ? true : (ef === "only" ? !u.enabled : u.enabled);
   const filtered = shown.filter(byEnabled);
-  // 模型搜索时排序：支持但未选排最前，已选其次
-  if (q) {
-    const order = { available: 0, selected: 1, name: 2, none: 3 };
-    filtered.sort((a, b) => (order[matchType(a)] ?? 3) - (order[matchType(b)] ?? 3));
+  // 模型搜索时排序：支持但未选排最前（发现价值大），已选其次
+  if (mq) {
+    const order = { available: 0, selected: 1, none: 2 };
+    filtered.sort((a, b) => (order[matchType(a)] ?? 2) - (order[matchType(b)] ?? 2));
   }
   if (upSortDir < 0) filtered.reverse();
   if (!filtered.length) {
-    const why = q ? `没有匹配「${esc(q)}」的上游或模型。`
-                  : (ef === "only" ? "没有已停用的上游。" : "没有可显示的上游。");
+    const why = mq ? `没有上游支持模型「${esc(mq)}」。`
+                  : (q ? `没有匹配「${esc(q)}」的上游。`
+                       : (ef === "only" ? "没有已停用的上游。" : "没有可显示的上游。"));
     applyHtml("upstreams", $("#upstreams"), `<div class="empty">${why}</div>`);
     return;
   }
   shown.length = 0; shown.push(...filtered);
-  // search active: update upCount with legend
+  // 模型搜索激活时：图例 + 统计
   const uc = $("#upCount");
-  if (uc && q) {
+  if (uc && mq) {
     const nSel = shown.filter(u => matchType(u) === "selected").length;
     const nAvail = shown.filter(u => matchType(u) === "available").length;
-    const nOther = shown.length - nSel - nAvail;
     uc.innerHTML = `<span style="color:#16a34a">\u2588 \u5df2\u9009 ${nSel}</span>` +
       ` &nbsp;<span style="color:#b45309">\u2588 \u652f\u6301\u4f46\u672a\u9009 ${nAvail}</span>` +
-      (nOther ? ` &nbsp;<span style="color:var(--dim)">\u2588 \u540d\u79f0\u5339\u914d ${nOther}</span>` : "") +
       ` &nbsp;\u2014 \u5171 ${shown.length} / ${ups.length}`;
-  } else if (uc && !q) {
+  } else if (uc) {
     const nOn = ups.filter(u => u.enabled).length;
     uc.textContent = ups.length ? `${ups.length} \u4e2a\u4e0a\u6e38\uff0c\u5176\u4e2d ${nOn} \u4e2a\u5df2\u542f\u7528` : "";
   }
   const html = shown.map(u => {
     const t = lastTest[u.id];
     const cooling = u.cooldown_remaining_seconds > 0;
-    const mt = q ? matchType(u) : "none";
+    const mt = mq ? matchType(u) : "none";
     const cls = ["up", u.enabled ? "" : "off", cooling ? "cool" : "",
                  expanded[u.id] ? "open" : "",
                  mt === "available" ? "match-avail" : "",
@@ -2298,6 +2306,7 @@ function editUpstream(id) {
   editId = id;
   $("#eName").value = u.name;
   $("#eUrl").value = u.base_url;
+  $("#eUA").value = u.user_agent || "";
   editKeyHints = [...(u.key_hints || (u.has_key ? [u.key_hint] : []))];
   editKeyDeleted = new Set();
   editKeyNew = [];
@@ -2345,6 +2354,7 @@ async function saveUpstreamEdit() {
     enabled: $("#eEnabled").checked,
     max_concurrent: capNum($("#eCapC")),
     max_per_minute: capNum($("#eCapM")),
+    user_agent: $("#eUA").value.trim(),
     api_keys: keys,
     key_strategy: $("#eKeyStrategy").value || "failover",
   };
@@ -3019,7 +3029,8 @@ function renderTabNums() {
   const upsAll = state.upstreams || [];
   const nOn = upsAll.filter(u => u.enabled).length;
   const uCount = $("#upCount");
-  if (uCount) {
+  const modelFindOn = ($("#upModelFind") && $("#upModelFind").value || "").trim();
+  if (uCount && !modelFindOn) {
     uCount.textContent = upsAll.length
       ? `${upsAll.length} 个上游，其中 ${nOn} 个已启用` : "";
   }
@@ -3204,6 +3215,7 @@ $("#sideReqs").addEventListener("click", async e => {
 $("#addBtn").onclick = addUpstream;
 // 上游来源搜索：输入即筛(名字 / 地址 / 勾选模型的真实名 / 分组名)
 if ($("#upSearch")) $("#upSearch").addEventListener("input", renderUpstreams);
+if ($("#upModelFind")) $("#upModelFind").addEventListener("input", renderUpstreams);
 if ($("#upEnabledFilter")) $("#upEnabledFilter").addEventListener("change", renderUpstreams);
 ["newName", "newUrl", "newKey"].forEach(id => {
   $("#" + id).addEventListener("keydown", e => { if (e.key === "Enter") addUpstream(); });
