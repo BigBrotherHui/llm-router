@@ -37,7 +37,7 @@ import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any, Optional
 
-__version__ = "2.4.8"
+__version__ = "2.7.7"
 
 WEBUI_FILENAME = "webui.html"
 
@@ -66,9 +66,8 @@ def _looks_like_sse_head(head: bytes) -> bool:
     first = h.split(b"\n", 1)[0].strip()
     return first.startswith((b"data:", b"event:"))
 
-# 组里的上游全部因「并发/速率已满」被跳过时，最多等这么久碰运气（秒）。
-# 0 = 不等，直接回 429。等待只在**自己配的这些上游**之间排队，
-# 不会让请求无限期挂着。
+# 组里的上游全部因「每天上限用满」被跳过时，最多等这么久碰运气（秒）。
+# 0 = 不等，直接回 429。（v2.7 起保留兼容读取，但每天上限等也没用，已不再使用）
 QUEUE_TIMEOUT_DEFAULT = 15.0
 
 # 状态文件的历史版本保留份数（每次保存都会轮转出一份带时间戳的快照）。
@@ -83,6 +82,40 @@ ADMIN_LOG_SUFFIX = ".admin.log"
 
 # 上游返回这些状态码时，认为「这个上游有问题」，换下一个
 DEFAULT_RETRY_STATUS = {401, 403, 408, 409, 425, 429, 500, 502, 503, 504, 520, 521, 522, 523, 524}
+
+# 首包超时：连上后多久没收到**响应头**就放弃这次尝试（换下一个 Key / 换下一家）。
+# 收到响应头后就不再按它掐——正文/流式继续读，用 BODY_READ_TIMEOUT。
+# 全局默认值可在网页「设置」里改，改完覆盖到所有上游；单上游也能在编辑里单独配。
+DEFAULT_FIRST_TIMEOUT = 15.0
+DEFAULT_CONNECT_TIMEOUT = 10.0
+BODY_READ_TIMEOUT = 300.0
+
+# 后台维护线程多久跑一次（秒）：把「每天上限」的当天用量轻量落盘。
+# 计数走请求路径、不触发管理保存，不落盘的话进程重启后当天用量会归零。
+CAPACITY_FLUSH_INTERVAL = 30.0
+
+# 上游拒绝「这个模型/账户干不了这一单」时的特征文案（大小写不敏感）。
+# 已知案例：某些中转对工具调用要求 OpenAI Responses API，而账户只开 Chat Completions，
+# 带 tools 的请求被 400 拒绝（dli_gpt 的 gpt-6.1-sol 实见过）。
+# 这不是客户端请求写错了 —— 换 Key / 换下一个上游可能就能通，
+# 所以要当上游故障处理（换一家重试），不能把 400 原样甩给客户端。
+UPSTREAM_CAPABILITY_MARKERS = (
+    "requires responses for tool calls",
+    "only supports chat completions",
+    # sensenova 中转的 kimi-k3（2026-10-16 实见）：同一请求先被 429
+    # 「inference exceeds tpm/rpm limit」拒，客户端自动重试立刻又收到 400
+    # 「inference request is invalid / InvalidParameter」；同样大的请求随后实测正常，
+    # 属上游按账号/通道的间歇性拒绝。换一家（或换个时段）可能就能通，
+    # 所以按上游故障换下去，别把请求直接打死。
+    "inference request is invalid",
+)
+
+
+def looks_like_capability_error(body: bytes) -> bool:
+    """上游 4xx 正文像「能力受限」的拒绝（而非客户端请求本身有错）。"""
+    text = (body or b"").decode("utf-8", "replace").lower()
+    return any(marker in text for marker in UPSTREAM_CAPABILITY_MARKERS)
+
 
 VALID_STRATEGIES = ("priority", "round_robin", "random")
 
@@ -139,12 +172,15 @@ def describe_http_error(status: int, body: bytes = b"") -> str:
 class Retryable(Exception):
     """表示这个上游没成功、应该换下一个。"""
 
-    def __init__(self, upstream: "Upstream", status: int, body: bytes, reason: str = ""):
+    def __init__(self, upstream: "Upstream", status: int, body: bytes, reason: str = "",
+                 key_label: str = ""):
         super().__init__(reason or str(status))
         self.upstream = upstream
         self.status = status
         self.body = body
         self.reason = reason
+        # 这次失败尝试用的是哪个 Key（名字或打码值），请求记录里要能看见
+        self.key_label = key_label
 
 
 def mask_key(key: str) -> str:
@@ -168,6 +204,13 @@ def _to_float(value: Any) -> Optional[float]:
 
 # 历史记录里输入/输出的截断长度：够看清内容，又不至于把内存吃满
 HISTORY_TEXT_LIMIT = 4000
+
+# 「仅流式」模型的自动转流：客户端要非流式时，代理改发 stream=true，
+# 把 SSE 收完再拼回一份普通 chat.completion。
+# 这两个上限只是聚合阶段的护栏（万一上游吐流不停，别把内存和响应时间拖死），
+# 正常回答远小于此，不会触发。
+STREAM_UPGRADE_MAX_BYTES = 32 * 1024 * 1024
+STREAM_UPGRADE_MAX_SECONDS = 900.0
 
 
 def extract_usage(obj: Any) -> dict:
@@ -310,19 +353,86 @@ def response_to_text(body: bytes) -> tuple[str, dict, str]:
 
 
 def make_sse_collector() -> dict:
-    """收集流式响应里的文本和 usage（后面的 chunk 通常带 usage）。"""
-    return {"text": [], "reasoning": [], "usage": {}, "len": 0}
+    """收集流式响应里的文本、usage 和错误事件（后面的 chunk 通常带 usage）。"""
+    return {"text": [], "reasoning": [], "usage": {}, "len": 0, "error": "",
+            # 结束原因 + 工具调用增量：把流拼回非流式响应时要用
+            "finish": "", "tool_calls": {},
+            # 上一片没等到换行的那半行（按字节存，免得中文被切断）
+            "buf": b""}
 
 
 def collect_sse(chunk: bytes, acc: dict) -> None:
-    """从 SSE 原始分片里累积文本和 usage 到 acc。"""
+    """从 SSE 原始分片里累积文本、usage 和错误事件到 acc。
+
+    read1() 的分片边界完全是随机的，经常把一行 `data: {...}` 从中间劈开
+    （nexavlinks 实测按 256 字节切）。早先每个分片各自 split("\\n")，
+    被劈开的那行 json.loads 直接失败，里面的 content 就永久丢了 ——
+    表现是「上游明明出字了，代理回来的 content 却是空字符串」。
+    这里把最后一个还没等到换行的半行按**字节**留在 acc["buf"] 里，
+    等下一片接上再解析（存字节，中文不会被切坏）。
+    """
     acc["len"] += len(chunk)
-    text = chunk.decode("utf-8", "replace")
+    pending = acc.get("buf") or b""
+    data = pending + chunk if pending else chunk
+    if b"\n" not in data:
+        # 整片都没换行：先攒着。万一是始终不出换行的垃圾流，
+        # 攒到 1MB 就按原样解析掉，免得内存无限涨。
+        if len(data) < 1024 * 1024:
+            acc["buf"] = data
+            return
+        head, tail = data, b""
+    else:
+        head, _, tail = data.rpartition(b"\n")
+    acc["buf"] = tail
+    _parse_sse_lines(head.decode("utf-8", "replace"), acc)
+
+
+def flush_sse(acc: dict) -> None:
+    """收尾：把 collect_sse 留在缓冲里的最后半行也解析掉（流结束时用）。"""
+    pending = acc.get("buf") or b""
+    acc["buf"] = b""
+    if pending.strip():
+        _parse_sse_lines(pending.decode("utf-8", "replace"), acc)
+
+
+def buffered_sse_error(acc: dict) -> str:
+    """看缓冲里那半行是不是「没带换行的裸 JSON 错误」，是就返回错误消息。
+
+    有些中转在 200 的流里直接甩一行 `{"error":{"message":...}}` 且**不带换行**。
+    因为没有换行，这行会留在 acc["buf"] 里等下一片；可如果流就这么结束了，
+    等不到下一片 —— 发流前那道「首块里有错误就换上游」的拦截就会漏掉。
+    这里补一刀：缓冲里的内容如果已经是一个能解析完整的 JSON 对象，就当作
+    完整事件看一眼（不消费缓冲，交给 flush_sse 正常处理）。
+    """
+    pending = (acc.get("buf") or b"").strip()
+    if not (pending.startswith(b"{") and pending.endswith(b"}")):
+        return ""
+    try:
+        obj = json.loads(pending)
+    except Exception:  # noqa: BLE001
+        return ""
+    if not isinstance(obj, dict):
+        return ""
+    err = obj.get("error")
+    if not err:
+        return ""
+    if isinstance(err, dict):
+        return str(err.get("message") or err.get("type") or err)
+    return str(err)
+
+
+def _parse_sse_lines(text: str, acc: dict) -> None:
+    """解析已经切好行的 SSE 文本（collect_sse / flush_sse 共用）。"""
     for line in text.split("\n"):
         line = line.strip()
-        if not line.startswith("data:"):
+        if line.startswith("data:"):
+            payload = line[5:].strip()
+        elif line.startswith("{"):
+            # 有些网关（dli_gpt 实见）在 200 的流里塞一行**没有 data: 前缀**的
+            # 裸 JSON 错误 —— 标准 SSE 客户端会解析失败。当错误事件处理。
+            payload = line
+        else:
             continue
-        payload = line[5:].strip()
         if not payload or payload == "[DONE]":
             continue
         try:
@@ -331,6 +441,15 @@ def collect_sse(chunk: bytes, acc: dict) -> None:
             continue
         if not isinstance(obj, dict):
             continue
+        # 有些上游（中转/网关）在 200 的流里夹错误事件：
+        # {"error":{"message":"...","type":"upstream_error"}} 然后 [DONE]。
+        # 这不是正常回复，收集第一个，给调用方兜底（发流前拦截 / 不记成功）。
+        err = obj.get("error")
+        if err and not acc["error"]:
+            if isinstance(err, dict):
+                acc["error"] = str(err.get("message") or err.get("type") or err)
+            else:
+                acc["error"] = str(err)
         # usage 可能出现多次，取最后一次非空的
         got = extract_usage(obj)
         if got:
@@ -352,6 +471,116 @@ def collect_sse(chunk: bytes, acc: dict) -> None:
                     rc = delta.get("reasoning_content") or delta.get("reasoning")
                     if isinstance(rc, str) and rc:
                         acc["reasoning"].append(rc)
+                    # 流式工具调用是分片增量（名字/参数被切成好几段），
+                    # 按 index 攒起来，拼回非流式响应时要还原成完整 tool_calls
+                    for call in (delta.get("tool_calls") or []):
+                        if not isinstance(call, dict):
+                            continue
+                        key = call.get("index", 0)
+                        slot = acc["tool_calls"].setdefault(
+                            key, {"id": "", "type": "function",
+                                  "function": {"name": "", "arguments": ""}})
+                        if call.get("id"):
+                            slot["id"] += str(call["id"])
+                        if call.get("type"):
+                            slot["type"] = str(call["type"])
+                        fn = call.get("function")
+                        if isinstance(fn, dict):
+                            slot["function"]["name"] += str(fn.get("name") or "")
+                            slot["function"]["arguments"] += str(fn.get("arguments") or "")
+                fr = first.get("finish_reason")
+                if isinstance(fr, str) and fr:
+                    acc["finish"] = fr
+
+
+def looks_like_binary_stream(chunk: bytes) -> bool:
+    """200 的流里出现「不是 SSE 文本」的二进制（网关错误页 / 压缩内容）。
+
+    分片边界可能切断多字节字符，所以只有在完全看不到 SSE 结构时才判为垃圾。
+    """
+    if chunk[:2] == b"\x1f\x8b":          # gzip magic：不可能是合法 SSE
+        return True
+    if len(chunk) < 8:
+        return False
+    try:
+        chunk.decode("utf-8")
+        return False
+    except UnicodeDecodeError:
+        pass
+    head = chunk.lstrip()
+    return not (b"data:" in chunk or b"event:" in chunk or head.startswith(b":"))
+
+
+def stream_has_payload(chunk: bytes) -> bool:
+    """流里是否已经出现「非注释」的行（heartbeat 只是 `: ...`）。"""
+    for line in chunk.decode("utf-8", "replace").split("\n"):
+        s = line.strip()
+        if s and not s.startswith(":"):
+            return True
+    return False
+
+
+def sse_to_completion(acc: dict, model: Optional[str],
+                      completion_id: str = "") -> bytes:
+    """把流式响应攒下来的片段拼成一份普通 chat.completion 响应。
+
+    有些上游的个别模型**只认流式**：同一个请求 stream=false 会被网关直接
+    502，stream=true 就正常（nexavlinks 的 deepseek-v4.1-flash 实测如此）。
+    客户端要的却只是一份 JSON。这里把 SSE 收完再拼回去，结构、字段名、
+    finish_reason 全部沿用 OpenAI 那套，对客户端完全透明。
+
+    usage 反着映射回标准字段名（extract_usage 归一成 input/output/total/
+    cache_read/cache_write，客户端认的是 prompt_tokens 那一套）。
+    """
+    text = "".join(acc.get("text") or [])
+    reasoning = "".join(acc.get("reasoning") or [])
+    calls = [acc["tool_calls"][k] for k in sorted(acc.get("tool_calls") or {})]
+
+    message: dict[str, Any] = {"role": "assistant", "content": text}
+    if reasoning:
+        # 推理模型的思考过程单独一栏，不能混进 content —— 混了客户端
+        # 会把思考过程当正式回答显示
+        message["reasoning_content"] = reasoning
+    if calls:
+        message["tool_calls"] = calls
+        if not text:
+            # 纯工具调用的回复 content 是 null（OpenAI 就是这规矩）
+            message["content"] = None
+
+    out: dict[str, Any] = {
+        "id": completion_id or f"chatcmpl-{uuid.uuid4().hex[:24]}",
+        "object": "chat.completion",
+        "created": int(time.time()),
+        "model": model or "",
+        "choices": [{
+            "index": 0,
+            "message": message,
+            "finish_reason": acc.get("finish") or ("tool_calls" if calls else "stop"),
+        }],
+    }
+
+    usage = acc.get("usage") or {}
+    if usage:
+        mapped: dict[str, Any] = {}
+        if "input" in usage:
+            mapped["prompt_tokens"] = usage["input"]
+        if "output" in usage:
+            mapped["completion_tokens"] = usage["output"]
+        if "total" in usage:
+            mapped["total_tokens"] = usage["total"]
+        elif "input" in usage or "output" in usage:
+            mapped["total_tokens"] = int(usage.get("input") or 0) + int(usage.get("output") or 0)
+        if "cache_read" in usage:
+            mapped["prompt_cache_hit_tokens"] = usage["cache_read"]
+        if "cache_write" in usage:
+            mapped["prompt_cache_miss_tokens"] = usage["cache_write"]
+        out["usage"] = mapped
+    try:
+        return json.dumps(out, ensure_ascii=False).encode("utf-8")
+    except Exception:  # noqa: BLE001
+        return json.dumps({"error": {"message": "聚合流式响应失败",
+                                    "type": "stream_aggregate_error"}},
+                          ensure_ascii=False).encode("utf-8")
 
 
 def header_value(value: Any) -> str:
@@ -434,113 +663,59 @@ def api_paths(base_url: str, path: str) -> list[tuple[str, str]]:
 # ---------------------------------------------------------------------------
 
 class CapacityGate:
-    """一个上游的「同时能跑几个 / 每分钟能发几个」闸门。
+    """一个上游的「本地自然日最多能发几个」闸门。
 
-    为什么放在路由器这一层而不是靠上游自己 429：
+    为什么放在路由器这一层而不是靠上游自己拒：
     同一个厂商开了好几个账号分摊额度时，上游只知道「这个 Key 超了」，
     它会直接拒绝，而路由器手里有整个组的信息 —— 可以先挑还有容量的那家发，
     从源头上少撞 429。这里只管**自己这边的上限**（用户按上游手填的），
     不做全局调度，也不猜上游的真实配额。
 
-    速率用的是**最近 60 秒滑动窗口**（不是「每分钟整点清零」），
-    否则整点那一瞬间会双倍放行。
+    每天额度按**本地自然日**计数（"每天最多 100 次"通常指的就是自然日）：
+    日期一变就清零，不按 24 小时滑动窗口。只留一个计数器 + 日期快照。
     """
-
-    WINDOW = 60.0
-    # 滑动窗口只留时间戳，超过这个数量就没必要记得更细了。
-    # 免得「不限速率」的上游被无限追加时间戳把内存撑起来。
-    MAX_STAMPS = 4096
 
     def __init__(self) -> None:
         self.lock = threading.Lock()
-        self.in_flight: int = 0
-        self._stamps: collections.deque = collections.deque()
+        self._day_key: str = ""
+        self._day_used: int = 0
 
     # ---- 配置（存在 Upstream 上，这里只读）----
-    def _trim(self, now: float) -> None:
-        cutoff = now - self.WINDOW
-        stamps = self._stamps
-        while stamps and stamps[0] <= cutoff:
-            stamps.popleft()
 
-    def used_last_minute(self, now: Optional[float] = None) -> int:
-        now = time.time() if now is None else now
+    def _ensure_day(self) -> None:
+        key = time.strftime("%Y-%m-%d")
+        if key != self._day_key:
+            self._day_key = key
+            self._day_used = 0
+
+    def used_today(self) -> int:
         with self.lock:
-            self._trim(now)
-            return len(self._stamps)
+            self._ensure_day()
+            return self._day_used
 
-    def acquire(self, max_concurrent: Optional[int],
-                max_per_minute: Optional[int],
-                wait: float = 0.0) -> tuple[bool, str]:
-        """尝试占一个坑。返回 (是否放行, 不放行的原因)。
+    def acquire(self, max_per_day: Optional[int]) -> tuple[bool, str]:
+        """尝试放行一次。返回 (是否放行, 不放行的原因)。
 
-        wait > 0 时会在「并发满了」的情况下小睡重试，直到超时。
-        速率超限**不等待** —— 那要等到窗口滑出去，等一个请求的时间
-        通常已经超过客户端的超时了，不如立刻换下一家。
+        每天额度用满**不等待** —— 那要等到第二天，在这里等没有意义，
+        不如立刻试下一家。
         """
-        deadline = time.time() + max(0.0, wait)
-        while True:
-            now = time.time()
-            with self.lock:
-                self._trim(now)
-                if max_per_minute is not None and len(self._stamps) >= max_per_minute:
-                    return False, f"每分钟上限 {max_per_minute} 已用满"
-                if max_concurrent is not None and self.in_flight >= max_concurrent:
-                    full = True
-                else:
-                    full = False
-                    self.in_flight += 1
-                    # 发出去的这一发也计入速率窗口
-                    if len(self._stamps) < self.MAX_STAMPS:
-                        self._stamps.append(now)
-                    return True, ""
-            if not full or time.time() >= deadline:
-                return False, f"并发上限 {max_concurrent} 已满"
-            time.sleep(0.05)
-
-    def release(self) -> None:
         with self.lock:
-            if self.in_flight > 0:
-                self.in_flight -= 1
+            self._ensure_day()
+            if max_per_day is not None and self._day_used >= max_per_day:
+                return False, f"每天上限 {max_per_day} 已用满"
+            self._day_used += 1
+            return True, ""
 
-    def state(self, max_concurrent: Optional[int], max_per_minute: Optional[int]) -> dict:
-        now = time.time()
+    def state(self, max_per_day: Optional[int]) -> dict:
         with self.lock:
-            self._trim(now)
-            used = len(self._stamps)
-            inflight = self.in_flight
+            self._ensure_day()
+            used = self._day_used
         return {
-            "in_flight": inflight,
-            "used_last_minute": used,
-            "max_concurrent": max_concurrent,
-            "max_per_minute": max_per_minute,
+            "used_today": used,
+            "max_per_day": max_per_day,
             # 还有没有容量（给前端标「已满」用；满了不代表坏了）
-            "has_room": (
-                (max_concurrent is None or inflight < max_concurrent)
-                and (max_per_minute is None or used < max_per_minute)
-            ),
+            "has_room": (max_per_day is None or used < max_per_day),
         }
-
-
-class CapacityLease:
-    """占坑的凭据。用 with 包住，异常路径也不会漏掉 release。"""
-
-    __slots__ = ("gate", "released")
-
-    def __init__(self, gate: Optional[CapacityGate]):
-        self.gate = gate
-        self.released = False
-
-    def release(self) -> None:
-        if self.gate is not None and not self.released:
-            self.released = True
-            self.gate.release()
-
-    def __enter__(self) -> "CapacityLease":
-        return self
-
-    def __exit__(self, *exc: Any) -> None:
-        self.release()
 
 
 # ---------------------------------------------------------------------------
@@ -615,6 +790,17 @@ class Upstream:
             str(k): str(v) for k, v in raw_groups.items() if str(k) and str(v)
         }
 
+        # 「仅流式」模型：这些模型上游只认 stream=true，非流式会被网关直接
+        # 502/400（nexavlinks 的 deepseek-v4.1-flash 实测就是这样：同一个
+        # Key、同一个地址，stream=false 立刻 502，stream=true 正常出字）。
+        # 名单是**逐上游逐模型**的，默认空 = 老行为，谁都不受影响。
+        # 客户端要非流式时，代理自动改发流式再把 SSE 拼回 JSON。
+        raw_so = cfg.get("stream_only_models") or []
+        self.stream_only_models: set[str] = (
+            {str(m).strip().lower() for m in raw_so if str(m).strip()}
+            if isinstance(raw_so, list) else set()
+        )
+
         # 记录哪种路径拼法可用（运行时，不持久化）
         self._prefix_hint: Optional[str] = None
 
@@ -631,16 +817,40 @@ class Upstream:
         self.latency_samples = 0
 
         # 每上游可单独覆盖的超时/冷却
-        self.connect_timeout: float = float(cfg.get("connect_timeout_seconds") or 10)
-        self.read_timeout: float = float(cfg.get("read_timeout_seconds") or 300)
+        try:
+            self.connect_timeout: float = float(cfg.get("connect_timeout_seconds") or DEFAULT_CONNECT_TIMEOUT)
+        except (TypeError, ValueError):
+            self.connect_timeout = DEFAULT_CONNECT_TIMEOUT
+        # 首包超时 = 连上后多久没收到**响应头**就当这次尝试卡死
+        # （超时就换下一个 Key / 换下一家）。收到响应头后读正文/流式不再按它掐。
+        # 网页「设置」里配的是全局默认（保存后覆盖所有上游）；老字段名 read_timeout_seconds 兼容读。
+        raw_ft = cfg.get("first_timeout_seconds")
+        if raw_ft in (None, ""):
+            raw_ft = cfg.get("read_timeout_seconds")
+        try:
+            _ft = float(raw_ft) if raw_ft not in (None, "") else DEFAULT_FIRST_TIMEOUT
+        except (TypeError, ValueError):
+            _ft = DEFAULT_FIRST_TIMEOUT
+        self.first_timeout: float = _ft if _ft > 0 else DEFAULT_FIRST_TIMEOUT
         self.cooldown: float = float(cfg.get("cooldown_seconds") or 60)
 
         # 容量上限（用户按上游手填）。None = 不限。
-        # max_concurrent 是「同时在跑几个请求」，max_per_minute 是「60 秒内发几次」。
-        # 只影响**发往这家**的请求：满了就换下一家，而不是让请求失败。
-        self.max_concurrent: Optional[int] = self._pos_int(cfg.get("max_concurrent"))
-        self.max_per_minute: Optional[int] = self._pos_int(cfg.get("max_per_minute"))
+        # max_per_day 是「本地自然日最多发几次」（日期一变清零），
+        # 适合「每天限 100 次」这类按天给的额度。
+        # 只影响**发往这家**的请求：用满就换下一家，而不是让请求失败。
+        self.max_per_day: Optional[int] = self._pos_int(cfg.get("max_per_day"))
         self.gate = CapacityGate()
+        # 当天已用次数（配了上限才记）：随状态文件持久化，进程重启不归零。
+        # 只认「存的时候是今天」的计数；跨天后由 _ensure_day 自然清零。
+        raw_today = cfg.get("capacity_today")
+        if isinstance(raw_today, dict):
+            d = str(raw_today.get("day") or "")
+            if d == time.strftime("%Y-%m-%d"):
+                try:
+                    self.gate._day_key = d
+                    self.gate._day_used = max(0, int(raw_today.get("used") or 0))
+                except (TypeError, ValueError):
+                    pass
 
     @staticmethod
     def _pos_int(value: Any) -> Optional[int]:
@@ -653,6 +863,30 @@ class Upstream:
             return None
         return n if n > 0 else None
 
+    # ---- 仅流式模型 ----
+    def stream_only(self, model: Optional[str]) -> bool:
+        """这个模型是不是「只认流式」的（非流式会被上游拒掉）。
+
+        模型名大小写、前后空格各家写法不统一（DeepSeek-V4.1-Flash 和
+        deepseek-v4.1-flash 是同一个），这里统一按小写比较。
+        """
+        if not model or not self.stream_only_models:
+            return False
+        return str(model).strip().lower() in self.stream_only_models
+
+    def set_stream_only(self, models: Any, append: bool = False) -> list[str]:
+        """设置「仅流式」模型名单。空列表 = 关掉这套特判（回到老行为）。"""
+        if models is None:
+            return sorted(self.stream_only_models)
+        if isinstance(models, str):
+            models = [models]
+        cleaned = {str(m).strip().lower() for m in models if str(m).strip()}
+        if append:
+            self.stream_only_models |= cleaned
+        else:
+            self.stream_only_models = cleaned
+        return sorted(self.stream_only_models)
+
     # ---- 可用性 ----
     def available(self) -> bool:
         return self.enabled and time.time() >= self.cooldown_until
@@ -662,20 +896,24 @@ class Upstream:
 
     # ---- 容量 ----
     def has_capacity_limit(self) -> bool:
-        return self.max_concurrent is not None or self.max_per_minute is not None
+        return self.max_per_day is not None
 
     def capacity_state(self) -> dict:
-        return self.gate.state(self.max_concurrent, self.max_per_minute)
+        return self.gate.state(self.max_per_day)
 
-    def acquire(self, wait: float = 0.0) -> tuple[CapacityLease, str]:
-        """占一个坑。返回 (凭据, 失败原因)；凭据的 gate 为 None 表示被挡下了。
+    def acquire(self) -> tuple[bool, str]:
+        """试一下还有没有每天额度。返回 (是否放行, 不放行的原因)。
 
-        没配任何上限的上游不占坑（凭据是空壳），零开销。
+        没配上限的不计数、不挡（零开销）；配了上限的从**设置那一刻**起算当天用量。
         """
         if not self.has_capacity_limit():
-            return CapacityLease(None), ""
-        ok, why = self.gate.acquire(self.max_concurrent, self.max_per_minute, wait)
-        return CapacityLease(self.gate if ok else None), ("" if ok else why)
+            return True, ""
+        return self.gate.acquire(self.max_per_day)
+
+    def capacity_persist(self) -> dict:
+        """要跟状态文件走的当天计数（配了上限才有；重启后不归零）。"""
+        with self.gate.lock:
+            return {"day": self.gate._day_key, "used": self.gate._day_used}
 
 
     def group_of(self, real_model: str) -> str:
@@ -811,6 +1049,9 @@ class Upstream:
                 "key_hints": [mask_key(k) for k in self.api_keys],
                 "key_names": list(self.api_key_names),
                 "key_disabled": list(self.api_key_disabled),
+                # 首包超时（秒）：连接后多久没收到响应头就换下一个 Key / 换下一家
+                "first_timeout_seconds": self.first_timeout,
+                "connect_timeout_seconds": self.connect_timeout,
                 "key_strategy": self.key_strategy,
                 "available_models": list(self.available_models),
                 "selected_models": list(self.selected()),
@@ -837,6 +1078,8 @@ class Upstream:
                 # 最近一次余额查询结果（没查过就是 None）
                 "balance": self.balance,
                 "user_agent": self.user_agent,
+                # 只认流式的模型（前端编辑框用来回显；空 = 没配）
+                "stream_only_models": sorted(self.stream_only_models),
             }
 
     def state(self) -> dict:
@@ -862,9 +1105,15 @@ class Upstream:
             "last_checks": dict(self.last_checks),
             "balance": self.balance,
             # 只在上限设过时才写，保持老状态文件干净
-            **({"max_concurrent": self.max_concurrent} if self.max_concurrent else {}),
-            **({"max_per_minute": self.max_per_minute} if self.max_per_minute else {}),
+            **({"max_per_day": self.max_per_day} if self.max_per_day else {}),
+            **({"capacity_today": self.capacity_persist()}
+               if self.max_per_day and self.gate.used_today() else {}),
+            **({"first_timeout_seconds": self.first_timeout}
+               if self.first_timeout != DEFAULT_FIRST_TIMEOUT else {}),
             **({"user_agent": self.user_agent} if self.user_agent else {}),
+            # 只有配了「仅流式」模型才写这一个字段，别的上游状态文件一字不变
+            **({"stream_only_models": sorted(self.stream_only_models)}
+               if self.stream_only_models else {}),
         }
 
     def usable_key_count(self) -> int:
@@ -889,6 +1138,20 @@ class Upstream:
                     self._key_index = idx + 1 if self.key_strategy == "round_robin" else idx
                     return keys[idx]
             return ""
+
+    def key_label(self, key: str) -> str:
+        """Key 的展示名：配了名字用名字，否则用打码值（请求记录里显示）。"""
+        if not key:
+            return ""
+        with self._lock:
+            try:
+                idx = self.api_keys.index(key)
+            except ValueError:
+                idx = -1
+            names = list(self.api_key_names)
+        if 0 <= idx < len(names) and names[idx]:
+            return names[idx]
+        return mask_key(key)
 
     def rotate_key(self, failed_key: str) -> bool:
         """failover 模式下，当前 Key 出错时切到下一个可用的（跳过禁用的）。
@@ -951,14 +1214,28 @@ class Upstream:
         for target, suffix in candidates:
             conn = None
             try:
-                conn = cls(parts.hostname, port, timeout=self.connect_timeout)
+                # 首包预算是**总时间**：从发起连接到收到响应头，合计不超过
+                # first_timeout（默认 15 秒）。连接超时只是连接阶段的单独上限，
+                # 和预算取小 —— 不会出现「连接 10 秒 + 收包 15 秒 = 25 秒」。
+                budget = self.first_timeout if read_timeout is None else read_timeout
+                t_first = time.monotonic()
+                conn = cls(parts.hostname, port, timeout=min(self.connect_timeout, budget))
                 conn.connect()
+                remain = budget - (time.monotonic() - t_first)
+                if remain <= 0:
+                    raise TimeoutError(f"连接就花掉了 {budget:g} 秒")
                 try:
-                    conn.sock.settimeout(self.read_timeout if read_timeout is None else read_timeout)
+                    conn.sock.settimeout(remain)
                 except Exception:
                     pass
                 conn.request(method, target, body=data, headers=headers or {})
                 resp = conn.getresponse()
+                # 响应头到手 = 这次尝试「有回复」；后面读正文/流式换成长超时，
+                # 别把正在生成的长回答按首包超时掐死。
+                try:
+                    conn.sock.settimeout(BODY_READ_TIMEOUT)
+                except Exception:
+                    pass
                 if resp.status == 404 and len(candidates) > 1:
                     # 路径拼法不对，记下来换下一种；把响应留着，
                     # 万一全都不行，至少能把这个 404 原样透传出去。
@@ -978,6 +1255,11 @@ class Upstream:
                     continue
                 self._prefix_hint = suffix
                 return conn, resp, target
+            except (TimeoutError, socket.timeout):
+                # 超时不是「路径拼法」的问题：换候选重试只会把「多久没回复」
+                # 翻倍。直接抛出去，让上层决定（换下一个 Key / 换下一家）。
+                self._close(conn)
+                raise
             except Exception as exc:  # noqa: BLE001
                 last_exc = exc
                 self._close(conn)
@@ -1134,8 +1416,21 @@ class Upstream:
                 payload.update(tools=[tool], tool_choice={"type": "function", "function": {"name": "diagnostic_echo"}})
             elif key == "tool_result":
                 payload["tools"] = [tool]
+            if self.stream_only(model) and not stream:
+                # 仅流式模型：上游对非流式请求是直接 502 的（nexavlinks 的
+                # deepseek-v4.1-flash 实测如此），必须在**发出去之前**就改成流式，
+                # 否则第一个探测就撞 502，整张诊断表跟着红。别的上游恒不进来。
+                stream = True
+                result_upgraded = True
+            else:
+                result_upgraded = False
+            if stream and "stream_options" not in payload:
+                payload["stream"] = True
+                payload["stream_options"] = {"include_usage": True}
             raw = json.dumps(payload, ensure_ascii=False).encode("utf-8")
             result = {"key": key, "name": name, "ok": False, "request_bytes": len(raw)}
+            if result_upgraded:
+                result["upgraded_stream"] = True
             conn = None
             start = time.monotonic()
             calls = {}
@@ -1270,21 +1565,48 @@ class Upstream:
         if not target:
             return {"id": self.id, "name": self.name, "ok": False,
                     "latency_seconds": None, "error": "还不知道该用哪个模型，先拉取模型列表"}
-        payload = json.dumps(
-            {"model": target, "messages": [{"role": "user", "content": "hi"}], "max_tokens": 1},
-            ensure_ascii=False,
-        ).encode("utf-8")
+        # 「仅流式」模型：测速也得走流式，否则上游网关直接 502/400，
+        # 卡片上永远是个红叉 —— 明明能用的模型被测成挂了。
+        # 没配 stream_only_models 的上游这里恒为 False，请求一模一样。
+        stream_only = self.stream_only(target)
+        probe = {"model": target, "messages": [{"role": "user", "content": "hi"}], "max_tokens": 1}
+        if stream_only:
+            probe["stream"] = True
+            probe["stream_options"] = {"include_usage": True}
+        payload = json.dumps(probe, ensure_ascii=False).encode("utf-8")
         conn = None
         t0 = time.time()
         try:
             conn, resp, _ = self.open("POST", "/chat/completions", data=payload,
-                                      headers=self.headers(key=key))
+                                      headers=self.headers(
+                                          accept="text/event-stream" if stream_only else "application/json",
+                                          key=key))
             latency = time.time() - t0
             body = resp.read()
             ctype = resp.getheader("Content-Type") or ""
             ok = resp.status < 400
             error = None
             rate_limited = False
+            if ok and stream_only:
+                # 流式测速：200 也可能是「流里夹着错误」，得把事件读一遍才算数
+                acc = make_sse_collector()
+                if looks_like_binary_stream(body):
+                    ok = False
+                    error = "上游返回非 SSE 的二进制数据（疑似网关错误页）"
+                else:
+                    collect_sse(body, acc)
+                    # 裸 JSON 错误常常不带换行，会一直躺在缓冲里 —— 先看再 flush
+                    if not acc["error"]:
+                        acc["error"] = buffered_sse_error(acc)
+                    flush_sse(acc)
+                    if acc["error"]:
+                        ok = False
+                        error = f"上游流式返回错误: {acc['error']}"
+                    elif not (acc["text"] or acc["reasoning"] or acc["finish"] or acc["tool_calls"]):
+                        # 200 + 空流：http.client 已经结束，但一个 token 都没有
+                        if not body.strip():
+                            ok = False
+                            error = "上游返回 200 但流为空"
             if ok and looks_like_html_page(ctype, body):
                 # 200 但回来的是网页：地址/路径其实不对，只是网关拿首页兜底了。
                 # 只按状态码判会被骗成「通，1 秒」—— 实测正是这种情况。
@@ -1566,7 +1888,9 @@ class StatsStore:
     @classmethod
     def _fresh_sub(cls) -> dict:
         return {"calls": 0, "ok": 0, "failed": 0, "attempts": 0, "elapsed": 0.0,
-                "input": 0, "output": 0, "total": 0, "cache_read": 0, "cache_write": 0}
+                "input": 0, "output": 0, "total": 0, "cache_read": 0, "cache_write": 0,
+                # 上游下的真实模型细分（同一分组里一个上游可能挂了多个模型）
+                "models": {}}
 
     @classmethod
     def _normalize(cls, raw: dict) -> dict:
@@ -1609,10 +1933,16 @@ class StatsStore:
             if not isinstance(step, dict):
                 continue
             up_name = step.get("upstream") or "-"
+            # 上游那边的真实模型名（同一分组里一个上游可能挂了多个模型，
+            # 只按上游聚合会看不出是哪个模型在跑）
+            real_model = str(step.get("model") or "-")
             for owner in (bucket, model):
                 u = owner["upstreams"].setdefault(up_name, self._fresh_sub())
                 u["calls"] += 1
                 u["ok" if step.get("ok") else "failed"] += 1
+                rm = u["models"].setdefault(real_model, self._fresh_sub())
+                rm["calls"] += 1
+                rm["ok" if step.get("ok") else "failed"] += 1
             bucket["attempts"] += 1
             model["attempts"] += 1
             # token 用量只算一次（算在实际处理成功的那一步），不然会重复计数
@@ -1623,6 +1953,8 @@ class StatsStore:
                 self._add_usage(model, usage)
                 self._add_usage(bucket["upstreams"][up_name], usage)
                 self._add_usage(model["upstreams"][up_name], usage)
+                self._add_usage(bucket["upstreams"][up_name]["models"][real_model], usage)
+                self._add_usage(model["upstreams"][up_name]["models"][real_model], usage)
 
     @staticmethod
     def _add_usage(bucket: dict, usage: dict) -> None:
@@ -1889,7 +2221,8 @@ class StatsStore:
                  "reason": entry.get("error")}]
 
     def query_journal(self, day: str = "", month: str = "", group: str = "",
-                      upstream: str = "", offset: int = 0, limit: int = 100,
+                      upstream: str = "", model: str = "",
+                      offset: int = 0, limit: int = 100,
                       with_text: bool = False) -> dict:
         """按条件翻流水。返回 {entries, total, offset, limit, days, groups, upstreams}。
 
@@ -1897,12 +2230,14 @@ class StatsStore:
         - month: "YYYY-MM"，只看这一个月
         - group: 模型分组名，只看它
         - upstream: 上游名，只看**试过**这个上游的请求（含中途失败后换家的那些）
+        - model: 上游那边的真实模型名（和 upstream 一起用，可细分同一上游的多个模型）
         - offset/limit: 分页；entries 按时间**倒序**（最新在前）
         - with_text: 是否带 request_text/response_text 这类大字段
           （列表页不需要，一直传全量会很卡，展开某条时再单独取）
 
         同时回传 days / groups / upstreams 各维度的计数，前端用来做下拉和筛选提示。
-        upstreams 按**每次尝试**统计（和右侧卡片同一口径），不是按最终上游。
+        upstreams 按**每次尝试**统计（和右侧卡片同一口径），并按「上游 + 真实模型」
+        细分 —— 同一个分组里一个上游挂了多个模型时，能分别看到各自用了多少。
         """
         entries = self.journal_entries()
         # 过滤
@@ -1911,7 +2246,7 @@ class StatsStore:
         group_counts: dict[str, int] = {}
         # upstream 计数在「天/月/分组」筛选之后、上游筛选之前统计：
         # 下拉里只列当前分组真正用过的上游，并带失败数，方便一眼找到坏上游。
-        up_counts: dict[str, list[int]] = {}
+        up_counts: dict[tuple[str, str], list[int]] = {}
         for e in entries:
             d = self._entry_day(e)
             g = self._entry_group(e)
@@ -1928,18 +2263,22 @@ class StatsStore:
                     continue
             steps = self._entry_trail(e)
             names = set()
+            models_seen = set()
             for s in steps:
                 su = str(s.get("upstream") or "-")
+                sm = str(s.get("model") or "-")
                 names.add(su)
-                slot = up_counts.setdefault(su, [0, 0])
+                models_seen.add(sm)
+                slot = up_counts.setdefault((su, sm), [0, 0])
                 slot[0] += 1
                 if not s.get("ok"):
                     slot[1] += 1
             # 按上游筛选时匹配「这次请求试过的任意一家」，而不是只看最终上游：
             # 否则换家过程中失败的上游永远筛不出来（请求后来在别家成功了）。
-            if upstream:
-                if upstream not in names:
-                    continue
+            if upstream and upstream not in names:
+                continue
+            if model and model not in models_seen:
+                continue
             keep.append((d, e))
 
         total = len(keep)
@@ -1963,7 +2302,7 @@ class StatsStore:
                 # 只挑列表要用的字段，避免把几十 MB 的正文一起发出去
                 out_entries.append({
                     k: e.get(k) for k in
-                    ("at", "time", "upstream_id", "upstream", "model",
+                    ("at", "time", "upstream_id", "upstream", "key", "model",
                      "effective_model", "status", "elapsed_seconds", "ok",
                      "stream", "attempts", "route_source", "error", "usage",
                      "trail")
@@ -1976,9 +2315,11 @@ class StatsStore:
             "days": dict(sorted(day_counts.items(), reverse=True)),
             "groups": dict(sorted(group_counts.items(), key=lambda kv: -kv[1])),
             "upstreams": [
-                {"key": k, "calls": v[0], "failed": v[1]}
-                for k, v in sorted(up_counts.items(),
-                                   key=lambda kv: (-kv[1][1], -kv[1][0]))
+                {"upstream": su, "model": sm,
+                 "key": (f"{su} · {sm}" if sm and sm != "-" else su),
+                 "calls": v[0], "failed": v[1]}
+                for (su, sm), v in sorted(up_counts.items(),
+                                          key=lambda kv: (-kv[1][1], -kv[1][0]))
             ],
             "filter": {"day": day, "month": month, "group": group,
                        "upstream": upstream},
@@ -2210,7 +2551,14 @@ class StatsStore:
             ups = sorted(
                 [{"upstream": un, "calls": int(u.get("calls", 0)),
                   "ok": int(u.get("ok", 0)), "failed": int(u.get("failed", 0)),
-                  "usage": cls._usage_of(u)}
+                  "usage": cls._usage_of(u),
+                  # 同一上游在这个分组里的真实模型细分（老数据没有 = 空数组）
+                  "models": sorted(
+                      [{"model": mn, "calls": int(mm.get("calls", 0)),
+                        "ok": int(mm.get("ok", 0)), "failed": int(mm.get("failed", 0)),
+                        "usage": cls._usage_of(mm)}
+                       for mn, mm in (u.get("models") or {}).items()],
+                      key=lambda x: -x["calls"])}
                  for un, u in (m.get("upstreams") or {}).items()],
                 key=lambda x: -x["calls"])
             calls = int(m.get("calls", 0))
@@ -2296,9 +2644,15 @@ class Router:
 
         self.upstreams: list[Upstream] = []
         self.models: dict[str, ModelRoute] = {}
+        # 全局默认参数（「设置」页可改）：保存后覆盖到所有上游，新加的上游也用它
+        self.default_first_timeout: float = DEFAULT_FIRST_TIMEOUT
+        self.default_connect_timeout: float = DEFAULT_CONNECT_TIMEOUT
         # 用户显式删掉的路由：sync_routes 不许按「勾选+分组」把它再建回来，
         # 直到用户重新保存这个路由 / 手动分组 / 自动配好为止。
         self.suppressed_models: set[str] = set()
+
+        # _save_state 会被请求线程和后台维护线程并发调用，加锁避免互相踩
+        self._state_lock = threading.Lock()
 
         seed = self._seed_from_config(cfg)
         saved = self._load_state()
@@ -2324,8 +2678,7 @@ class Router:
                 # 配置文件里写明的模型，视为「已经选用」，不然写完配置还得去网页勾一遍
                 "selected_models": [str(m) for m in (u.get("selected_models") or models)],
                 # 容量上限也可以写在配置文件里（网页上能改，会覆盖这里）
-                "max_concurrent": u.get("max_concurrent"),
-                "max_per_minute": u.get("max_per_minute"),
+"max_per_day": u.get("max_per_day"),
             })
         models_out: dict[str, dict] = {}
         for name, mcfg in (cfg.get("models") or {}).items():
@@ -2342,6 +2695,18 @@ class Router:
         return {"upstreams": ups, "models": models_out}
 
     def _apply_state(self, data: dict) -> None:
+        defaults = data.get("defaults")
+        if isinstance(defaults, dict):
+            try:
+                ft = float(defaults.get("first_timeout_seconds") or DEFAULT_FIRST_TIMEOUT)
+                self.default_first_timeout = ft if ft > 0 else DEFAULT_FIRST_TIMEOUT
+            except (TypeError, ValueError):
+                pass
+            try:
+                ct = float(defaults.get("connect_timeout_seconds") or DEFAULT_CONNECT_TIMEOUT)
+                self.default_connect_timeout = ct if ct > 0 else DEFAULT_CONNECT_TIMEOUT
+            except (TypeError, ValueError):
+                pass
         self.upstreams = []
         for i, u in enumerate(data.get("upstreams") or []):
             up = Upstream(u, i)
@@ -2538,12 +2903,25 @@ class Router:
             sys.stderr.write(f"[warn] {os.path.basename(path)} 读不了，改用配置文件: {exc}\n")
             return None
 
-    def _save_state(self) -> None:
+    def _save_state(self, want_snapshot: bool = True) -> None:
+        # 请求线程和后台维护线程会并发调用，串行化整个读写。
+        # want_snapshot=False = 轻量保存（不轮转快照）：每天上限计数用，
+        # 它会跟着后台线程每 30 秒走一次，不能每次都转一份快照。
+        with self._state_lock:
+            self._write_state(want_snapshot=want_snapshot)
+
+    def _write_state(self, want_snapshot: bool = True) -> None:
         payload = {
             "version": 2,
             "upstreams": [u.state() for u in self.upstreams],
             "models": {name: r.state() for name, r in self.models.items()},
             "suppressed_models": sorted(self.suppressed_models),
+            # 全局默认参数：还是出厂值就不写，保持老状态文件干净
+            **({"defaults": {"first_timeout_seconds": self.default_first_timeout,
+                             "connect_timeout_seconds": self.default_connect_timeout}}
+               if (self.default_first_timeout != DEFAULT_FIRST_TIMEOUT
+                   or self.default_connect_timeout != DEFAULT_CONNECT_TIMEOUT)
+               else {}),
         }
         path = self._state_path()
         try:
@@ -2551,7 +2929,7 @@ class Router:
 
             # 覆盖前轮转出一份带时间戳的快照（versions/ 下保留最近若干份）。
             # 同时照旧留一份同名 .bak —— 老用户和 README 里都认这个名字。
-            if os.path.exists(path):
+            if os.path.exists(path) and want_snapshot:
                 self._snapshot_state(path)
                 try:
                     shutil.copyfile(path, path + ".bak")
@@ -2663,9 +3041,15 @@ class Router:
             # 新加的上游默认一个模型都不选，等用户拉取后自己勾
             "available_models": [],
             "selected_models": [],
-            "max_concurrent": payload.get("max_concurrent"),
-            "max_per_minute": payload.get("max_per_minute"),
+            "max_per_day": payload.get("max_per_day"),
+            # 不指定就用「设置」页里的全局默认
+            "first_timeout_seconds": payload.get("first_timeout_seconds")
+                                     or self.default_first_timeout,
+            "connect_timeout_seconds": payload.get("connect_timeout_seconds")
+                                       or self.default_connect_timeout,
             "user_agent": payload.get("user_agent") or "",
+            # 只有传了才生效；不传 = 没有仅流式模型，老行为
+            "stream_only_models": payload.get("stream_only_models") or [],
         }, len(self.upstreams))
         up.cooldown = self.cooldown_default
         self.upstreams.append(up)
@@ -2749,40 +3133,78 @@ class Router:
         if payload.get("enabled") is not None:
             up.enabled = bool(payload["enabled"])
         # 容量上限：显式传 null/"" 表示清掉（回到不限量）
-        if "max_concurrent" in payload:
-            up.max_concurrent = self._pos_int(payload.get("max_concurrent"))
-        if "max_per_minute" in payload:
-            up.max_per_minute = self._pos_int(payload.get("max_per_minute"))
+        if "max_per_day" in payload:
+            up.max_per_day = self._pos_int(payload.get("max_per_day"))
+        # 首包超时：显式传空 = 回到全局默认
+        if "first_timeout_seconds" in payload or "read_timeout_seconds" in payload:
+            raw_ft = payload.get("first_timeout_seconds",
+                                 payload.get("read_timeout_seconds"))
+            ft = self._pos_int(raw_ft)
+            up.first_timeout = float(ft) if ft else self.default_first_timeout
         # 空串 = 回到默认 UA（llm-router/<版本>）
         if "user_agent" in payload:
             up.user_agent = str(payload.get("user_agent") or "").strip()
+        # 仅流式模型名单：传列表 = 整体覆盖（空列表 = 清掉，回到老行为）；
+        # 传 append=true 只追加。不传这个键 = 一个字节都不动。
+        if "stream_only_models" in payload:
+            up.set_stream_only(payload.get("stream_only_models"),
+                               append=bool(payload.get("stream_only_append")))
         self._save_state()
         return up
 
-    def set_capacity(self, uid: str, max_concurrent: Any = None,
-                     max_per_minute: Any = None) -> dict:
-        """设置某个上游的并发/速率上限（0 或空 = 不限量）。
+    def set_capacity(self, uid: str, max_per_day: Any = None) -> dict:
+        """设置某个上游的每天上限（0 或空 = 不限量）。
 
         上限挂在**上游**身上而不是某个分组：它反映的是这个账号/Key 的
         真实配额，同一个账号被好几个分组引用时，配额是共用的一份。
-        按分组各记一套的话，两个分组各给 5 并发，实际就会同时打进 10 个，
+        按分组各记一套的话，同一个账号能用的总次数会被重复计数，
         等于上限根本没生效。
         """
         up = self.find_upstream(uid)
         if up is None:
             raise KeyError(f"找不到上游 {uid!r}")
-        up.max_concurrent = self._pos_int(max_concurrent)
-        up.max_per_minute = self._pos_int(max_per_minute)
+        up.max_per_day = self._pos_int(max_per_day)
         self._save_state()
         return {"ok": True, "id": up.id, "name": up.name,
-                "max_concurrent": up.max_concurrent,
-                "max_per_minute": up.max_per_minute,
+                "max_per_day": up.max_per_day,
                 "capacity": up.capacity_state()}
+
+    def set_defaults(self, first_timeout: Any = None,
+                     connect_timeout: Any = None) -> dict:
+        """「设置」页的全局默认参数：改完**覆盖到所有上游**（不管之前有没有单独配过）。
+
+        空/0 = 回到出厂默认（首包 15 秒、连接 10 秒）。新加的上游也用这套值。
+        """
+        ft = self._pos_int(first_timeout)
+        ct = self._pos_int(connect_timeout)
+        self.default_first_timeout = float(ft) if ft else DEFAULT_FIRST_TIMEOUT
+        self.default_connect_timeout = float(ct) if ct else DEFAULT_CONNECT_TIMEOUT
+        for up in self.upstreams:
+            up.first_timeout = self.default_first_timeout
+            up.connect_timeout = self.default_connect_timeout
+        self._save_state()
+        return {"ok": True,
+                "defaults": {"first_timeout_seconds": self.default_first_timeout,
+                             "connect_timeout_seconds": self.default_connect_timeout},
+                "upstreams": len(self.upstreams)}
 
     @staticmethod
     def _pos_int(value: Any) -> Optional[int]:
         """把传入的上限读成正整数；空/0/负数/看不懂的一律当「不限」。"""
         return Upstream._pos_int(value)
+
+    def _capacity_flush_loop(self) -> None:
+        """后台线程：定期把「每天上限」的当天用量轻量落盘（不轮转快照）。
+
+        计数走请求路径、不触发管理保存，不落盘的话进程重启后当天的用量会归零。
+        """
+        while True:
+            try:
+                if any(u.has_capacity_limit() for u in self.upstreams):
+                    self._save_state(want_snapshot=False)
+            except Exception as exc:  # noqa: BLE001
+                sys.stderr.write(f"[warn] 每天上限计数落盘失败: {exc}\n")
+            time.sleep(CAPACITY_FLUSH_INTERVAL)
 
     def delete_upstream(self, uid: str) -> dict:
         up = self.find_upstream(uid)
@@ -3618,6 +4040,9 @@ class Router:
             "version": __version__,
             "http_error_hints": HTTP_ERROR_HINTS,
             "config_path": os.path.abspath(self.config_path),
+            # 「设置」页的全局默认参数
+            "defaults": {"first_timeout_seconds": self.default_first_timeout,
+                         "connect_timeout_seconds": self.default_connect_timeout},
             "state_path": os.path.abspath(self._state_path()),
             "journal": self.stats.journal_info(),
             "uptime_seconds": round(time.time() - self.started_at, 1),
@@ -4518,7 +4943,7 @@ class Handler(BaseHTTPRequestHandler):
 
                 return self._send_json(200, self.router.stats.query_journal(
                     day=one("day"), month=one("month"), group=one("group"),
-                    upstream=one("upstream"),
+                    upstream=one("upstream"), model=one("model"),
                     offset=one("offset", "0"), limit=one("limit", "100"),
                     with_text=one("with_text", "") in ("1", "true", "yes")))
             if path == "/admin/state/versions":
@@ -4529,6 +4954,7 @@ class Handler(BaseHTTPRequestHandler):
                 "/admin/upstream/update": self._h_upstream_update,
                 "/admin/upstream/delete": self._h_upstream_delete,
                 "/admin/upstream/capacity": self._h_upstream_capacity,
+                "/admin/defaults": self._h_defaults,
                 "/admin/fetch-models": self._h_fetch_models,
                 "/admin/balance": self._h_balance,
                 "/admin/select-models": self._h_select_models,
@@ -4585,7 +5011,7 @@ class Handler(BaseHTTPRequestHandler):
     # 哪些管理接口前后会改变状态，值得记一笔审计
     AUDIT_DETAIL_KEYS = ("id", "name", "upstream", "model", "models", "from", "to",
                          "enabled", "mapping", "entries", "label", "strategy",
-                         "max_concurrent", "max_per_minute")
+                         "max_per_day")
 
     def _audit(self, path: str) -> None:
         """把这次管理调用记进审计日志（读 body 前先缓存，免得流被消费掉）。"""
@@ -4913,16 +5339,23 @@ class Handler(BaseHTTPRequestHandler):
         self._send_json(status, out)
 
     def _h_upstream_capacity(self) -> None:
-        """设置某个上游的并发/速率上限（0 或空 = 不限量）。"""
+        """设置某个上游的每天上限（0 或空 = 不限量）。"""
         def go():
             payload = self._read_json_body()
             uid = str(payload.get("id") or "")
             if not uid:
                 raise ValueError("缺少 id")
-            return self.router.set_capacity(
-                uid,
-                payload.get("max_concurrent"),
-                payload.get("max_per_minute"),
+            return self.router.set_capacity(uid, payload.get("max_per_day"))
+        status, out = self._result(go)
+        self._send_json(status, out)
+
+    def _h_defaults(self) -> None:
+        """「设置」页：全局默认参数，保存后覆盖到所有上游。"""
+        def go():
+            payload = self._read_json_body()
+            return self.router.set_defaults(
+                payload.get("first_timeout_seconds"),
+                payload.get("connect_timeout_seconds"),
             )
         status, out = self._result(go)
         self._send_json(status, out)
@@ -5136,12 +5569,15 @@ class Handler(BaseHTTPRequestHandler):
                         request_text: Optional[str] = None,
                         response_text: Optional[str] = None,
                         reasoning_text: Optional[str] = None,
-                        trail: Optional[list[dict]] = None) -> None:
+                        trail: Optional[list[dict]] = None,
+                        key_label: str = "") -> None:
         entry = {
             "at": time.time(),
             "time": time.strftime("%H:%M:%S"),
             "upstream_id": upstream.id if upstream else None,
             "upstream": upstream.name if upstream else "-",
+            # 这次请求实际用的是哪个 Key（名字或打码值；多 Key 上游才看得见）
+            "key": key_label or None,
             "model": requested_model or "-",
             "effective_model": effective_model if effective_model not in ("-", None) else (requested_model or "-"),
             "status": status,
@@ -5257,60 +5693,47 @@ class Handler(BaseHTTPRequestHandler):
         # 这次请求试过谁、结果如何。失败的上游也记进来，
         # 左侧统计靠它才能和右侧卡片的「请求/成功/失败」对上。
         trail: list[dict] = []
-        queue_deadline = t_start + self.router.queue_timeout
         tried: set[int] = set()
-        # 这一轮里因为「并发/速率满了」被挡下的上游：它们没坏，只是这会儿排不上。
-        # 单独记着，等所有能试的都试完了再回头等它们腾出容量。
+        # 因为「每天上限用满」被挡下的上游：它们没坏，只是今天的额度用完了，
+        # 换下一家试（全部都用完额度才报 429）。
         cap_full: dict[int, str] = {}
 
-        while True:
-            cap_full.clear()
-            for i, (up, eff_model) in enumerate(pairs):
-                if i in tried:
-                    continue
-                lease, denied = up.acquire()
-                if denied:
-                    cap_full[i] = denied
-                    continue
-                tried.add(i)
-                try:
-                    self._try_upstream(up, eff_model, method, path, payload, raw_body,
-                                       requested_model, route_source, attempts=len(pairs),
-                                       trail=trail, anthropic=anthropic,
-                                       adapt_notes=adapt_notes)
-                    return
-                except Retryable as exc:
-                    last = exc
-                    attempts_log.append((up, exc.reason))
-                    trail.append({"upstream": up.name, "upstream_id": up.id, "ok": False,
-                                  "model": eff_model, "status": exc.status,
-                                  "reason": exc.reason})
-                    remaining = len(pairs) - i - 1
-                    if remaining > 0:
-                        self.log_message("上游 %s 失败(%s)，换下一个（还剩 %d 个）",
-                                         up.name, exc.reason, remaining)
-                    continue
-                finally:
-                    # 流式请求要一直占着坑，所以在这里才释放 ——
-                    # _try_upstream 返回时流已经转发完了。
-                    lease.release()
+        for i, (up, eff_model) in enumerate(pairs):
+            if i in tried:
+                continue
+            ok, denied = up.acquire()
+            if denied:
+                cap_full[i] = denied
+                continue
+            tried.add(i)
+            try:
+                self._try_upstream(up, eff_model, method, path, payload, raw_body,
+                                   requested_model, route_source, attempts=len(pairs),
+                                   trail=trail, anthropic=anthropic,
+                                   adapt_notes=adapt_notes)
+                return
+            except Retryable as exc:
+                last = exc
+                attempts_log.append((up, exc.reason))
+                trail.append({"upstream": up.name, "upstream_id": up.id, "ok": False,
+                              "key": getattr(exc, "key_label", "") or None,
+                              "model": eff_model, "status": exc.status,
+                              "reason": exc.reason})
+                remaining = len(pairs) - i - 1
+                if remaining > 0:
+                    self.log_message("上游 %s 失败(%s)，换下一个（还剩 %d 个）",
+                                     up.name, exc.reason, remaining)
+                continue
 
-            # 到这儿说明这一轮能试的都试完了。
-            # 若剩下的全是「排不上队」且还没到等待上限，就歇一下再来一轮 ——
-            # 那些上游没坏，只是此刻并发满了，等一下通常就能进去。
-            if not cap_full or time.time() >= queue_deadline:
-                break
-            time.sleep(0.1)
-
-        # 一条都没发出去，全卡在容量上限上：这既不是「上游坏了」也不是
+        # 一条都没发出去，全卡在每天上限上：这既不是「上游坏了」也不是
         # 「没配置」，得说清楚，否则客户端会以为是自己参数不对。
         if last is None and not tried and cap_full:
             detail = "；".join(f"{pairs[i][0].name}（{why}）" for i, why in sorted(cap_full.items()))
-            reason = f"所有上游都达到并发/速率上限：{detail}"
+            reason = f"所有上游都达到每天上限：{detail}"
             self._record_history(None, requested_model, "-", 429,
                                  time.time() - t_start, reason,
                                  attempts=len(pairs), route_source=route_source)
-            self.log_message("容量已满，%d 个上游都没排上：%s", len(cap_full), detail)
+            self.log_message("容量已满，%d 个上游都已用完今天的额度：%s", len(cap_full), detail)
             return self._send_json(429, {"error": {
                 "message": reason,
                 "type": "capacity_exhausted",
@@ -5321,8 +5744,9 @@ class Handler(BaseHTTPRequestHandler):
         if last is not None:
             self._record_history(last.upstream, requested_model, "-", last.status,
                                  time.time() - t_start, last.reason,
+                                 stream=bool((payload or {}).get("stream")),
                                  attempts=len(pairs), route_source=route_source,
-                                 trail=trail)
+                                 trail=trail, key_label=last.key_label)
             self.close_connection = False
             body = last.body
             try:
@@ -5363,152 +5787,344 @@ class Handler(BaseHTTPRequestHandler):
             new_payload["model"] = eff_model
             data = json.dumps(new_payload, ensure_ascii=False).encode("utf-8")
 
-        # Key 级别重试：failover 策略下 401/403/429 换下一个 Key 重试同一个上游
-        # （次数按没被禁用的 Key 算；都被禁用就没什么可换的）
-        _KEY_ERR = {401, 403, 429}
-        _key_tries = max(1, up.usable_key_count()) if up.key_strategy == "failover" else 1
+        # 「仅流式」模型 ＋ 客户端要非流式 → 偷偷改成 stream=true 发出去，
+        # 收完 SSE 再拼回一份普通 chat.completion（见 _relay_aggregated）。
+        # 上游的网关对这类模型的非流式请求是直接 502 的（nexavlinks 的
+        # deepseek-v4.1-flash 实测如此：同一个 Key、同一个地址，
+        # stream=false 立刻 502，stream=true 正常出字），改发流式才通。
+        # 没配 stream_only_models 的上游这里恒为 False，请求体一个字节都不变。
+        _raw_stream = (payload or {}).get("stream")
+        _client_streams = _raw_stream is True or (
+            isinstance(_raw_stream, str) and _raw_stream.strip().lower() in ("1", "true", "yes"))
+        stream_upgrade = bool(
+            payload is not None and not _client_streams and up.stream_only(eff_model))
+        upgrade_data: Optional[bytes] = None
+        if stream_upgrade:
+            up_payload = dict(payload or {})
+            up_payload["model"] = eff_model or requested_model or up_payload.get("model")
+            up_payload["stream"] = True
+            # 要 usage 才能在拼回去的 JSON 里带上 token 用量（history 统计要用）
+            _opts = up_payload.get("stream_options")
+            up_payload["stream_options"] = (
+                {**_opts, "include_usage": True} if isinstance(_opts, dict)
+                else {"include_usage": True})
+            upgrade_data = json.dumps(up_payload, ensure_ascii=False).encode("utf-8")
 
-        for _kt in range(_key_tries):
-            headers = up.headers(
-                content_type=self.headers.get("Content-Type") or "application/json",
-                accept=self.headers.get("Accept") or "application/json",
-            )
+        # 一次请求里，failover 策略把每个可用 Key 各试一次：
+        # 首包超时（连接后多久没收到响应头，上「设置」页/单上游可配）、连不上、
+        # 报错（401/403/408/429/5xx、读响应失败…）都算这次尝试失败 → 换下一个 Key；
+        # 全试完还不行 → 换下一家（Retryable 交给路由层）。
+        # round_robin / 没别的 Key 时行为不变（_key_tries = 1）。
+        _key_tries = max(1, up.usable_key_count()) if up.key_strategy == "failover" else 1
+        _kt = 0
+        while True:
+            last_key = _kt >= _key_tries - 1
+            if stream_upgrade:
+                # 改发流式了，Accept 也得跟着改，不然有些网关按 Accept 判返回格式
+                headers = up.headers(
+                    content_type=self.headers.get("Content-Type") or "application/json",
+                    accept="text/event-stream",
+                )
+            else:
+                headers = up.headers(
+                    content_type=self.headers.get("Content-Type") or "application/json",
+                    accept=self.headers.get("Accept") or "application/json",
+                )
             _used_key = headers.get("Authorization", "")[len("Bearer "):] if "Authorization" in headers else ""
+            _used_label = up.key_label(_used_key)
             conn = None
             t0 = time.time()
             try:
-                conn, resp, _ = up.open(method, path, data=data, headers=headers)
+                conn, resp, _ = up.open(
+                    method, path,
+                    data=(upgrade_data if stream_upgrade else data),
+                    headers=headers)
             except Exception as exc:  # noqa: BLE001
-                reason = f"\u8fde\u63a5\u5931\u8d25: {type(exc).__name__}: {exc}"
+                # 连接不上/超时：还有别的 Key 就换一个再试同一家
+                if not last_key and up.rotate_key(_used_key):
+                    _kt += 1
+                    self.log_message("上游 %s 第 %d 个 Key 失败(%s)，换下一个 Key 重试",
+                                     up.name, _kt, type(exc).__name__)
+                    continue
+                if isinstance(exc, (TimeoutError, socket.timeout)):
+                    reason = f"超时（{up.first_timeout:g} 秒没收到响应头）"
+                else:
+                    reason = f"\u8fde\u63a5\u5931\u8d25: {type(exc).__name__}: {exc}"
                 up.record_failure(reason, self.router.failure_threshold, up.cooldown)
                 raise Retryable(up, 502, json.dumps({"error": {
                     "message": reason, "type": "upstream_connect_error",
-                    "upstream": up.name}}, ensure_ascii=False).encode("utf-8"), reason) from exc
+                    "upstream": up.name}}, ensure_ascii=False).encode("utf-8"), reason,
+                    key_label=_used_label) from exc
 
             status = resp.status
+            ctype = (resp.getheader("Content-Type") or "").lower()
 
-            # Key 相关错误且还有别的 Key：换 Key 重试，不算上游故障
-            if status in _KEY_ERR and _kt < _key_tries - 1 and up.rotate_key(_used_key):
+            # 1) 该换下一个上游的错误（Key 类 401/403/408/429、5xx 等）：
+            #    还有别的 Key 就先换 Key 重试，全试完才换下一家
+            if status >= 400 and (status in DEFAULT_RETRY_STATUS or status >= 500):
                 try:
-                    resp.read()
+                    body = resp.read()
                 except Exception:  # noqa: BLE001
-                    pass
-                up._close(conn)
-                self.log_message("\u4e0a\u6e38 %s Key #%d \u62a5 %d\uff0c\u6362\u4e0b\u4e00\u4e2a Key \u91cd\u8bd5", up.name, _kt + 1, status)
-                continue
-            break
-
-        ctype = (resp.getheader("Content-Type") or "").lower()
-
-        # 1) 该换下一个上游的错误
-        if status >= 400 and (status in DEFAULT_RETRY_STATUS or status >= 500):
-            try:
-                body = resp.read()
-            except Exception:  # noqa: BLE001
-                body = b""
-            finally:
-                up._close(conn)
-            reason = describe_http_error(status, body)
-            up.record_failure(reason, self.router.failure_threshold, up.cooldown)
-            raise Retryable(up, status, body, reason)
-
-        # 2) 客户端自己的错误：原样透传，不算上游的锅
-        if status >= 400:
-            try:
-                body = resp.read()
-            except Exception:  # noqa: BLE001
-                body = b""
-            up._close(conn)
-            reason = describe_http_error(status, body)
-            up.record_neutral(reason)
-            if anthropic:
-                # 错误体也换成 Anthropic 的形状，否则客户端只会说「解析失败」，
-                # 真正的错因（Key 无效 / 参数不对）就看不见了
-                body = openai_error_to_anthropic(body, status)
-                self._relay_json(status, resp, body, up.name, time.time() - t0,
-                                 content_type="application/json")
-            else:
-                self._relay_json(status, resp, body, up.name, time.time() - t0)
-            trail.append({"upstream": up.name, "upstream_id": up.id, "ok": False,
-                          "model": eff_model, "status": status, "client_error": True,
-                          "reason": reason})
-            self._record_history(up, requested_model, eff_model or "-", status,
-                                 time.time() - t0, reason,
-                                 attempts=len(trail), route_source=route_source,
-                                 trail=trail)
-            return
-
-        # 2.5) 200 但回来的是网页：很多网关（New API / one-api 这类）
-        # 对认不出的路径不报 404，而是回 200 + 首页 HTML。
-        # 这永远不是合法的 API 响应，必须当上游故障处理：换下一个，
-        # 或最终回 502 + JSON 错因 —— 绝不能把 HTML 当模型回复甩给客户端
-        # （要 SSE/JSON 的客户端一解析就断，而且 200 让所有状态码检查全绿）。
-        # 判定以正文开头为准，标错 Content-Type 的真流式/真 JSON 不能误杀。
-        if looks_like_html_page(ctype):
-            try:
-                head = resp.peek(256)
-            except Exception:  # noqa: BLE001
-                head = b""
-            if _looks_like_sse_head(head):
-                ctype = "text/event-stream"          # 其实是流，只是标错了
-            elif (head or b"").lstrip()[:1] in (b"{", b"["):
-                ctype = "application/json"           # 其实是 JSON，只是标错了
-            else:
-                try:
-                    resp.read()
-                except Exception:  # noqa: BLE001
-                    pass
-                up._close(conn)
-                reason = "上游返回网页(HTML)而不是 API 响应"
+                    body = b""
+                finally:
+                    up._close(conn)
+                reason = describe_http_error(status, body)
+                if not last_key and up.rotate_key(_used_key):
+                    _kt += 1
+                    self.log_message("上游 %s 第 %d 个 Key 报 %d，换下一个 Key 重试",
+                                     up.name, _kt, status)
+                    continue
                 up.record_failure(reason, self.router.failure_threshold, up.cooldown)
-                raise Retryable(up, 502, b"", reason)
+                raise Retryable(up, status, body, reason, key_label=_used_label)
 
-        # 3) 流式
-        if "text/event-stream" in ctype:
-            self._relay_stream(conn, resp, up, requested_model, eff_model, t0,
-                               route_source, attempts, payload, trail,
-                               anthropic=anthropic)
+            # 2) 客户端自己的错误：原样透传，不算上游的锅
+            if status >= 400:
+                try:
+                    body = resp.read()
+                except Exception:  # noqa: BLE001
+                    body = b""
+                up._close(conn)
+                reason = describe_http_error(status, body)
+                # 例外：上游说「这个模型/账户干不了这一单」（如工具调用要求 Responses API）。
+                # 这是上游的能力限制，换个 Key / 换一家可能就行 —— 按上游故障换下去试，
+                # 别让一个干不动的上游把带工具的请求直接打死。
+                if status == 400 and looks_like_capability_error(body):
+                    up.record_neutral(reason)
+                    if not last_key and up.rotate_key(_used_key):
+                        _kt += 1
+                        self.log_message("上游 %s 第 %d 个 Key 报 400（能力限制），换下一个 Key 重试",
+                                         up.name, _kt)
+                        continue
+                    raise Retryable(up, status, body, reason, key_label=_used_label)
+                up.record_neutral(reason)
+                if anthropic:
+                    # 错误体也换成 Anthropic 的形状，否则客户端只会说「解析失败」，
+                    # 真正的错因（Key 无效 / 参数不对）就看不见了
+                    body = openai_error_to_anthropic(body, status)
+                    self._relay_json(status, resp, body, up.name, time.time() - t0,
+                                     content_type="application/json")
+                else:
+                    self._relay_json(status, resp, body, up.name, time.time() - t0)
+                trail.append({"upstream": up.name, "upstream_id": up.id, "ok": False,
+                              "key": _used_label or None,
+                              "model": eff_model, "status": status, "client_error": True,
+                              "reason": reason})
+                self._record_history(up, requested_model, eff_model or "-", status,
+                                     time.time() - t0, reason,
+                                     stream=bool((payload or {}).get("stream")),
+                                     attempts=len(trail), route_source=route_source,
+                                     trail=trail, key_label=_used_label)
+                return
+
+            # 2.5) 200 但回来的是网页：很多网关（New API / one-api 这类）
+            # 对认不出的路径不报 404，而是回 200 + 首页 HTML。
+            # 这永远不是合法的 API 响应，必须当上游故障处理：换下一个 Key / 换下一家，
+            # 或最终回 502 + JSON 错因 —— 绝不能把 HTML 当模型回复甩给客户端
+            # （要 SSE/JSON 的客户端一解析就断，而且 200 让所有状态码检查全绿）。
+            # 判定以正文开头为准，标错 Content-Type 的真流式/真 JSON 不能误杀。
+            if looks_like_html_page(ctype):
+                try:
+                    head = resp.peek(256)
+                except Exception:  # noqa: BLE001
+                    head = b""
+                if _looks_like_sse_head(head):
+                    ctype = "text/event-stream"          # 其实是流，只是标错了
+                elif (head or b"").lstrip()[:1] in (b"{", b"["):
+                    ctype = "application/json"           # 其实是 JSON，只是标错了
+                else:
+                    try:
+                        resp.read()
+                    except Exception:  # noqa: BLE001
+                        pass
+                    up._close(conn)
+                    reason = "上游返回网页(HTML)而不是 API 响应"
+                    if not last_key and up.rotate_key(_used_key):
+                        _kt += 1
+                        self.log_message("上游 %s 第 %d 个 Key 返回网页，换下一个 Key 重试",
+                                         up.name, _kt)
+                        continue
+                    up.record_failure(reason, self.router.failure_threshold, up.cooldown)
+                    raise Retryable(up, 502, b"", reason, key_label=_used_label)
+
+            # 3) 流式
+            if "text/event-stream" in ctype:
+                if stream_upgrade:
+                    # 是我们自己把非流式改成流式的（仅流式模型），得收完拼回 JSON。
+                    # 这条路径**还没给客户端发任何东西**，所以失败照常换 Key / 换上游。
+                    try:
+                        self._relay_aggregated(conn, resp, up, requested_model, eff_model,
+                                               t0, route_source, attempts, payload, trail,
+                                               anthropic=anthropic, key_label=_used_label)
+                    except Retryable:
+                        up._close(conn)
+                        if not last_key and up.rotate_key(_used_key):
+                            _kt += 1
+                            self.log_message("上游 %s 第 %d 个 Key 流式聚合失败，换下一个 Key 重试",
+                                             up.name, _kt)
+                            continue
+                        raise
+                    return
+                try:
+                    self._relay_stream(conn, resp, up, requested_model, eff_model, t0,
+                                       route_source, attempts, payload, trail,
+                                       anthropic=anthropic, key_label=_used_label)
+                except Retryable:
+                    # 只有「响应头还没发给客户端」的失败会走到这（等首块超时/空流/
+                    # 流内先报错）。还有别的 Key 就换一个重试，否则照旧换下一家。
+                    up._close(conn)
+                    if not last_key and up.rotate_key(_used_key):
+                        _kt += 1
+                        self.log_message("上游 %s 第 %d 个 Key 流式失败，换下一个 Key 重试",
+                                         up.name, _kt)
+                        continue
+                    raise
+                return
+
+            # 4) 非流式
+            try:
+                body = resp.read()
+            except Exception as exc:  # noqa: BLE001
+                up._close(conn)
+                reason = f"读取响应失败: {exc}"
+                if not last_key and up.rotate_key(_used_key):
+                    _kt += 1
+                    self.log_message("上游 %s 第 %d 个 Key 读取失败(%s)，换下一个 Key 重试",
+                                     up.name, _kt, type(exc).__name__)
+                    continue
+                up.record_failure(reason, self.router.failure_threshold, up.cooldown)
+                raise Retryable(up, 502, b"", reason, key_label=_used_label) from exc
+            latency = time.time() - t0
+            up._close(conn)
+
+            # 正文其实也是网页（上面 Content-Type 检查没抓到的那种）：同样别放行
+            if looks_like_html_page("", body):
+                reason = "上游返回网页(HTML)而不是 API 响应"
+                if not last_key and up.rotate_key(_used_key):
+                    _kt += 1
+                    self.log_message("上游 %s 第 %d 个 Key 返回网页正文，换下一个 Key 重试",
+                                     up.name, _kt)
+                    continue
+                up.record_failure(reason, self.router.failure_threshold, up.cooldown)
+                raise Retryable(up, 502, b"", reason, key_label=_used_label)
+
+            if anthropic:
+                # 客户端要的是 Anthropic 格式：模型名不用单独改了，
+                # 转换函数会把 model 一步写成客户端请求的那个名字。
+                body = openai_to_anthropic_response(body, requested_model or eff_model or "",
+                                                    fallback_id=resp.getheader("x-request-id") or "")
+            elif eff_model and requested_model and eff_model != requested_model:
+                body = rewrite_json_model(body, eff_model, requested_model)
+
+            resp_text, usage, reasoning = response_to_text(body)
+            up.record_success(latency)
+            self._relay_json(status, resp, body, up.name, latency=latency,
+                             effective=eff_model, content_type="application/json")
+            trail.append({"upstream": up.name, "upstream_id": up.id, "ok": True,
+                          "key": _used_label or None,
+                          "model": eff_model, "status": status, "reason": ""})
+            self._record_history(up, requested_model, eff_model or "-", status, latency,
+                                 attempts=attempts, route_source=route_source,
+                                 usage=usage,
+                                 request_text=messages_to_text(payload),
+                                 response_text=resp_text,
+                                 reasoning_text=reasoning,
+                                 trail=trail, key_label=_used_label)
             return
 
-        # 4) 非流式
+    def _relay_aggregated(self, conn, resp, up: Upstream, requested_model: Optional[str],
+                          eff_model: Optional[str], t0: float, route_source: str,
+                          attempts: int, payload: Optional[dict] = None,
+                          trail: Optional[list[dict]] = None,
+                          anthropic: bool = False,
+                          key_label: str = "") -> None:
+        """把一条 SSE 流整个收完，再拼成普通的**非流式** JSON 发给客户端。
+
+        专给「仅流式」模型用：客户端要 stream=false，可上游只认 stream=true
+        （nexavlinks 的 deepseek-v4.1-flash：同一个 Key、同一个地址，
+        stream=false 立刻 502，stream=true 正常出字）。
+
+        和 _relay_stream 的关键区别：**一个字节都还没发给客户端**，
+        所以流里任何环节出问题都还能照常换 Key / 换下一家，
+        而不是像真流式那样只能硬着头皮收尾。
+        """
+        trail = trail if trail is not None else []
+        acc = make_sse_collector()
+        req_id = resp.getheader("x-request-id") or ""
+        deadline = time.monotonic() + STREAM_UPGRADE_MAX_SECONDS
         try:
-            body = resp.read()
+            while True:
+                chunk = resp.read1(262144)
+                if not chunk:
+                    break
+                if acc["len"] > STREAM_UPGRADE_MAX_BYTES:
+                    reason = (f"上游流式响应超过 "
+                              f"{STREAM_UPGRADE_MAX_BYTES // (1024 * 1024)}MB，中止聚合")
+                    up._close(conn)
+                    up.record_failure(reason, self.router.failure_threshold, up.cooldown)
+                    raise Retryable(up, 502, b"", reason, key_label=key_label)
+                if looks_like_binary_stream(chunk):
+                    reason = "上游返回非 SSE 的二进制数据（疑似网关错误页/压缩内容）"
+                    up._close(conn)
+                    up.record_failure(reason, self.router.failure_threshold, up.cooldown)
+                    raise Retryable(up, 502, b"", reason, key_label=key_label)
+                collect_sse(chunk, acc)
+                if time.monotonic() >= deadline:
+                    reason = f"上游流式响应超过 {STREAM_UPGRADE_MAX_SECONDS:g} 秒，中止聚合"
+                    up._close(conn)
+                    up.record_failure(reason, self.router.failure_threshold, up.cooldown)
+                    raise Retryable(up, 502, b"", reason, key_label=key_label)
+            # 流结束了，缓冲里可能还剩最后一个没换行的半行，解析掉再拼响应。
+            # 顺序要紧：裸 JSON 错误往往没带换行、一直躺在缓冲里，
+            # 得在 flush 吃掉缓冲**之前**先看它一眼。
+            if not acc["error"]:
+                acc["error"] = buffered_sse_error(acc)
+            flush_sse(acc)
+        except Retryable:
+            raise
         except Exception as exc:  # noqa: BLE001
             up._close(conn)
             reason = f"读取响应失败: {exc}"
             up.record_failure(reason, self.router.failure_threshold, up.cooldown)
-            raise Retryable(up, 502, b"", reason) from exc
-        latency = time.time() - t0
-        up._close(conn)
+            raise Retryable(up, 502, b"", reason, key_label=key_label) from exc
+        finally:
+            up._close(conn)
 
-        # 正文其实也是网页（上面 Content-Type 检查没抓到的那种）：同样别放行
-        # 正文其实也是网页（上面 Content-Type 检查没抓到的那种）：同样别放行
-        if looks_like_html_page("", body):
-            reason = "上游返回网页(HTML)而不是 API 响应"
+        # 流里夹着上游错误事件：这次不算成功，按上游故障换下去
+        if acc["error"]:
+            reason = f"上游流式返回错误: {acc['error']}"
             up.record_failure(reason, self.router.failure_threshold, up.cooldown)
-            raise Retryable(up, 502, b"", reason)
+            raise Retryable(up, 502, b"", reason, key_label=key_label)
+        if not acc["len"]:
+            reason = "上游返回 200 但流为空"
+            up.record_failure(reason, self.router.failure_threshold, up.cooldown)
+            raise Retryable(up, 502, b"", reason, key_label=key_label)
 
+        latency = time.time() - t0
+        body = sse_to_completion(acc, requested_model or eff_model or "", completion_id=req_id)
         if anthropic:
-            # 客户端要的是 Anthropic 格式：模型名不用单独改了，
-            # 转换函数会把 model 一步写成客户端请求的那个名字。
-            body = openai_to_anthropic_response(body, requested_model or eff_model or "",
-                                                fallback_id=resp.getheader("x-request-id") or "")
-        elif eff_model and requested_model and eff_model != requested_model:
-            body = rewrite_json_model(body, eff_model, requested_model)
-
-        resp_text, usage, reasoning = response_to_text(body)
+            # Anthropic 客户端要的是 message/content 那套结构，不是 OpenAI 的
+            body = openai_to_anthropic_response(
+                body, requested_model or eff_model or "", fallback_id=req_id)
+        # 推理模型常见「只有思考过程、content 是空的」：这里照样算成功，
+        # 思考过程已经写进 reasoning_content，别当空回复丢掉
+        resp_text = "".join(acc["text"])
+        reasoning = "".join(acc["reasoning"])
+        usage = acc["usage"]
         up.record_success(latency)
-        self._relay_json(status, resp, body, up.name, latency=latency,
+        self._relay_json(resp.status, resp, body, up.name, latency=latency,
                          effective=eff_model, content_type="application/json")
         trail.append({"upstream": up.name, "upstream_id": up.id, "ok": True,
-                      "model": eff_model, "status": status, "reason": ""})
-        self._record_history(up, requested_model, eff_model or "-", status, latency,
+                      "key": key_label or None,
+                      "model": eff_model, "status": resp.status, "reason": ""})
+        self._record_history(up, requested_model, eff_model or "-", resp.status, latency,
                              attempts=attempts, route_source=route_source,
                              usage=usage,
                              request_text=messages_to_text(payload),
                              response_text=resp_text,
                              reasoning_text=reasoning,
-                             trail=trail)
+                             trail=trail, key_label=key_label)
+        self.log_message("聚合流式→非流式：上游=%s 模型=%s 耗时=%.2fs 字节=%d",
+                         up.name, eff_model or requested_model, latency, len(body))
 
     def _relay_json(self, status: int, resp, body: bytes, upstream_name: str,
                     latency: float = 0.0, effective: Optional[str] = None,
@@ -5534,7 +6150,8 @@ class Handler(BaseHTTPRequestHandler):
                       eff_model: Optional[str], t0: float, route_source: str,
                       attempts: int, payload: Optional[dict] = None,
                       trail: Optional[list[dict]] = None,
-                      anthropic: bool = False) -> None:
+                      anthropic: bool = False,
+                      key_label: str = "") -> None:
         trail = trail if trail is not None else []
         headers_sent = False
         acc = make_sse_collector()      # 边转发边攒文本和 token 用量
@@ -5548,20 +6165,49 @@ class Handler(BaseHTTPRequestHandler):
                 rewriter = SSEModelRewriter(requested_model or "", eff_model or "")
                 conv = rewriter
 
-            # 先偷看第一块：有些上游返回 200 后立刻断流，
-            # 提前拿到首块才能判定失败并切换，而不是把空流甩给客户端。
+            # 先偷看第一块：有些上游返回 200 后立刻断流/报错，
+            # 提前拿到才能判定失败并切换，而不是把坏流甩给客户端。
+            # 只看到 `:` 注释（heartbeat）时继续看下去 —— 错误行通常紧跟心跳
+            # （dli_gpt 实见：2 条 heartbeat + 裸 JSON 错误）。
+            # 注意：不能用 socket 超时来「少等一会」—— 读超时会把 http.client
+            # 的缓冲对象弄坏（cannot read from timed out object），之后整条流
+            # 都读不了。所以只按墙钟限时，每读完一块看一眼。
             first_chunk = b""
+            peek_deadline = time.monotonic() + 10.0
             while True:
                 piece = resp.read1(65536)
                 if not piece:
                     break
-                first_chunk = piece
-                break
+                first_chunk += piece
+                if stream_has_payload(first_chunk) or looks_like_binary_stream(first_chunk):
+                    break
+                if len(first_chunk) >= 1024 * 1024 or time.monotonic() >= peek_deadline:
+                    break
             if not first_chunk:
                 up._close(conn)
                 reason = "上游返回 200 但流为空"
                 up.record_failure(reason, self.router.failure_threshold, up.cooldown)
-                raise Retryable(up, 502, b"", reason)
+                raise Retryable(up, 502, b"", reason, key_label=key_label)
+
+            # 首块里就带错误事件（中转繁忙/过载时常这样回 200 + error）：
+            # 响应头还没发出去，还能当上游故障处理 —— 换 Key / 换下一家。
+            collect_sse(first_chunk, acc)
+            # 缓冲里那半行也可能就是个完整错误对象（没带换行的裸 JSON）：
+            # 流要是就此结束，光等下一片永远等不到，错误就被漏过去了
+            if not acc["error"]:
+                acc["error"] = buffered_sse_error(acc)
+            if acc["error"]:
+                up._close(conn)
+                reason = f"上游流式返回错误: {acc['error']}"
+                up.record_failure(reason, self.router.failure_threshold, up.cooldown)
+                raise Retryable(up, 502, b"", reason, key_label=key_label)
+
+            # 首块直接是二进制（压缩错误页/垃圾数据）：同样不能当成功发给客户端。
+            if looks_like_binary_stream(first_chunk):
+                up._close(conn)
+                reason = "上游返回 200 但流内容不是 SSE（二进制数据）"
+                up.record_failure(reason, self.router.failure_threshold, up.cooldown)
+                raise Retryable(up, 502, b"", reason, key_label=key_label)
 
             first_byte_at = time.time()
             self.send_response(resp.status)
@@ -5577,7 +6223,6 @@ class Handler(BaseHTTPRequestHandler):
             self.end_headers()
             headers_sent = True
 
-            collect_sse(first_chunk, acc)
             out = conv.feed(first_chunk)
             if out:
                 self._write_chunk(out)
@@ -5586,13 +6231,33 @@ class Handler(BaseHTTPRequestHandler):
                 chunk = resp.read1(262144)
                 if not chunk:
                     break
+                if looks_like_binary_stream(chunk):
+                    # 头已经发出去了，换不了上游；记错误、别再把垃圾转发给客户端。
+                    acc["error"] = "上游返回非 SSE 的二进制数据（疑似网关错误页/压缩内容）"
+                    break
                 collect_sse(chunk, acc)
+                if acc["error"] and b"data:" not in chunk:
+                    # 裸 JSON 错误（不是合法 SSE 事件）：别把这段垃圾转给客户端
+                    break
                 out = conv.feed(chunk)
                 if out:
                     self._write_chunk(out)
 
+            # 收尾：缓冲里最后那半行（没等到换行）也得解析，否则计入
+            # usage/文本时少一段；转发本身不受影响（原始字节已经给客户端了）。
+            # 先看一眼缓冲是不是裸 JSON 错误 —— 那种错误常常不带换行，
+            # flush 会把它当普通行吞掉，错误就这么藏起来了。
+            if not acc["error"]:
+                acc["error"] = buffered_sse_error(acc)
+            flush_sse(acc)
+
             if anthropic:
-                tail = conv.close()
+                if acc["error"]:
+                    # 已经流出 message_start 之后才报错：按 Anthropic 的约定
+                    # 用 error 事件收尾，别假装正常结束（客户端才能看出这次失败）
+                    tail = conv.error(f"上游流式返回错误: {acc['error']}", "upstream_error")
+                else:
+                    tail = conv.close()
             else:
                 tail = conv.feed(b"", final=True)
             if tail:
@@ -5601,8 +6266,28 @@ class Handler(BaseHTTPRequestHandler):
             self.wfile.flush()
 
             latency = first_byte_at - t0
+            if acc["error"]:
+                # 流里夹着上游错误：客户端收到了这个错误事件，这次不算成功 ——
+                # 否则卡片和统计全是绿的，故障就藏起来了。
+                reason = f"上游流式返回错误: {acc['error']}"
+                up.record_failure(reason, self.router.failure_threshold, up.cooldown)
+                trail.append({"upstream": up.name, "upstream_id": up.id, "ok": False,
+                              "key": key_label or None,
+                              "model": eff_model, "status": 502, "reason": reason})
+                self._record_history(up, requested_model, eff_model or "-", 502,
+                                     latency, reason, stream=True, attempts=attempts,
+                                     route_source=route_source,
+                                     usage=acc["usage"],
+                                     request_text=messages_to_text(payload),
+                                     response_text="".join(acc["text"]),
+                                     reasoning_text="".join(acc["reasoning"]),
+                                     trail=trail, key_label=key_label)
+                self.log_message("流式错误：上游=%s 模型=%s 详情=%s",
+                                 up.name, eff_model or requested_model, acc["error"])
+                return
             up.record_success(latency)
             trail.append({"upstream": up.name, "upstream_id": up.id, "ok": True,
+                          "key": key_label or None,
                           "model": eff_model, "status": resp.status, "reason": ""})
             self._record_history(up, requested_model, eff_model or "-", resp.status,
                                  latency, stream=True, attempts=attempts,
@@ -5611,7 +6296,7 @@ class Handler(BaseHTTPRequestHandler):
                                  request_text=messages_to_text(payload),
                                  response_text="".join(acc["text"]),
                                  reasoning_text="".join(acc["reasoning"]),
-                                 trail=trail)
+                                 trail=trail, key_label=key_label)
             self.log_message("流式：上游=%s 首字节=%.2fs 模型=%s",
                              up.name, latency, eff_model or requested_model)
         except Retryable:
@@ -5624,7 +6309,7 @@ class Handler(BaseHTTPRequestHandler):
             up.record_failure(reason, self.router.failure_threshold, up.cooldown)
             self.close_connection = True
             if not headers_sent:
-                raise Retryable(up, 502, b"", f"流式响应失败: {exc}") from exc
+                raise Retryable(up, 502, b"", f"流式响应失败: {exc}", key_label=key_label) from exc
             # 响应头已经发出去了，没法再换上游，但这个失败也要留在记录里，
             # 否则右侧卡片记了失败、左侧统计却没有，两边又对不上
             if anthropic:
@@ -5637,6 +6322,7 @@ class Handler(BaseHTTPRequestHandler):
                 except Exception:  # noqa: BLE001
                     pass
             trail.append({"upstream": up.name, "upstream_id": up.id, "ok": False,
+                          "key": key_label or None,
                           "model": eff_model, "status": 502, "reason": reason})
             self._record_history(up, requested_model, eff_model or "-", 502,
                                  time.time() - t0, reason, stream=True,
@@ -5645,7 +6331,7 @@ class Handler(BaseHTTPRequestHandler):
                                  request_text=messages_to_text(payload),
                                  response_text="".join(acc["text"]),
                                  reasoning_text="".join(acc["reasoning"]),
-                                 trail=trail)
+                                 trail=trail, key_label=key_label)
         finally:
             up._close(conn)
 
@@ -5727,6 +6413,10 @@ def main(argv: Optional[list[str]] = None) -> int:
     httpd = ThreadingHTTPServer((router.host, router.port), Handler)
     httpd.daemon_threads = True
     httpd.router = router  # type: ignore[attr-defined]
+
+    # 后台维护线程：定期把「每天上限」的当天用量轻量落盘（重启不归零）
+    threading.Thread(target=router._capacity_flush_loop, daemon=True,
+                     name="capacity-flush").start()
 
     print("\n服务已启动，Ctrl+C 停止。")
     print(f"  客户端 base_url 用: http://{router.host}:{router.port}/v1\n")

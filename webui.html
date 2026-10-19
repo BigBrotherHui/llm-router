@@ -3,6 +3,10 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black">
+<meta name="apple-mobile-web-app-title" content="llm-router">
+<meta name="mobile-web-app-capable" content="yes">
 <title>llm-router 控制台</title>
 <style>
   :root{
@@ -226,6 +230,9 @@
   .upbar .track i.fail{background:var(--bad)}
   .upbar .cnt{font-variant-numeric:tabular-nums;min-width:26px;text-align:right}
   .upbar .okf{color:var(--bad);font-size:10px;margin-left:2px}
+  /* 上游下的真实模型细分行：缩进、字号略小，和上游汇总分隔开 */
+  .upbar.sub{margin-top:3px;padding-left:14px;opacity:.9}
+  .upbar.sub .nm{min-width:90px;font-size:10.5px;color:var(--dim)}
   /* 请求行 */
   .req{background:var(--panel2);border:1px solid var(--line);border-radius:8px;
     margin-bottom:7px;overflow:hidden}
@@ -277,7 +284,7 @@
   .seg button.active:hover{color:#04121f}
   .pick{display:flex;align-items:center;gap:10px;background:var(--panel2);
     border:1px solid var(--line);border-radius:8px;padding:10px 12px;margin-bottom:7px;
-    /* 这一行挺宽（模型名 + 参与 + 额度 + 并发/速率 + 测试），窗口窄时
+    /* 这一行挺宽（模型名 + 参与 + 额度 + 每天上限 + 测试），窗口窄时
        让动作区整体换到第二行，别把上游名字挤成两行 */
     flex-wrap:wrap;
     /* 整行都可以按住拖（见拖动排序那段），所以不让选中文字；
@@ -316,7 +323,7 @@
   .quota-cell input[type=number]{width:80px;background:var(--bg);border:1px solid var(--line);
     border-radius:7px;color:var(--text);padding:5px 8px;font-size:12.5px}
   .quota-cell .badge.bad{opacity:.9}
-  /* 并发 / 速率上限（这一列配的是**上游**的容量，不是这个分组的） */
+  /* 每天上限（这一列配的是**上游**的容量，不是这个分组的） */
   .cap-cell{display:flex;align-items:center;gap:4px;white-space:nowrap}
   .cap-cell input[type=number]{width:52px;background:var(--bg);border:1px solid var(--line);
     border-radius:7px;color:var(--text);padding:5px 6px;font-size:12.5px;text-align:center}
@@ -359,6 +366,12 @@
     </button>
     <button class="tab" data-tab="model" role="tab" aria-selected="false">
       <span>模型路由</span><span class="n" id="tabN-model" title="已配置路由的模型个数"></span>
+    </button>
+    <button class="tab" data-tab="set" role="tab" aria-selected="false">
+      <span>设置</span>
+    </button>
+    <button class="tab" data-tab="log" role="tab" aria-selected="false">
+      <span>日志</span><span class="n" id="tabN-log" title="未看的新日志条数"></span>
     </button>
   </nav>
 
@@ -412,7 +425,7 @@
           只填名字、地址、Key 就行，不用管模型。填好后点「拉取模型」把它们支持的模型抓过来。
         </div>
 
-        <div class="grid" style="grid-template-columns:1.1fr 2.4fr 1.6fr auto;align-items:end;
+        <div class="grid" style="grid-template-columns:1fr 2fr 1.4fr auto;align-items:end;
              margin-bottom:14px" id="addForm">
           <label class="grid" style="gap:5px">
             <span class="hint">名字</span>
@@ -476,6 +489,50 @@
         </div>
 
         <div id="models"></div>
+      </div>
+    </section>
+
+    <!-- ============ 设置 ============ -->
+    <section class="pane" id="pane-set" role="tabpanel" hidden>
+      <div class="card">
+        <h2>全局默认参数</h2>
+        <div class="hint" style="margin:-6px 0 12px">
+          这里改的是<b>所有上游</b>的默认值：保存后会覆盖到每个上游（不管之前有没有单独配置过），
+          新加的上游也用这套值。单个上游想例外，去「上游来源」→ 编辑里单独改。
+        </div>
+        <div class="row" style="gap:14px;flex-wrap:wrap">
+          <label class="cap-cell" style="max-width:220px"
+            title="从发起请求到收到响应头的总时间预算（包含建立连接）。超了就放弃这次尝试（换下一个 Key / 换下一家）。收到响应头后就按长超时继续读，不会掐死正在生成的长回答。">
+            <span class="cap-k">首包超时(秒)</span>
+            <input type="number" min="0" step="1" id="setFirstTimeout" placeholder="15">
+          </label>
+          <label class="cap-cell" style="max-width:220px"
+            title="连接阶段的单独上限，和首包超时取小值（不会叠加：总时间仍以首包超时为上限）。">
+            <span class="cap-k">连接超时(秒)</span>
+            <input type="number" min="0" step="1" id="setConnectTimeout" placeholder="10">
+          </label>
+        </div>
+        <div class="row" style="margin-top:14px;gap:10px">
+          <button class="primary" id="setSave">保存并应用到所有上游</button>
+          <span class="hint" id="setStatus"></span>
+        </div>
+      </div>
+    </section>
+
+    <!-- ============ 日志 ============ -->
+    <section class="pane" id="pane-log" role="tabpanel" hidden>
+      <div class="card">
+        <h2>日志</h2>
+        <div class="hint" style="margin:-6px 0 12px">
+          界面上弹过的提示（测试结果、报错等）都留在这里，右下角的小弹窗消失后还能慢慢翻。
+          只存在这台浏览器里，最多留最近 300 条。
+        </div>
+        <div class="row" style="gap:8px;margin-bottom:10px">
+          <button class="mini" id="logCopy">复制全部</button>
+          <button class="mini danger" id="logClear">清空</button>
+          <span class="muted" style="font-size:12px" id="logCount"></span>
+        </div>
+        <div id="logList" style="font-size:12px"></div>
       </div>
     </section>
   </main>
@@ -627,17 +684,23 @@
         <input type="checkbox" id="eEnabled"> <span style="font-size:13px">启用这个上游</span>
       </label>
       <div class="grid" style="gap:5px">
-        <span class="hint">容量上限（留空 = 不限量；配在这个上游上，所有分组共用）</span>
+        <span class="hint">每天上限（留空 = 不限量；配在这个上游上，所有分组共用）</span>
         <div class="row" style="gap:10px">
-          <label class="cap-cell" title="同时在跑的请求数上限。满了就自动换下一家，不会让请求失败。">
-            <span class="cap-k">并发</span>
-            <input type="number" min="0" step="1" id="eCapC" placeholder="∞">
-          </label>
-          <label class="cap-cell" title="60 秒内最多发几次（滑动窗口，不是整点清零）。超了就换下一家。">
-            <span class="cap-k">每分钟</span>
-            <input type="number" min="0" step="1" id="eCapM" placeholder="∞">
+          <label class="cap-cell" title="本地自然日最多发几次（日期一变清零，适合「每天限 100 次」这类上游）。用满就换下一家。">
+            <span class="cap-k">每天</span>
+            <input type="number" min="0" step="1" id="eCapD" placeholder="∞">
           </label>
         </div>
+      </div>
+      <div class="grid" style="gap:5px">
+        <span class="hint">首包超时(秒)（从发起请求到收到响应头的总时间，含连接；超了就换下一个 Key，
+          全试完换下一家。留空 = 用「设置」页的全局默认）</span>
+        <input type="number" min="0" step="1" id="eTimeout" placeholder="默认15" style="max-width:140px">
+      </div>
+      <div class="grid" style="gap:5px">
+        <span class="hint">仅流式模型（逗号分隔；这些模型只认 stream=true，非流式请求会被上游网关直接 502。
+          填了之后代理会自动改发流式、收完再拼成普通 JSON 返回，测速和详细测试也一并走流式。留空 = 全部按原样发）</span>
+        <input type="text" id="eStreamOnly" placeholder="例如：deepseek-v4.1-flash, some-model" style="max-width:420px">
       </div>
     </div>
     <div class="row" style="margin-top:18px">
@@ -655,7 +718,8 @@
 <script>
 "use strict";
 const $ = s => document.querySelector(s);
-const apiBase = "";
+// 手机链路挂在 opencode-web 的 /llm/ 反代下时，API 走同一前缀（同源才能复用推送）
+const apiBase = location.pathname.startsWith("/llm") ? "/llm" : "";
 let state = null;
 let pageVersion = null;  // 服务端版本号，变了就自动重载（避免旧 JS 配新后端）
 let editing = null;      // { name, strategy, picks:[{id,name,hasModel,model,enabled}] }
@@ -673,7 +737,56 @@ const expanded = {};
 const pickFilter = {};
 let upSortDir = 1;   // 上游来源卡片排序方向：1 = 原始顺序，-1 = 倒过来
 
+// ---- 日志：界面上弹过的提示都留一份，「日志」tab 里能慢慢翻 ----
+// 存 localStorage（上限 300 条），页面刷新/版本自动重载后也还在。
+const LOG_KEY = "llm-router-log";
+const LOG_MAX = 300;
+let logEntries = [];
+try {
+  const saved = JSON.parse(localStorage.getItem(LOG_KEY) || "[]");
+  logEntries = Array.isArray(saved) ? saved : [];
+} catch (e) { logEntries = []; }
+let logUnread = 0;   // 没看「日志」tab 时新攒的条数，tab 上显示小数字
+
+function logAdd(kind, msg) {
+  logEntries.push({ at: Date.now(), kind: kind || "", msg: String(msg).slice(0, 4000) });
+  if (logEntries.length > LOG_MAX) logEntries = logEntries.slice(-LOG_MAX);
+  try { localStorage.setItem(LOG_KEY, JSON.stringify(logEntries)); } catch (e) {}
+  if (curTab === "log") {
+    renderLog();
+  } else {
+    logUnread += 1;
+    setTabNum("log", logUnread, false, "未看的新日志条数");
+  }
+}
+
+function renderLog() {
+  const box = $("#logList");
+  if (!box) return;
+  const n = logEntries.length;
+  const cnt = $("#logCount");
+  if (cnt) cnt.textContent = n ? `共 ${n} 条` : "还没有日志";
+  box.innerHTML = "";
+  [...logEntries].reverse().forEach(e => {
+    const d = new Date(e.at);
+    const color = e.kind === "bad" ? "var(--bad)"
+                : e.kind === "ok" ? "var(--ok)"
+                : e.kind === "warn" ? "var(--warn)" : "var(--dim)";
+    const mark = e.kind === "bad" ? "✗" : e.kind === "ok" ? "✓"
+               : e.kind === "warn" ? "!" : "·";
+    const row = document.createElement("div");
+    row.style.cssText = "display:flex;gap:8px;align-items:flex-start;" +
+      "border-bottom:1px solid var(--line);padding:5px 0";
+    row.innerHTML = `<span class="muted" style="flex:none">${
+      d.getFullYear()}-${pad2(d.getMonth() + 1)}-${pad2(d.getDate())} ${pad2(d.getHours())}:${pad2(d.getMinutes())}:${pad2(d.getSeconds())}</span>` +
+      `<span style="flex:none;color:${color}">${mark}</span>` +
+      `<span style="white-space:pre-wrap;word-break:break-word">${esc(e.msg)}</span>`;
+    box.appendChild(row);
+  });
+}
+
 function toast(msg, kind = "") {
+  logAdd(kind, msg);
   const el = document.createElement("div");
   el.className = kind;
   el.textContent = msg;
@@ -781,7 +894,7 @@ function renderCheckResults(u) {
 // 上限是配在**上游**上的（所有引用它的分组共用），所以放在卡片上而不是分组弹窗里。
 function capBadge(u) {
   const c = u.capacity;
-  if (!c || (c.max_concurrent == null && c.max_per_minute == null)) return "";
+  if (!c || c.max_per_day == null) return "";
   const full = c.has_room === false;
   const tip = full
     ? "此刻已满：新请求会先换别家；整组都满才排队等一会儿"
@@ -1453,39 +1566,35 @@ function requestAttemptLabel(h, trail) {
 // 只在设了对应上限时显示那一项 —— 没设就是「不限量」，数字没意义。
 function capLiveText(cap) {
   const parts = [];
-  if (cap.max_concurrent != null) parts.push(`${cap.in_flight || 0}/${cap.max_concurrent} 并发`);
-  if (cap.max_per_minute != null) parts.push(`每分钟 ${cap.used_last_minute || 0}/${cap.max_per_minute}`);
+  if (cap.max_per_day != null) parts.push(`今天 ${cap.used_today || 0}/${cap.max_per_day}`);
   return (cap.has_room === false ? "满 · " : "") + parts.join(" · ");
 }
 
-// 这一行的并发 / 每分钟上限 + 实时占用。
+// 这一行的每天上限 + 实时占用。
 //
 // 上限是配在**上游**身上的（反映那个账号/Key 的真实配额），不是这个分组独有的：
 // 同一个上游出现在多个分组里时，配额是共用的一份 —— 每个分组各设一套的话，
-// 两个分组各写 5 并发，实际会同时打进 10 个，上限就白设了。
+// 同一个账号能用的总次数会被重复计数，上限就白设了。
 // 所以这里改的是一份共用配置，界面上也直说。
 function capCell(p, i) {
   const u = (state.upstreams || []).find(x => x.id === p.id);
   const cap = (u && u.capacity) || {};
-  const mc = cap.max_concurrent == null ? "" : cap.max_concurrent;
-  const mp = cap.max_per_minute == null ? "" : cap.max_per_minute;
-  const hasLimit = mc !== "" || mp !== "";
+  const md = cap.max_per_day == null ? "" : cap.max_per_day;
+  const hasLimit = md !== "";
   // 实时占用：只有设了上限才值得显示（没设就是「不限量」，数字没意义）
   let live = "";
   if (hasLimit) {
     live = `<span class="cap-live${cap.has_room === false ? " full" : ""}" title="${
       cap.has_room === false
-        ? "此刻已满：新请求会先换别家，全都满了才排队等"
-        : "此刻还有余量"
+        ? "今天额度已用满：新请求会先换别家，明天清零"
+        : "今天还有余量"
     }">${capLiveText(cap)}</span>`;
   }
-  return `<span class="cap-cell" title="并发 / 每分钟上限（留空 = 不限）。
+  return `<span class="cap-cell" title="每天上限（留空 = 不限）。
 配在这个**上游**上：它在别的分组里也共用同一份配额。
-满了就自动换下一个上游，不影响调用；整组都满才排队等一会儿。">
-      <span class="cap-k">并发</span>
-      <input type="number" min="0" step="1" data-cap-c="${i}" placeholder="∞" value="${mc}">
-      <span class="cap-k">/分</span>
-      <input type="number" min="0" step="1" data-cap-m="${i}" placeholder="∞" value="${mp}">
+用满就自动换下一个上游，不影响调用。">
+      <span class="cap-k">/天</span>
+      <input type="number" min="0" step="1" data-cap-d="${i}" placeholder="∞" value="${md}">
       ${live}
     </span>`;
 }
@@ -1692,37 +1801,34 @@ function bindModal() {
     inp.addEventListener("keydown", e => { if (e.key === "Enter") { commit(); inp.blur(); } });
   });
 
-  // 并发 / 每分钟上限：改完立刻落盘（这个不跟着「保存」走 ——
+  // 每天上限：改完立刻落盘（这个不跟着「保存」走 ——
   // 它属于上游的容量配置，和这个分组的路由是两回事，没必要等到点保存）
-  document.querySelectorAll("#mPicks input[data-cap-c], #mPicks input[data-cap-m]").forEach(inp => {
+  document.querySelectorAll("#mPicks input[data-cap-d]").forEach(inp => {
     const commit = async () => {
-      const i = Number(inp.dataset.capC ?? inp.dataset.capM);
+      const i = Number(inp.dataset.capD);
       const p = editing.picks[i];
       if (!p) return;
       const cell = inp.closest(".cap-cell");
-      const c = cell.querySelector("input[data-cap-c]");
-      const m = cell.querySelector("input[data-cap-m]");
+      const d = cell.querySelector("input[data-cap-d]");
       const num = v => {
         const raw = (v.value || "").trim();
         if (raw === "") return 0;                       // 空 = 不限量
         const n = Math.floor(Number(raw));
         return Number.isFinite(n) && n > 0 ? n : 0;     // 0/负数/乱填 = 不限量
       };
-      const payload = { id: p.id, max_concurrent: num(c), max_per_minute: num(m) };
+      const payload = { id: p.id, max_per_day: num(d) };
       try {
         const r = await api("/admin/upstream/capacity", payload);
         // 回填规范化后的值（填 0 或乱填会被后端当「不限量」）
-        c.value = r.max_concurrent == null ? "" : r.max_concurrent;
-        m.value = r.max_per_minute == null ? "" : r.max_per_minute;
+        d.value = r.max_per_day == null ? "" : r.max_per_day;
         // 同步到本地 state，免得下次 renderModal 又拿旧值覆盖
         const u = (state.upstreams || []).find(x => x.id === p.id);
         if (u) {
           u.capacity = Object.assign({}, u.capacity, {
-            max_concurrent: r.max_concurrent, max_per_minute: r.max_per_minute,
+            max_per_day: r.max_per_day,
           });
         }
-        toast(`${p.name} 的容量上限：并发 ${r.max_concurrent == null ? "不限" : r.max_concurrent}`
-              + `，每分钟 ${r.max_per_minute == null ? "不限" : r.max_per_minute}`, "ok");
+        toast(`${p.name} 的容量上限：每天 ${r.max_per_day == null ? "不限" : r.max_per_day} 次`, "ok");
       } catch (e) {
         toast("容量上限保存失败：" + e.message, "bad");
       }
@@ -1736,14 +1842,14 @@ function renderQuotaHint() {
   const picks = editing.picks || [];
   const n0 = picks.filter(p => p.quota === 0).length;
   const nSet = picks.filter(p => p.quota !== "" && p.quota != null && p.quota !== 0).length;
-  // 「并发 / 每分钟」是配在上游身上的，和分组里的额度不是一回事，分开说
+  // 「每天上限」是配在上游身上的，和分组里的额度不是一回事，分开说
   const nCap = picks.filter(p => {
     const u = (state.upstreams || []).find(x => x.id === p.id);
     const c = (u && u.capacity) || {};
-    return c.max_concurrent != null || c.max_per_minute != null;
+    return c.max_per_day != null;
   }).length;
   const capNote = nCap
-    ? ` 另有 ${nCap} 个上游设了并发/速率上限（那个是配在上游上的，所有分组共用）。`
+    ? ` 另有 ${nCap} 个上游设了每天上限（那个是配在上游上的，所有分组共用）。`
     : "";
   $("#mQuotaHint").innerHTML = ((n0 || nSet)
     ? `其中 ${n0} 个上游设为 0（不调用）${nSet ? `，${nSet} 个设了调用额度` : ""}。
@@ -2443,8 +2549,10 @@ function editUpstream(id) {
   $("#eKeyStrategy").value = u.key_strategy || "failover";
   $("#eEnabled").checked = u.enabled;
   const cap = u.capacity || {};
-  $("#eCapC").value = cap.max_concurrent == null ? "" : cap.max_concurrent;
-  $("#eCapM").value = cap.max_per_minute == null ? "" : cap.max_per_minute;
+  $("#eCapD").value = cap.max_per_day == null ? "" : cap.max_per_day;
+  $("#eTimeout").value = u.first_timeout_seconds || "";
+  // 仅流式模型：有就按逗号铺开显示，没有就是空（留空 = 全按原样发）
+  $("#eStreamOnly").value = (u.stream_only_models || []).join(", ");
   $("#eStatus").textContent = "";
   $("#editModal").hidden = false;
   $("#eName").focus();
@@ -2478,11 +2586,15 @@ async function saveUpstreamEdit() {
     name: $("#eName").value.trim(),
     base_url: $("#eUrl").value.trim(),
     enabled: $("#eEnabled").checked,
-    max_concurrent: capNum($("#eCapC")),
-    max_per_minute: capNum($("#eCapM")),
+    max_per_day: capNum($("#eCapD")),
+    first_timeout_seconds: capNum($("#eTimeout")),
     user_agent: $("#eUA").value.trim(),
     api_keys: keys,
     key_strategy: $("#eKeyStrategy").value || "failover",
+    // 仅流式模型：逗号/空格/换行分隔都认，去重后提交（留空 = 清空，全部按原样发）
+    stream_only_models: String($("#eStreamOnly").value || "")
+      .split(/[\s,;]+/).map(s => s.trim()).filter(Boolean)
+      .filter((v, i, a) => a.indexOf(v) === i),
   };
   if (!patch.base_url) { toast("\u5730\u5740\u4e0d\u80fd\u4e3a\u7a7a", "bad"); return; }
 
@@ -2756,6 +2868,24 @@ let journalIndex = null;
 const reqTextCache = new Map();
 
 // 当前筛选的可读描述，用在角标上
+// 上游筛选值可能是「上游」或「上游 · 模型」组合（同一分组里一个上游挂了多个模型）。
+// 值用 JSON [上游, 模型] 编码，避免名字里带分隔符时拆错；老的纯上游值也兼容。
+function parseUpFilter(v) {
+  if (!v) return { upstream: "", model: "" };
+  try {
+    const a = JSON.parse(v);
+    if (Array.isArray(a)) return { upstream: String(a[0] || ""), model: String(a[1] || "") };
+  } catch (e) {}
+  return { upstream: String(v), model: "" };
+}
+function upFilterValue(upstream, model) {
+  return JSON.stringify([upstream || "", model || ""]);
+}
+function upFilterLabel(v) {
+  const p = parseUpFilter(v);
+  return p.model && p.model !== "-" ? `${p.upstream} · ${p.model}` : p.upstream;
+}
+
 function curFilterLabel() {
   const day = ($("#sideDay") && $("#sideDay").value) || "";
   const month = ($("#sideMonth") && $("#sideMonth").value) || "";
@@ -2765,7 +2895,7 @@ function curFilterLabel() {
   if (day) parts.push(day);
   else if (month) parts.push(month + "（月）");
   if (g) parts.push(g);
-  if (u) parts.push(u);
+  if (u) parts.push(upFilterLabel(u));
   return parts.length ? "[" + parts.join(" · ") + "]" : "[全部]";
 }
 
@@ -2775,8 +2905,10 @@ function curJournalFilter() {
   const month = ($("#sideMonth") && $("#sideMonth").value) || "";
   const g = ($("#sideFilter") && $("#sideFilter").value) || "";
   const u = ($("#sideUpstream") && $("#sideUpstream").value) || "";
+  const up = parseUpFilter(u);
   // 选了具体某天时，月份条件就没必要再传了（天更具体）
-  return { day, month: day ? "" : month, group: g, upstream: u };
+  return { day, month: day ? "" : month, group: g,
+           upstream: up.upstream, model: up.model };
 }
 
 async function loadJournal() {
@@ -2789,6 +2921,7 @@ async function loadJournal() {
   if (f.month) qs.set("month", f.month);
   if (f.group) qs.set("group", f.group);
   if (f.upstream) qs.set("upstream", f.upstream);
+  if (f.model) qs.set("model", f.model);
   try {
     journalPage = await api("/admin/journal?" + qs.toString(), undefined, "GET");
   } catch (e) {
@@ -2807,14 +2940,16 @@ function fillUpstreamOptions() {
   const g = ($("#sideFilter") && $("#sideFilter").value) || "";
   const items = (journalPage && journalPage.upstreams) || [];
   const usable = g ? items : [];
-  const key = usable.map(x => x.key + ":" + x.failed).join("|");
+  // 选项按「上游 · 真实模型」细分：同一分组里一个上游挂了多个模型时，
+  // 能分别看各自的请求情况（老记录没有模型名时退回纯上游）。
+  const key = usable.map(x => upFilterValue(x.upstream, x.model) + ":" + x.failed).join("|");
   if (sel.dataset.opts === key) return;
   const cur = sel.value;
   const opts = usable.map(u =>
-    `<option value="${esc(u.key)}">${esc(u.key)}${u.failed ? `（${u.failed} 败）` : ""}</option>`
+    `<option value='${esc(upFilterValue(u.upstream, u.model))}'>${esc(u.key)}${u.failed ? `（${u.failed} 败）` : ""}</option>`
   );
   sel.innerHTML = `<option value="">全部上游</option>` + opts.join("");
-  sel.value = usable.some(u => u.key === cur) ? cur : "";
+  sel.value = usable.some(u => upFilterValue(u.upstream, u.model) === cur) ? cur : "";
   sel.dataset.opts = key;
   sel.disabled = !g;
 }
@@ -2831,11 +2966,15 @@ async function loadJournalIndex() {
 // 把索引里的天 / 月 / 分组填进筛选下拉。
 // 只列真有过记录的那些值，不给空选项 —— 选一个没数据的日期只会
 // 得到一片空白，那很难分辨是「那会儿没调用」还是「筛坏了」。
+// 例外：日期下拉会额外保留「今天」，这样刚过零点、今天还没请求时
+// 默认选中今天也能看到明确的「今天还没有请求」。
+let journalDayDefaulted = false;   // 首次进入默认选今天；之后尊重用户选择
 function fillFilterOptions() {
   if (!journalIndex) return;
-  const fill = (sel, items, allLabel) => {
+  const fill = (sel, items, allLabel, extra = []) => {
     if (!sel) return;
-    const opts = (items || []).map(x => x.key);
+    const base = (items || []).map(x => x.key);
+    const opts = base.concat(extra.filter(x => !base.includes(x)));
     const key = opts.join("|");
     if ((sel.dataset.opts || "") === key) return;   // 没变就不重建，免得把选择冲掉
     const cur = sel.value;
@@ -2844,9 +2983,15 @@ function fillFilterOptions() {
     sel.value = opts.includes(cur) ? cur : "";
     sel.dataset.opts = key;
   };
-  fill($("#sideDay"), journalIndex.days, "全部日期");
+  const today = dayKeyOf();
+  fill($("#sideDay"), journalIndex.days, "全部日期", [today]);
   fill($("#sideMonth"), journalIndex.months, "全部月份");
   fill($("#sideFilter"), journalIndex.groups, "全部分组");
+  // 默认按当天看（只默认一次；用户手动切到「全部日期」后不再抢回）
+  if (!journalDayDefaulted) {
+    journalDayDefaulted = true;
+    if ($("#sideDay")) $("#sideDay").value = today;
+  }
 }
 
 function fmtNum(n) {
@@ -2883,6 +3028,8 @@ function renderSide() {
 
   const filter = $("#sideFilter").value;
   const upFilter = ($("#sideUpstream") && $("#sideUpstream").value) || "";
+  const upSel = parseUpFilter(upFilter);
+  const upName = upSel.upstream, upModel = upSel.model;
   const mode = $("#sideMode").value;
 
   // 这个筛选条件下到底有多少条 —— 用列表自身的总数（同一个来源，必然一致）
@@ -2901,15 +3048,19 @@ function renderSide() {
   // 选了某个上游时，面板也缩到这个上游：按「它每次被调用」算，
   // 和右侧列表、下面那条对比条同口径。否则客户端的「失败」（请求最终全挂了）
   // 和上游的「败」（它自己失败几次）是两个数，摆一起必然对不上。
-  const gSel = (upFilter && filter)
+  const gSel = (upName && filter)
     ? (stats.groups || []).find(g => g.group === filter) : null;
-  const uSel = gSel ? (gSel.upstreams || []).find(x => x.upstream === upFilter) : null;
+  const uSelBase = gSel ? (gSel.upstreams || []).find(x => x.upstream === upName) : null;
+  // 选了「上游 · 模型」时，统计面板显示这个模型自己的数据
+  const uSel = uSelBase && upModel
+    ? ((uSelBase.models || []).find(m => m.model === upModel) || null)
+    : uSelBase;
   let statHtml;
   if (uSel) {
     const u = uSel.usage || {};
     statHtml = `
   <div class="hint" style="padding:2px 2px 8px">
-    当前只统计上游 <b>${esc(upFilter)}</b>：按它每次被调用算。它失败几次就是几次——
+    当前只统计上游 <b>${esc(upName)}</b>${upModel ? ` 的模型 <code>${esc(upModel)}</code>` : ""}：按它每次被调用算。它失败几次就是几次——
     请求失败后换家在别家成功，这次失败仍算在这个上游头上，所以这里的失败数
     可能大于客户端请求失败数。和右侧列表同口径。
   </div>
@@ -2938,7 +3089,8 @@ function renderSide() {
     「总请求」按客户端请求算（失败会换下一个，还算一次）；「上游尝试」按实际发给上游算——
     换过一次就会多一两次。和右上角每个上游卡片里的「请求/成功/失败」是同一口径。<br>
     每个上游条上的「N 败」是该上游**自己**失败的次数（换家过程中失败的也算），
-    所以各条相加会大于客户端「失败」——想看某个上游的真实情况，就在上面的下拉里选它。
+    所以各条相加会大于客户端「失败」——想看某个上游的真实情况，就在上面的下拉里选它
+    （同一个上游挂多个模型时，选「上游 · 模型」看单模型的数据）。
   </div>`;
 
   const glist = filter
@@ -2968,20 +3120,32 @@ function renderSide() {
           <div><b>${fmtNum(g.usage.output)}</b><span>输出</span></div>
           <div class="tkn"><b style="color:var(--ok);font-size:13.5px">${fmtNum(g.usage.cache_read)}</b><span>缓存读</span></div>
         </div>
-        ${g.upstreams.filter(u => !upFilter || u.upstream === upFilter).map(u => {
+        ${g.upstreams.filter(u => !upName || u.upstream === upName).map(u => {
           // 失败只占条里对应的那一小段，别把整条染红 —— 414 次里错 16 次
           // 看起来不该像全挂了。条总长按调用量，内部再按成功/失败比例分段。
-          const w = Math.max(3, Math.round(u.calls / maxc * 100));
-          const fw = u.calls ? Math.min(w, u.failed / u.calls * w) : 0;
-          const okw = w - fw;
-          return `
-          <div class="upbar">
-            <span class="nm" title="${esc(u.upstream)}">${esc(u.upstream)}</span>
+          const bar = (x, sub) => {
+            const w = Math.max(3, Math.round(x.calls / maxc * 100));
+            const fw = x.calls ? Math.min(w, x.failed / x.calls * w) : 0;
+            const okw = w - fw;
+            const nm = sub ? (x.model || "-") : x.upstream;
+            return `
+          <div class="upbar${sub ? " sub" : ""}">
+            <span class="nm" title="${esc(nm)}">${esc(nm)}</span>
             <span class="track">${okw > 0 ? `<i class="ok" style="width:${okw}%"></i>` : ""}${
               fw ? `<i class="fail" style="width:${fw}%"></i>` : ""}</span>
-            <span class="cnt" title="调用 ${u.calls} 次 · 成功 ${u.ok} · 失败 ${u.failed}">${
-              `${fmtNum(u.calls)}<span class="okf">${u.failed ? ` · ${fmtNum(u.failed)}败` : ""}</span>`}</span>
+            <span class="cnt" title="调用 ${x.calls} 次 · 成功 ${x.ok} · 失败 ${x.failed}">${
+              `${fmtNum(x.calls)}<span class="okf">${x.failed ? ` · ${fmtNum(x.failed)}败` : ""}</span>`}</span>
           </div>`;
+          };
+          // 同一上游在这个分组里挂了多个模型时，上游汇总条下面再列模型细分；
+          // 已经选了具体模型就只显示那一行。
+          const rows = [];
+          if (!upModel) rows.push(bar(u, false));
+          const ms = (u.models || []).filter(m => !upModel || m.model === upModel);
+          if (ms.length && (upModel || (u.models || []).length > 1)) {
+            ms.forEach(m => rows.push(bar(m, true)));
+          }
+          return rows.join("");
         }).join("")}
       </div>`;
     }).join("");
@@ -3012,17 +3176,18 @@ function renderSide() {
     const open = openReqs.has(key);
     // 这条请求依次试过的上游（每次尝试一步）。老记录可能没有 trail。
     const trail = Array.isArray(h.trail) ? h.trail.filter(Boolean) : [];
-    // 按某个上游筛选时，行代表的应该是「该上游这一次」的结果，而不是客户端
-    // 最终结果 —— 否则中途失败的尝试会因为请求后来在别家成功而整行显示绿色。
-    const step = upFilter ? trail.find(s => s.upstream === upFilter) : null;
+    // 按「上游」或「上游 · 模型」筛选时，行代表的应该是该次尝试的结果，
+    // 而不是客户端最终结果 —— 否则中途失败的尝试会因为请求后来在别家成功而整行显示绿色。
+    const step = upName ? trail.find(s => s.upstream === upName
+      && (!upModel || String(s.model || "") === upModel)) : null;
     const rowOk = step ? !!step.ok : h.ok;
     const rowStatus = step ? step.status : h.status;
     const badge = rowOk
       ? `<span class="badge ok">${rowStatus}</span>`
       : `<span class="badge bad">${rowStatus}</span>`;
-    // 筛选上游时把「本行主体」显示成被筛的上游，后面再标出最终落在谁身上。
-    const subjUp = upFilter || h.upstream;
-    const fellBack = upFilter && h.upstream !== upFilter;
+    // 筛选上游时把「本行主体」显示成被筛的上游（或上游 · 模型），后面再标出最终落在谁身上。
+    const subjUp = upName ? (upModel ? `${upName} · ${upModel}` : upName) : h.upstream;
+    const fellBack = upName && h.upstream !== upName;
     const use = h.usage || {};
     // 列表接口不带正文（省流量）。展开时如果还没取过，就显示加载中，
     // 由 ensureEntryText() 取回来后再补渲染。
@@ -3035,6 +3200,7 @@ function renderSide() {
         ${badge}
         <span class="req-model" title="${esc(h.model)}">${esc(h.model)}</span>
         <span class="badge">${esc(subjUp)}</span>
+        ${h.key ? `<span class="badge" title="实际使用的 Key">${esc(h.key)}</span>` : ""}
         ${fellBack ? `<span class="hint">→ ${esc(h.upstream)}</span>` : ""}
         <div class="grow"></div>
         ${use.total != null ? `<span class="badge">${fmtNum(use.total)} tok</span>` : ""}
@@ -3052,6 +3218,7 @@ function renderSide() {
           <h5>详情</h5>
           <div class="hint" style="line-height:1.8">
             实际发往上游的模型：<code>${esc(h.effective_model || "-")}</code><br>
+            ${h.key ? `实际使用的 Key：<code>${esc(h.key)}</code><br>` : ""}
             路由来源：${esc(h.route_source || "-")}　·　${requestAttemptLabel(h, trail)}
             ${h.error || h.status >= 400 ? `<br><span style="color:var(--bad)">错误：${esc(explainHttpError(h.error, h.status))}</span>` : ""}
           </div>
@@ -3063,6 +3230,7 @@ function renderSide() {
               ? `<span style="color:var(--ok)">✓</span>`
               : `<span style="color:var(--bad)">✗</span>`;
             const parts = [esc(s.upstream || "-")];
+            if (s.key) parts.push(`<span class="badge">${esc(s.key)}</span>`);
             if (s.status != null) parts.push(String(s.status));
             if (s.model) parts.push(`<code>${esc(s.model)}</code>`);
             if (s.reason || s.status >= 400) parts.push(`<span style="color:var(--bad)">${esc(explainHttpError(s.reason, s.status))}</span>`);
@@ -3116,8 +3284,8 @@ async function ensureEntryText(at, upstream) {
 }
 
 /* ================= 左侧 tab：请求记录 / 上游来源 / 模型路由 ================= */
-const TABS = ["req", "up", "model"];
-const TAB_LABEL = { req: "请求记录", up: "上游来源", model: "模型路由" };
+const TABS = ["req", "up", "model", "set", "log"];
+const TAB_LABEL = { req: "请求记录", up: "上游来源", model: "模型路由", set: "设置", log: "日志" };
 let curTab = null;
 
 function setTab(name) {
@@ -3129,6 +3297,12 @@ function setTab(name) {
     btn.setAttribute("aria-selected", on ? "true" : "false");
     $("#pane-" + t).hidden = !on;
   });
+  // 切到日志：清掉「未读」小数字，并刷新一遍
+  if (tab === "log") {
+    logUnread = 0;
+    setTabNum("log", 0);
+    renderLog();
+  }
   // 换 tab 时回到顶部，免得带着上一屏的滚动位置落进新内容中间
   if (curTab !== null && curTab !== tab) window.scrollTo(0, 0);
   curTab = tab;
@@ -3192,6 +3366,72 @@ function statsRangeKey() {
   return "all";
 }
 
+// 设置页：全局默认参数（保存后覆盖所有上游，不管之前有没有单独配过）
+function renderSettings() {
+  const d = (state && state.defaults) || {};
+  const f = $("#setFirstTimeout"), c = $("#setConnectTimeout");
+  if (!f || !c) return;
+  // 正输入着就别覆盖
+  if (document.activeElement !== f) {
+    f.value = d.first_timeout_seconds != null ? d.first_timeout_seconds : "";
+  }
+  if (document.activeElement !== c) {
+    c.value = d.connect_timeout_seconds != null ? d.connect_timeout_seconds : "";
+  }
+}
+
+async function saveSettings() {
+  const num = el => {
+    const raw = (el.value || "").trim();
+    if (raw === "") return 0;
+    const n = Math.floor(Number(raw));
+    return Number.isFinite(n) && n > 0 ? n : 0;
+  };
+  const btn = $("#setSave");
+  btn.disabled = true;
+  $("#setStatus").textContent = "\u4fdd\u5b58\u4e2d\u2026";
+  try {
+    const r = await api("/admin/defaults", {
+      first_timeout_seconds: num($("#setFirstTimeout")),
+      connect_timeout_seconds: num($("#setConnectTimeout")),
+    });
+    const d = r.defaults || {};
+    $("#setStatus").textContent =
+      `\u5df2\u5e94\u7528\u5230 ${r.upstreams || 0} \u4e2a\u4e0a\u6e38\uff08\u9996\u5305 ${d.first_timeout_seconds}s / \u8fde\u63a5 ${d.connect_timeout_seconds}s\uff09`;
+    toast("\u9ed8\u8ba4\u53c2\u6570\u5df2\u4fdd\u5b58\u5e76\u5e94\u7528\u5230\u6240\u6709\u4e0a\u6e38", "ok");
+    await refresh();
+  } catch (e) {
+    $("#setStatus").textContent = "";
+    toast("\u4fdd\u5b58\u5931\u8d25\uff1a" + e.message, "bad");
+  }
+  btn.disabled = false;
+}
+$("#setSave").onclick = saveSettings;
+
+$("#logCopy").onclick = async () => {
+  const text = logEntries.map(e => {
+    const d = new Date(e.at);
+    const ts = `${d.getFullYear()}-${pad2(d.getMonth() + 1)}-${pad2(d.getDate())} ` +
+               `${pad2(d.getHours())}:${pad2(d.getMinutes())}:${pad2(d.getSeconds())}`;
+    return `${ts} [${e.kind || "info"}] ${e.msg}`;
+  }).join("\n");
+  try {
+    await navigator.clipboard.writeText(text);
+    toast(`\u5df2\u590d\u5236 ${logEntries.length} \u6761\u65e5\u5fd7`, "ok");
+  } catch (e) {
+    toast("\u590d\u5236\u5931\u8d25\uff1a" + e.message, "bad");
+  }
+};
+
+$("#logClear").onclick = () => {
+  if (logEntries.length && !confirm("\u6e05\u7a7a\u5168\u90e8\u65e5\u5fd7\uff1f")) return;
+  logEntries = [];
+  try { localStorage.removeItem(LOG_KEY); } catch (e) {}
+  logUnread = 0;
+  setTabNum("log", 0);
+  renderLog();
+};
+
 async function refresh() {
   try {
     state = await api("/stats?range=" + statsRangeKey());
@@ -3209,6 +3449,7 @@ async function refresh() {
     $("#statePath").textContent = state.state_path || "";
     renderUpstreams();
     renderModels();
+    renderSettings();
     // 流水索引（有哪些天/月/分组）→ 填筛选下拉；再取当前筛选下的一页记录。
     // 两步都要在 renderSide 之前完成，否则列表拿到的是空页。
     await loadJournalIndex();
@@ -3233,7 +3474,7 @@ async function refresh() {
       renderSide();
     }
     // 模型弹窗开着时不重渲染，否则会打断正在拖拽排序的手感。
-    // 但「并发占用」是会变的，得单独就地刷新那几个数字。
+    // 但「今天用量」是会变的，得单独就地刷新那几个数字。
     updateCapacityLive();
   } catch (e) {
     $("#health").className = "dot off";
@@ -3243,18 +3484,17 @@ async function refresh() {
 // 只更新弹窗里那几行的「占用/满」标记，不重排 DOM、不动输入框。
 function updateCapacityLive() {
   if (!editing || $("#modal").hidden) return;
-  document.querySelectorAll("#mPicks input[data-cap-c]").forEach(inp => {
-    const i = Number(inp.dataset.capC);
+  document.querySelectorAll("#mPicks input[data-cap-d]").forEach(inp => {
+    const i = Number(inp.dataset.capD);
     const p = editing.picks[i];
     if (!p) return;
     const cell = inp.closest(".cap-cell");
     if (!cell) return;
     const u = (state.upstreams || []).find(x => x.id === p.id);
     const cap = (u && u.capacity) || {};
-    const mc = cap.max_concurrent;
-    const mp = cap.max_per_minute;
+    const md = cap.max_per_day;
     let live = cell.querySelector(".cap-live");
-    if (mc == null && mp == null) {
+    if (md == null) {
       // 刚被改成不限量：把标记去掉
       if (live) live.remove();
       return;
@@ -3268,8 +3508,8 @@ function updateCapacityLive() {
     live.textContent = capLiveText(cap);
     live.className = "cap-live" + (full ? " full" : "");
     live.title = full
-      ? "此刻已满：新请求会先换别家，全都满了才排队等"
-      : "此刻还有余量";
+      ? "今天额度已用满：新请求会先换别家，明天清零"
+      : "今天还有余量";
   });
 }
 

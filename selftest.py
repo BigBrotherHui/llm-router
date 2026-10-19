@@ -32,6 +32,10 @@ auths: dict[str, list] = {"a": [], "b": [], "c": [], "d": []}
 behavior: dict[str, str] = {"a": "ok", "b": "ok", "c": "ok", "d": "ok"}
 # 每个假上游的人工延迟（秒），用来让「按测速重排」的结果可预测
 delay: dict[str, float] = {"a": 0.0, "b": 0.0, "c": 0.0, "d": 0.0}
+# 「读超时换 Key」测试用：stall_keys[tag] 是子串，Authorization 里含它就拖住不回。
+# 非流式：连响应头都不给（整家卡死）；流式：响应头给了但首块迟迟不来（模型不出字）。
+stall_keys: dict[str, str] = {"a": "", "b": "", "c": "", "d": ""}
+stall_seconds: dict[str, float] = {"a": 5.0, "b": 5.0, "c": 5.0, "d": 5.0}
 last_error_payload: dict[str, bytes] = {}
 lock = threading.Lock()
 
@@ -74,6 +78,7 @@ class UpstreamServer(BaseHTTPRequestHandler):
 
     def log_message(self, *a):
         pass
+
 
     def _strict_path(self) -> bool:
         """有些真实上游只认一种路径，拼错就 404。
@@ -154,6 +159,30 @@ class UpstreamServer(BaseHTTPRequestHandler):
         if wait:
             time.sleep(wait)
 
+        # 「这个 Key 被拖住」模式：测读超时换 Key。
+        # 非流式不给响应头；流式给头但不给首块（模型卡住不出字的真实样子）。
+        with lock:
+            stall = stall_keys.get(self.tag, "")
+            stall_wait = stall_seconds.get(self.tag, 5.0)
+        if stall and stall in (self.headers.get("Authorization") or ""):
+            if self.path.endswith("/stream") or body.get("stream"):
+                self.send_response(200)
+                self.send_header("Content-Type", "text/event-stream")
+                self.send_header("Transfer-Encoding", "chunked")
+                self.end_headers()
+                time.sleep(stall_wait)
+                # 响应头已发但首块不来，然后把连接掐了（模拟上游中途死掉）。
+                # 必须关闭连接：HTTP/1.1 keep-alive 下不关的话双方互相等，
+                # 会一直挂到客户端超时，测不出「换 Key」。
+                self.close_connection = True
+                return
+            time.sleep(stall_wait)
+            return
+
+        if behave.startswith("fail_model:") and model == behave.split(":", 1)[1]:
+            # 只拒某一个模型（其余模型正常）——用来构造「同一分组、同一上游、
+            # 两个真实模型」的请求记录，验证按模型细分的统计/筛选。
+            return self._json(401, {"error": {"message": f"{self.tag} 的 {model} 不可用"}})
         if behave == "fail500":
             return self._json(500, {"error": {"message": f"{self.tag} 挂了"}})
         if behave == "fail429":
@@ -173,6 +202,20 @@ class UpstreamServer(BaseHTTPRequestHandler):
             self.end_headers()
             self.wfile.write(payload)
             return
+        if behave == "capability_400":
+            # 模拟中转的能力限制：工具调用要求 Responses API，但账户只开 Chat Completions
+            # （真实案例：dli_gpt 的 gpt-6.1-sol）。这不该原样甩给客户端，要换下一家。
+            return self._json(400, {"error": {
+                "message": "gpt-6.1-sol requires Responses for tool calls; "
+                           "this account only supports Chat Completions",
+                "type": "invalid_request_error"}})
+        if behave == "invalid_400":
+            # 模拟 sensenova 的 kimi-k3 实况（2026-10-16）：偶发 400
+            # 「inference request is invalid / InvalidParameter」——同一请求此前先被
+            # 429 限流、之后同样大的请求又正常，属上游侧间歇拒绝，要换下一家。
+            return self._json(400, {"error": {
+                "message": "inference request is invalid",
+                "type": "invalid_request_error", "code": "InvalidParameter"}})
         if behave == "empty_stream":
             self.send_response(200)
             self.send_header("Content-Type", "text/event-stream")
@@ -214,6 +257,59 @@ class UpstreamServer(BaseHTTPRequestHandler):
             self.send_header("Content-Type", "text/event-stream")
             self.send_header("Transfer-Encoding", "chunked")
             self.end_headers()
+            if behave == "bare_error_stream":
+                # dli_gpt 实见：200 的流里只有 heartbeat 注释 + 一行**没有 data:
+                # 前缀**的裸 JSON 错误。标准 SSE 客户端解析失败；路由器要能识别并换家。
+                self._write_chunk(b": heartbeat\n\n")
+                self._write_chunk(b": heartbeat\n\n")
+                ev = {"error": {"message": "gpt-6.1-sol requires Responses for tool calls; "
+                                           "this account only supports Chat Completions",
+                                "type": "invalid_request_error"}}
+                self._write_chunk((json.dumps(ev) + "\n\n").encode())
+                self.wfile.write(b"0\r\n\r\n")
+                self.wfile.flush()
+                return
+            if behave == "binary_stream":
+                # 200 的流里直接是 gzip 二进制（网关错误页/压缩内容）
+                self._write_chunk(b"\x1f\x8b\x08\x00\x00\x00\x00\x00\x00\xff" + b"\x9c" * 120)
+                self.wfile.write(b"0\r\n\r\n")
+                self.wfile.flush()
+                return
+            if behave == "bare_error_mid":
+                # 先正常吐一块，再跟一行裸 JSON 错误（流到一半才暴露）
+                ev0 = json.dumps({"model": model,
+                                  "choices": [{"delta": {"content": f"{self.tag}0"}}]})
+                self._write_chunk(f"data: {ev0}\n\n".encode())
+                time.sleep(0.25)
+                ev = {"error": {"message": "The service is busy. Please retry later.",
+                                "type": "upstream_error"}}
+                self._write_chunk((json.dumps(ev) + "\n\n").encode())
+                self.wfile.write(b"0\r\n\r\n")
+                self.wfile.flush()
+                return
+            if behave == "stream_error_first":
+                # 200 的流，首块就是错误事件（中转繁忙/过载时真实出现过）。
+                # 路由器应该在把流发给客户端之前拦下、换下一家。
+                ev = {"error": {"message": "The service is busy. Please retry later.",
+                                "type": "upstream_error"}}
+                self._write_chunk(f"data: {json.dumps(ev)}\n\n".encode())
+                self._write_chunk(b"data: [DONE]\n\n")
+                self.wfile.write(b"0\r\n\r\n")
+                self.wfile.flush()
+                return
+            if behave == "stream_error_mid":
+                # 先正常吐一块，再夹错误事件：模拟「流到一半才报繁忙」。
+                ev0 = json.dumps({"model": model,
+                                  "choices": [{"delta": {"content": f"{self.tag}0"}}]})
+                self._write_chunk(f"data: {ev0}\n\n".encode())
+                time.sleep(0.25)   # 让路由器先把首块读走，错误落到后续块
+                ev = {"error": {"message": "The service is busy. Please retry later.",
+                                "type": "upstream_error"}}
+                self._write_chunk(f"data: {json.dumps(ev)}\n\n".encode())
+                self._write_chunk(b"data: [DONE]\n\n")
+                self.wfile.write(b"0\r\n\r\n")
+                self.wfile.flush()
+                return
             if body.get("tool_choice") and behave != "ignore_tools":
                 ev = {"choices": [{"delta": {"tool_calls": [{"index": 0, "id": "call_test", "type": "function",
                        "function": {"name": "diagnostic_echo", "arguments": '{"value":"OK"}'}}]},
@@ -255,10 +351,17 @@ class UpstreamServer(BaseHTTPRequestHandler):
         })
 
 
+class QuietServer(ThreadingHTTPServer):
+    """客户端超时/断开是超时用例的预期行为，别把 traceback 打到测试输出里。"""
+
+    def handle_error(self, request, client_address):
+        pass
+
+
 def start_upstreams():
     for tag, port in UP_PORTS.items():
         cls = type(f"Up_{tag}", (UpstreamServer,), {"tag": tag})
-        srv = ThreadingHTTPServer(("127.0.0.1", port), cls)
+        srv = QuietServer(("127.0.0.1", port), cls)
         srv.daemon_threads = True
         threading.Thread(target=srv.serve_forever, daemon=True).start()
 
@@ -483,6 +586,8 @@ def reset_hits():
             uas[k].clear()
         for k in auths:
             auths[k].clear()
+        for k in stall_keys:
+            stall_keys[k] = ""
 
 
 def cleanup():
@@ -2406,10 +2511,12 @@ def main():
         st, byup = get("/admin/journal?group=deepseek-chat&upstream=up-a")
         check("按上游筛选命中条数正确",
               byup.get("total") == sent, str(byup.get("total")))
-        ups = {u["key"]: u for u in (byup.get("upstreams") or [])}
+        # upstreams 统计现在按「上游 + 真实模型」细分（key 形如 "up-a · deepseek-chat"）。
+        # 这里所有请求都是 up-a 的 deepseek-chat，按 upstream 字段找即可。
+        ups = [u for u in (byup.get("upstreams") or []) if u.get("upstream") == "up-a"]
         check("分组内上游计数带调用数和失败数",
-              ups.get("up-a", {}).get("calls") == sent
-              and ups.get("up-a", {}).get("failed") == 0, str(ups))
+              len(ups) == 1 and ups[0].get("calls") == sent
+              and ups[0].get("failed") == 0, str(ups))
         st, byup2 = get("/admin/journal?group=deepseek-chat&upstream="
                         + urllib.parse.quote("不存在"))
         check("筛一个不存在的上游得到 0 条",
@@ -2480,9 +2587,9 @@ def main():
                       and not (s or {}).get("ok")
                       for s in (e.get("trail") or [])) for e in rows),
               f"total={fo.get('total')}")
-        foups = {u["key"]: u for u in (fo.get("upstreams") or [])}
+        foups = [u for u in (fo.get("upstreams") or []) if u.get("upstream") == "up-a"]
         check("组内上游计数按每次尝试（失败也计入）",
-              foups.get("up-a", {}).get("failed", 0) >= 1, str(foups))
+              foups and sum(u.get("failed", 0) for u in foups) >= 1, str(foups))
     finally:
         stop_router(p)
 
@@ -2730,100 +2837,61 @@ def main():
     finally:
         stop_router(p)
 
-    # ================= 32. 上游并发 / 速率上限 =================
-    print("\n[32] 上游并发 / 速率上限")
+    # ================= 32. 上游每天上限 =================
+    print("\n[32] 上游每天上限（自然日配额）")
     cfg = write_config()
     p = start_router(cfg)
     try:
         admin("/admin/fetch-models")
         admin("/admin/select-models", {"id": "a1", "models": ["deepseek-chat"]})
 
-        st, r = admin("/admin/upstream/capacity",
-                      {"id": "a1", "max_concurrent": 2, "max_per_minute": 0})
-        check("设置并发上限成功", st == 200 and r.get("max_concurrent") == 2, str(r)[:200])
-        check("0 表示不限速率（回 null）", r.get("max_per_minute") is None, str(r)[:200])
-
-        st, snap = get("/stats")
-        by_id = {u["id"]: u for u in snap["upstreams"]}
-        cap = by_id["a1"].get("capacity") or {}
-        check("snapshot 带 capacity（含实时占用）",
-              cap.get("max_concurrent") == 2 and "in_flight" in cap and "has_room" in cap,
-              json.dumps(cap, ensure_ascii=False))
-        check("空闲时 has_room=True", cap.get("has_room") is True,
-              json.dumps(cap, ensure_ascii=False))
-
-        # 上限必须随状态持久化（重启后还在）
-        st, snap = get("/stats")
-        check("capacity 挂在落盘状态里",
-              (snap["upstreams"][0].get("capacity") or {}).get("max_concurrent") == 2
-              or any((u.get("capacity") or {}).get("max_concurrent") == 2
-                     for u in snap["upstreams"]),
-              json.dumps([u.get("capacity") for u in snap["upstreams"]], ensure_ascii=False))
-
-        # 慢上游 + 并发上限：同时发出的请求不能超过上限
-        delay["a"] = 0.5     # 让每个请求慢 0.5s，才看得出发并发上限
-        peak = {"a": 0}
-        # 假上游里记录了 hits，但并发峰值需要另测：用并发请求跑一遍，
-        # 只要全部成功、且耗时呈「分批」特征，就说明闸门在起作用。
-        results = []
-        lock2 = threading.Lock()
-
-        def one():
-            st, rr = admin("/v1/chat/completions",
-                           {"model": "deepseek-chat",
-                            "messages": [{"role": "user", "content": "hi"}]})
-            with lock2:
-                results.append(st)
-
-        threads = [threading.Thread(target=one) for _ in range(6)]
-        t0 = time.time()
-        for t in threads:
-            t.start()
-        for t in threads:
-            t.join()
-        elapsed = time.time() - t0
-        check("并发下请求全部成功", results.count(200) == 6, str(results))
-        # a1 上限 2、每个 0.5s：6 个请求至少分 3 批 ≈ 1.5s。
-        # 完全不限并发的话 6 个并排跑完只要 ~0.5s。
-        check("被并发上限串行化（耗时应 ≥ 1.4s）", elapsed >= 1.4, f"实测 {elapsed:.2f}s")
-        delay["a"] = 0.0
-
-        # 上游失败时凭据必须归还，否则上限会越用越少。
-        # 释放发生在 _try_upstream 的 finally 里，紧跟请求返回，稍等一下再读。
-        time.sleep(0.4)
+        # 计数从「设上限那一刻」起算：先设 3，然后连发 4 个
+        st, r = admin("/admin/upstream/capacity", {"id": "a1", "max_per_day": 3})
+        check("设置每天上限成功", st == 200 and r.get("max_per_day") == 3, str(r)[:200])
         st, snap = get("/stats")
         cap = next(u["capacity"] for u in snap["upstreams"] if u["id"] == "a1")
-        check("请求跑完后 in_flight 归零（凭据没泄漏）", cap.get("in_flight") == 0,
+        check("snapshot 带 capacity（含今天已用）",
+              cap.get("max_per_day") == 3 and cap.get("used_today") == 0
+              and cap.get("has_room") is True,
               json.dumps(cap, ensure_ascii=False))
 
-        # 速率上限：连发超过上限就被挡（1 分钟窗口）
-        admin("/admin/upstream/capacity", {"id": "a1", "max_concurrent": 0,
-                                           "max_per_minute": 3})
+        for n in (1, 2, 3):
+            st, r = admin("/v1/chat/completions",
+                          {"model": "deepseek-chat", "messages": [{"role": "user", "content": "hi"}]})
+            check(f"第 {n} 个请求成功（今天用满前）", st == 200, f"{st} {str(r)[:120]}")
         st, snap = get("/stats")
         cap = next(u["capacity"] for u in snap["upstreams"] if u["id"] == "a1")
-        check("速率上限已生效（max_per_minute=3）", cap.get("max_per_minute") == 3,
+        check("用完额度的计数如实带出", cap.get("used_today") == 3 and cap.get("has_room") is False,
               json.dumps(cap, ensure_ascii=False))
-        # 第 1 个请求就会占掉窗口里的一格
-        admin("/v1/chat/completions", {"model": "deepseek-chat",
-                                       "messages": [{"role": "user", "content": "hi"}]})
+        st, r = admin("/v1/chat/completions",
+                      {"model": "deepseek-chat", "messages": [{"role": "user", "content": "hi"}]})
+        check("超过每天上限被挡（429 已用满）", st == 429 and "已用满" in str(r)[:300],
+              f"{st} {str(r)[:300]}")
+
+        # 上限必须随状态持久化（重启后今天的用量还在、不会重新放行）。
+        # 任何管理操作都会顺带保存（后台线程每 30 秒也会轻量保存，测试不等它）。
+        admin("/admin/upstream/update", {"id": "a1", "name": "up-a"})
+        stop_router(p)
+        p = start_router(cfg)
         st, snap = get("/stats")
         cap = next(u["capacity"] for u in snap["upstreams"] if u["id"] == "a1")
-        check("用掉的次数被记进滑动窗口", cap.get("used_last_minute", 0) >= 1,
+        check("重启后当天用量恢复（不归零）",
+              cap.get("used_today") == 3 and cap.get("has_room") is False,
               json.dumps(cap, ensure_ascii=False))
+        st, r = admin("/v1/chat/completions",
+                      {"model": "deepseek-chat", "messages": [{"role": "user", "content": "hi"}]})
+        check("重启后超过上限仍被挡", st == 429, f"{st} {str(r)[:200]}")
 
         # 清掉上限后回到不限量
-        st, r = admin("/admin/upstream/capacity", {"id": "a1", "max_concurrent": 0,
-                                                   "max_per_minute": 0})
-        check("清掉上限后返回 null",
-              r.get("max_concurrent") is None and r.get("max_per_minute") is None,
-              str(r)[:200])
+        st, r = admin("/admin/upstream/capacity", {"id": "a1", "max_per_day": 0})
+        check("清掉上限后返回 null", r.get("max_per_day") is None, str(r)[:200])
         st, snap = get("/stats")
         cap = next(u["capacity"] for u in snap["upstreams"] if u["id"] == "a1")
         check("不限量时 has_room=True", cap.get("has_room") is True,
               json.dumps(cap, ensure_ascii=False))
 
         # 不存在的上游要报错
-        st, r = admin("/admin/upstream/capacity", {"id": "不存在", "max_concurrent": 2})
+        st, r = admin("/admin/upstream/capacity", {"id": "不存在"})
         check("给不存在的上游设上限会报错", st >= 400, f"{st} {str(r)[:150]}")
     finally:
         stop_router(p)
@@ -2970,6 +3038,19 @@ def main():
               auths["a"] and auths["a"][-1] == "Bearer sk-backup-000002",
               str(auths["a"]))
 
+        # 4a) 请求记录要能看见这次实际用的是哪个 Key（名字，不是打码值）
+        st, hist = get("/admin/history")
+        entry = (hist.get("history") or [])[-1]
+        check("请求记录带出实际使用的 Key 名字",
+              entry.get("key") == "二号", str(entry.get("key")))
+        check("尝试链最后一步也带 Key 名字",
+              bool(entry.get("trail")) and entry["trail"][-1].get("key") == "二号",
+              str((entry.get("trail") or [{}])[-1]))
+        st, jp = get("/admin/journal?limit=1")
+        jentry = (jp.get("entries") or [{}])[0]
+        check("落盘流水里也有 Key 名字",
+              jentry.get("key") == "二号", str(jentry.get("key")))
+
         # 4b) 逐 Key 测试：key_index 定位已保存的 Key、model 指定测哪个模型，不碰轮转下标
         reset_hits()
         st, r = admin("/admin/speedtest", {"key_test": {"id": "a1", "key_index": 1,
@@ -3110,6 +3191,284 @@ def main():
         a1 = next(u for u in snap["upstreams"] if u["id"] == "a1")
         check("不带的条目被删除", a1["key_count"] == 1
               and a1["key_hints"] == [hints2[1]], str(a1["key_hints"]))
+
+        # 10) 同一分组里同一个上游挂了两个模型：请求记录要能按「上游 · 模型」分开看
+        admin("/admin/upstream/update", {"id": "a1", "api_keys": [
+            {"id": None, "name": "主号", "key": "sk-primary-000001"}]})
+        behavior["a"] = "ok"
+        admin("/admin/fetch-models", {"ids": ["a1"]})
+        admin("/admin/select-models", {"id": "a1",
+                                       "models": ["deepseek-chat", "glm-4.6"]})
+        admin("/admin/set-group", {"id": "a1", "mapping": {
+            "deepseek-chat": "grp", "glm-4.6": "grp"}})
+        # 让真实模型 deepseek-chat 被上游拒掉 → 分组内换到同一上游的 glm-4.6，
+        # 这样一条请求的 trail 里出现同一上游的两个模型。
+        behavior["a"] = "fail_model:deepseek-chat"
+        reset_hits()
+        st, raw, _hdr = post(body={"model": "grp",
+                                   "messages": [{"role": "user", "content": "hi"}]})
+        check("分组内同一上游换模型成功", st == 200, f"{st} {str(raw)[:150]}")
+        behavior["a"] = "ok"
+
+        st, jp = get("/admin/journal?group=grp")
+        ups_stat = jp.get("upstreams") or []
+        by_model = {(x.get("upstream"), x.get("model")): x for x in ups_stat}
+        up_name = (ups_stat[0].get("upstream") if ups_stat else "up-a")
+        check("同一上游的两个模型分别出现在统计里",
+              len(ups_stat) == 2
+              and by_model.get((up_name, "deepseek-chat"), {}).get("calls") == 1
+              and by_model.get((up_name, "glm-4.6"), {}).get("calls") == 1,
+              str(ups_stat)[:300])
+        check("被拒的模型标记为失败",
+              by_model.get((up_name, "deepseek-chat"), {}).get("failed") == 1,
+              str(ups_stat)[:300])
+        st, jp2 = get("/admin/journal?group=grp&upstream=" + up_name +
+                      "&model=glm-4.6")
+        check("按上游+模型筛选只返回试过该模型的请求",
+              jp2.get("total") == 1, str(jp2.get("total")))
+        st, snap = get("/stats?range=all")
+        grp = next((g for g in (snap.get("stats_range") or {}).get("groups", [])
+                    if g.get("group") == "grp"), {})
+        gu = (grp.get("upstreams") or [{}])[0]
+        check("分组统计里带模型细分",
+              {m.get("model") for m in (gu.get("models") or [])}
+              == {"deepseek-chat", "glm-4.6"},
+              str(gu.get("models"))[:300])
+    finally:
+        stop_router(p)
+
+    # ================= 36. 上游能力限制 400 / 流内错误事件 =================
+    # 场景一：中转对工具调用要求 Responses API、账户只开 Chat Completions，
+    # 带 tools 的请求被 400 拒（真实案例：dli_gpt 的 gpt-6.1-sol）。
+    # 这不是客户端请求错 —— 要像上游故障一样换下一家，而不是把 400 甩给客户端。
+    # 场景二：上游用 200 的 SSE 夹错误事件（繁忙/过载）。首块能在发流前拦下、
+    # 换下一家；流到一半才报错的换不了，但至少不能记成成功。
+    print("\n[36] 上游能力限制 400 / 流内错误事件")
+    cleanup()
+    cfg = write_config(with_routes=True)      # deepseek-chat: a→b→c
+    behavior["a"] = "capability_400"
+    p = start_router(cfg)
+    try:
+        reset_hits()
+        st, body, hdr = post(body={
+            "model": "deepseek-chat",
+            "messages": [{"role": "user", "content": "hi"}],
+            "tools": [{"type": "function",
+                       "function": {"name": "f", "parameters": {"type": "object"}}}]})
+        check("能力限制 400 会自动换下一个上游",
+              st == 200 and hdr.get("X-Upstream") == "up-b",
+              f"status={st} up={hdr.get('X-Upstream')}")
+        check("换上游后回复正常", b"hi from b" in body, str(body[:100]))
+        check("被拒的上游确实试过了", hits["a"] == ["deepseek-chat"], str(hits["a"]))
+        check("客户端没收到上游的 400 文案",
+              b"requires Responses" not in body, str(body[:150]))
+
+        _, hist_raw = get("/admin/history")
+        trail = hist_raw["history"][-1]["trail"]
+        check("trail 第一步记录了拒绝原因",
+              len(trail) == 2 and trail[0]["ok"] is False
+              and "requires Responses" in trail[0]["reason"], str(trail))
+
+        # 所有上游都能力受限：客户端拿到 400 原文（不被吞成 502）
+        behavior["b"] = behavior["c"] = "capability_400"
+        st, body, hdr = post(body={"model": "deepseek-chat",
+                                   "messages": [{"role": "user", "content": "hi"}]})
+        check("全都能力受限时透传 400", st == 400, str(st))
+        check("400 详情保留上游原文", b"requires Responses" in body, str(body[:200]))
+        behavior["b"] = behavior["c"] = "ok"
+
+        # sensenova kimi-k3 实况：400「inference request is invalid」是上游侧
+        # 间歇拒绝（先 429 后 400、随后正常），也要自动换下一家而不是打死请求
+        reset_hits()
+        behavior["a"] = "invalid_400"
+        st, body, hdr = post(body={"model": "deepseek-chat",
+                                   "messages": [{"role": "user", "content": "hi"}]})
+        check("inference request is invalid 400 会自动换下一个上游",
+              st == 200 and hdr.get("X-Upstream") == "up-b",
+              f"status={st} up={hdr.get('X-Upstream')}")
+        check("换上游后回复正常（invalid 400）", b"hi from b" in body, str(body[:100]))
+        check("客户端没收到上游的 invalid 400 文案",
+              b"inference request is invalid" not in body, str(body[:150]))
+        behavior["a"] = "ok"
+
+        # 失败的记录也要如实带 stream 标志（此前这两条失败路径固定记成 false，
+        # 查「流式请求为什么 400」时会误导）
+        behavior["a"] = "fail400"
+        st, body, hdr = post(body={"model": "deepseek-chat", "stream": True,
+                                   "messages": [{"role": "user", "content": "hi"}]})
+        _, hist_raw = get("/admin/history")
+        entry = hist_raw["history"][-1]
+        check("客户端错误的失败记录带 stream=true",
+              st == 400 and entry["status"] == 400 and entry["stream"] is True,
+              f'status={st} rec_stream={entry.get("stream")}')
+        behavior["a"] = "ok"
+
+        # 首块就是错误事件的流：发流前拦截 → 换下一家（客户端看不到错误事件）
+        reset_hits()
+        behavior["a"] = "stream_error_first"
+        st, body, hdr = post(body={"model": "deepseek-chat", "stream": True,
+                                   "messages": [{"role": "user", "content": "hi"}]})
+        check("流首块错误会换下一个上游",
+              hdr.get("X-Upstream") == "up-b", str(hdr.get("X-Upstream")))
+        check("拦截后没把错误事件透传给客户端",
+              b"service is busy" not in body and b"b0" in body, str(body[:200]))
+        check("能力受限不误伤健康（a 仍被优先尝试）",
+              hits["a"] == ["deepseek-chat"], str(hits["a"]))
+        behavior["a"] = "ok"
+
+        # 流到一半才夹错误事件：换不了上游了，但这次不能记成功
+        _, snap0 = get("/stats")
+        a0 = next(u for u in snap0["upstreams"] if u["id"] == "a1")
+        base_fail = a0["failures"]
+        reset_hits()
+        behavior["a"] = "stream_error_mid"
+        st, body, hdr = post(body={"model": "deepseek-chat", "stream": True,
+                                   "messages": [{"role": "user", "content": "hi"}]})
+        check("流中错误仍正常结束（200）", st == 200, str(st))
+        check("已流出的内容照常转发", b"a0" in body, str(body[:200]))
+        check("流中的错误事件如实透传（客户端能看见）",
+              b"service is busy" in body, str(body[-200:]))
+        _, hist_raw = get("/admin/history")
+        entry = hist_raw["history"][-1]
+        check("流中错误不记成功",
+              entry["ok"] is False and entry["status"] == 502
+              and "流式返回错误" in (entry.get("error") or ""),
+              f'{entry.get("status")} {entry.get("error")}')
+        _, snap1 = get("/stats")
+        a1 = next(u for u in snap1["upstreams"] if u["id"] == "a1")
+        check("流中错误计入上游失败", a1["failures"] == base_fail + 1,
+              f'{base_fail} -> {a1["failures"]}')
+        behavior["a"] = "ok"
+    finally:
+        stop_router(p)
+        behavior["a"] = "ok"
+
+    # ================= 36. 读超时：换下一个 Key / 全试完换下一家 =================
+    # 上游卡住不回复时：有多个 Key 就每个 Key 各试一次，全试完才换下一家；
+    # 单 Key 也一样支持（超时 = 这次尝试失败，直接换下一家）。
+    print("\n[36] 首包超时：卡住就换下一个 Key / 换下一家 + 全局默认参数")
+    cleanup()
+    cfg = write_config(with_routes=True)
+    p = start_router(cfg)
+    try:
+        # a1 配两个 Key：第一个被拖住、第二个正常；首包超时 1 秒
+        st, r = admin("/admin/upstream/update", {"id": "a1",
+                                                 "api_keys": ["sk-stall-1111", "sk-good-2222"],
+                                                 "key_strategy": "failover",
+                                                 "first_timeout_seconds": 1})
+        check("首包超时能保存", st == 200, f"{st} {str(r)[:150]}")
+        st, snap = get("/stats")
+        a1 = next(u for u in snap["upstreams"] if u["id"] == "a1")
+        check("快照带出首包超时", a1.get("first_timeout_seconds") == 1,
+              str(a1.get("first_timeout_seconds")))
+
+        # 1) 第一个 Key 卡住 → 超时后换第二个 Key，同一家成功
+        reset_hits()
+        with lock:
+            stall_keys["a"] = "sk-stall"
+        t0 = time.time()
+        st, raw, _ = post()
+        elapsed = time.time() - t0
+        check("卡住的 Key 超时后换下一个 Key 成功", st == 200, str(st))
+        check("确实按顺序试了两个 Key",
+              auths["a"] == ["Bearer sk-stall-1111", "Bearer sk-good-2222"],
+              str(auths["a"]))
+        check("1 秒超时生效（没有等它 5 秒）", elapsed < 4, f"{elapsed:.2f}s")
+
+        # 2) 两个 Key 都卡住 → 每个各试一次，然后换下一家（b1）
+        reset_hits()
+        with lock:
+            stall_keys["a"] = "sk-"
+        t0 = time.time()
+        st, raw, _ = post()
+        elapsed = time.time() - t0
+        check("全部 Key 卡住 → 换下一家成功", st == 200, str(st))
+        check("b 家收到请求（真的换过去了）",
+              hits["b"] == ["deepseek-ai/DeepSeek-V3"], str(hits["b"]))
+        # 顺序不固定：上一个用例成功后当前 Key 停在第二个上，先从哪个试都算对
+        check("两个 Key 各试一次才放弃",
+              sorted(auths["a"]) == sorted(["Bearer sk-stall-1111",
+                                            "Bearer sk-good-2222"]),
+              str(auths["a"]))
+        check("总耗时≈两次超时", elapsed < 6, f"{elapsed:.2f}s")
+
+        # 3) 流式：响应头来了但首块迟迟不来（模型卡住不出字）→ 换下一个 Key
+        reset_hits()
+        with lock:
+            stall_keys["a"] = "sk-stall"
+        st, raw, _ = _req("/v1/chat/completions", {
+            "model": "deepseek-chat",
+            "messages": [{"role": "user", "content": "hi"}], "stream": True})
+        check("流式首块卡住 → 换下一个 Key 后出流",
+              st == 200 and b"data:" in raw, f"{st} {raw[:120]}")
+        check("流式也是先试卡住的 Key 再换",
+              auths["a"] == ["Bearer sk-stall-1111", "Bearer sk-good-2222"],
+              str(auths["a"]))
+
+        # 4) 单 Key 也支持：超时后直接换下一家
+        admin("/admin/upstream/update", {"id": "a1", "api_keys": ["sk-stall-3333"]})
+        reset_hits()
+        with lock:
+            stall_keys["a"] = "sk-"
+        st, raw, _ = post()
+        check("单 Key 超时后直接换下一家",
+              st == 200 and auths["a"] == ["Bearer sk-stall-3333"] and hits["b"],
+              f"{st} {auths['a']} {hits['b']}")
+
+        # 5) 「设置」页的全局默认：保存后覆盖所有上游（单个配过的也覆盖），新加的上游也用它
+        admin("/admin/upstream/update", {"id": "a1", "first_timeout_seconds": 9})
+        st, snap = get("/stats")
+        a1 = next(u for u in snap["upstreams"] if u["id"] == "a1")
+        check("单上游可以先单独配", a1.get("first_timeout_seconds") == 9,
+              str(a1.get("first_timeout_seconds")))
+        st, r = admin("/admin/defaults", {"first_timeout_seconds": 2,
+                                          "connect_timeout_seconds": 5})
+        check("保存全局默认成功", st == 200, f"{st} {str(r)[:150]}")
+        st, snap = get("/stats")
+        ups = {u["id"]: u for u in snap["upstreams"]}
+        check("单个配过的上游也被全局覆盖",
+              ups["a1"].get("first_timeout_seconds") == 2,
+              str(ups["a1"].get("first_timeout_seconds")))
+        check("其它上游同样用新默认",
+              ups["b1"].get("first_timeout_seconds") == 2
+              and ups["c1"].get("first_timeout_seconds") == 2,
+              f'{ups["b1"].get("first_timeout_seconds")}/{ups["c1"].get("first_timeout_seconds")}')
+        check("连接超时一起应用了",
+              ups["a1"].get("connect_timeout_seconds") == 5,
+              str(ups["a1"].get("connect_timeout_seconds")))
+        check("stats 带出全局默认",
+              (snap.get("defaults") or {}).get("first_timeout_seconds") == 2,
+              str(snap.get("defaults")))
+        st, r = admin("/admin/upstream/add", {"name": "新上游X",
+                                              "base_url": "http://127.0.0.1:9/v1",
+                                              "api_key": "k"})
+        st, snap = get("/stats")
+        nu = next(u for u in snap["upstreams"] if u["name"] == "新上游X")
+        check("新加的上游继承全局默认",
+              nu.get("first_timeout_seconds") == 2
+              and nu.get("connect_timeout_seconds") == 5,
+              f'{nu.get("first_timeout_seconds")}/{nu.get("connect_timeout_seconds")}')
+
+        # 6) 留空 = 回到出厂默认（首包 15 / 连接 10）
+        st, r = admin("/admin/defaults", {"first_timeout_seconds": "",
+                                          "connect_timeout_seconds": ""})
+        check("留空回到出厂默认（15/10）",
+              (r.get("defaults") or {}).get("first_timeout_seconds") == 15
+              and (r.get("defaults") or {}).get("connect_timeout_seconds") == 10,
+              str(r.get("defaults")))
+        admin("/admin/defaults", {"first_timeout_seconds": 2, "connect_timeout_seconds": 5})
+
+        # 7) 单上游值与全局默认随状态持久化（重启后还在）
+        stop_router(p)
+        p = start_router(cfg)
+        st, snap = get("/stats")
+        a1 = next(u for u in snap["upstreams"] if u["id"] == "a1")
+        check("重启后单上游值还在", a1.get("first_timeout_seconds") == 2,
+              str(a1.get("first_timeout_seconds")))
+        check("重启后全局默认还在（2/5）",
+              (snap.get("defaults") or {}).get("first_timeout_seconds") == 2
+              and (snap.get("defaults") or {}).get("connect_timeout_seconds") == 5,
+              str(snap.get("defaults")))
     finally:
         stop_router(p)
 

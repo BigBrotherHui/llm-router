@@ -1,5 +1,214 @@
 # NOTES
 
+## 2026-10-17 v2.7.2：200 流里的「裸 JSON 错误」与二进制垃圾
+
+现象（用户报）：调 gpt-6.1-sol 客户端报错，但请求记录全是 200；上游（dli_gpt）后台日志全是
+400「gpt-6.1-sol requires Responses for tool calls; this account only supports Chat Completions」。
+
+复现（直连 api.dlizz.com，同一 Key）：
+- 带工具 + stream=false → 老老实实回 HTTP 400（v2.4.9 已能识别并换家）。
+- 带工具 + stream=true → **HTTP 200 + `: heartbeat` 注释 + 一行没有 `data:` 前缀的裸 JSON 错误**
+  （`{"error":{"message":"gpt-6.1-sol requires Responses ..."}}`）→ 标准 SSE 客户端解析失败；
+  我们此前只认 `data:` 行 → 识别不到 → 记成 200 成功（usage/正文都是空）。
+- 不带工具（流式/非流式）→ 正常。错误只在「工具调用」这条路上出现，且间歇（同时段别的
+  请求又是通的）。
+- 前一天见到的二进制（gzip）垃圾流同属「200 里塞非 SSE 内容」这一类。
+
+做法（router.py）：
+- `collect_sse`：除了 `data:` 行，也解析**以 `{` 开头的裸 JSON 行**（当错误事件处理）。
+- `looks_like_binary_stream()`：200 流里出现 gzip magic / 非 UTF-8 且完全没有 SSE 结构的
+  二进制 → 当上游故障。
+- `_relay_stream`：首块若只有 `:` 注释（heartbeat），继续往下读，直到出现非注释行
+  （错误行通常紧跟心跳，dli_gpt 实见）—— 按墙钟最多偷看 10 秒 / 1MB。
+  **不能用 socket 超时来限时**：读超时会把 http.client 的缓冲对象弄坏
+  （`cannot read from timed out object`，实测），之后整条流都读不了。
+  拿到错误/二进制 → 头未发，换 Key / 换下一家。
+  流中段才出现裸 JSON 错误 → 换不了，但不记成功（502 + 原因），且**不再把裸 JSON 转发给客户端**；
+  二进制块同样停止转发。正常流不受影响：一出现非注释行立即结束偷看，不多等。
+- `selftest.py`：假上游新增 `bare_error_stream` / `binary_stream` / `bare_error_mid`；
+  第 38 组 8 项（首块裸 JSON 换家、二进制换家、流中裸 JSON 不记成功且不回传垃圾、全坏流回 502）。
+
+验证：`python selftest.py` **571 项全过**；8010 已重启到 2.7.2；重启后经 8010 实测 3 次
+gpt-6.1-sol 工具请求全部正常（此刻 dli_gpt 又好了 —— 间歇性，故障窗口内会由新逻辑换家）。
+
+## 2026-10-17 升级 v1.4.1；免费档门禁收紧，官方 CLI 也 403
+
+- 仓库确认为同一个 `jasonxu114514/opencode2api`；本地此前是 v1.4.0，上游已发 v1.4.1（2026-10-16）。
+- v1.4.1 主要变化：优先 legacy `/zen/v1` 匿名通道并回退 `/inference`、轮询别名走匿名通道、代理池轮换、WebUI 重建；`clientVersion` 两版都是 `2.0.29`。
+- 已升级：下载 v1.4.1 Windows amd64 包（SHA256 与官方一致），解压到 `bin/`，`start-proxy.ps1` 指向新 exe；`config.json` 未变，`/healthz` 显示 `v1.4.1`、`zen:1`。
+- 关键结论：**当前 403 与版本无关**。v1.4.1 与并排启动的 v1.4.0 都是 403；**官方 CLI 1.18.35 和 1.19.3 今天也 403**（昨天官方 CLI 还能返回 OK）。
+- 日志形态：`legs":"anon:403 ... kfYbd:403 ..."` —— 匿名与 key 两条通道都被门禁拒绝，不是 429 限流。
+- 用户 key 有效但账号无余额：付费模型直连 `402 Insufficient account funds`。
+- 判断：上游免费档对本机/IP 收紧（或改为要求登录账号），与反代实现无关。可选：换出口 IP；登录 OpenCode 账号；等；充值用付费模型。
+- 已清理并排测试实例（8012）与临时配置；8011 保持 v1.4.1 运行。
+- 社区排查（2026-10-17）：上游 issue #105，作者答复「确保版本在 commit 2319941a6a 之后并检查 IP 归属」。v1.4.1 已包含该 commit。
+- 用 `ebouther/opencode-unlimited-proxy` 的 `scripts/gate-probe.py` 实测：baseline（正确指纹：UA≥1.17、canonical session、`read` 工具、stream:true）仍 **403**；其余 7 个反例控制项符合预期 → 不是单纯少某个头。
+- 官方 CLI 1.18.35 与 1.19.3 同时 403 → 指向**出口 IP**，而非客户端指纹。
+- 本机出口：Clash Verge（verge-mihomo，Meta TUN）→ `87.120.204.149`（日本，AS199524 G-Core Labs，机房 IP）。免费档疑似拒绝机房/VPN 出口并按出口地址计配额。
+- 社区已知方案：轮换/更换出口 IP（WARP 池或住宅代理）。`ebouther/opencode-unlimited-proxy` 仅 Linux；另有 `mj8724/zen-free`、`12errh/zen-proxy`。本机 Windows 不适合 WARP 特权容器方案。
+- 下一步：把 Clash 节点换成非机房/住宅出口后重跑 gate-probe；或提供干净的 HTTP/SOCKS 代理填进 `config.json` 的 `proxies`。注意社区文档也声明：轮换出口可能违反 OpenCode 条款。
+
+### 2026-10-17 已解决：换住宅出口 IP
+
+- Clash Verge 的控制 API 只在命名管道 `\\.\pipe\verge-mihomo-sidecar-release-...`（TCP 9097/9090 不监听），用 Python 打开管道发 HTTP 操作。
+- 把 `三毛机场` 选择器切到 `香港原生IP-1|勿跑大流量`，出口变为 `219.76.254.13`（香港，住宅/原生 IP，非机房）。
+- `gate-probe.py --proxy http://127.0.0.1:7897`：baseline **200**；8/9 控制项符合预期（gate 2「shaped but unencoded session」文档已过时，现在放行，无害）。
+- 反代 `config.json` 的 `proxies` 从 `["direct"]` 改为 `["http://127.0.0.1:7897"]`，显式走 Clash，不依赖 TUN 的 direct 行为。
+- 验证：8011 DS 返回 BANANA/7；8010 分组路由 OK；源码 OpenCode `localrouter/deepseek-v4.1-flash-free` 返回 BANANA，`cost: 0`；连续 3 次稳定。
+- 仅探测 DS：availability 文件把其余免费模型（含新出现的 beam-free/glm-5.3-flash-free/ll-alpha-free）设为 `manual:true`；重启后日志只有 DS 一条 `availability_checked`，`probe_succeeded`。
+- 注意：Clash 全局选择器现在固定在 HK 原生节点（`store-selected: true` 会持久化），**其它流量也走这个节点**；要换回原节点需在 Clash Verge 手动切。若 DS 再次 403/429，切到 `香港原生IP-2|勿跑大流量` 或另一住宅节点。
+- 结论：免费档拒绝的是**机房/VPN 出口**；换住宅 IP 即恢复，与客户端版本无关。
+
+
+
+## 2026-10-16 v2.5.3：kimi-k3 的 400「inference request is invalid」按上游抖动换家
+
+现象：用户报告 kimi-k3 请求报 400「上游详情：inference request is invalid」。
+
+排查（静态 + 实测）：
+- 失败请求来自 opencode（Dental 大会话，模型 kimi-k3 variant medium），上下文约
+  **50 万 token**；上游是 sensenova（token.sensenova.cn）中转；路由组里 nexavlinks
+  被禁，实际只有 sensenova 一家。
+- history 里同一请求先被 429「inference exceeds tpm/rpm limit」（18:29:46），
+  客户端自动重试 5 秒后在同一家拿到 400「inference request is invalid /
+  InvalidParameter」（18:29:51）——同一份请求两个不同状态码。
+- 直连 sensenova 逐项探测：最小请求、tools、tools+stream、reasoning_effort、
+  50/150/300 个工具、max_tokens=38400、tool 回合，全部 200；
+  尺寸阶梯 10 万 / 30 万 / **50 万 token 请求全部 200**（限流窗口过去之后）。
+  ⇒ 既不是请求格式错，也不是尺寸超限；是该中转当时按账号/通道的间歇性限流/抖动
+  （错误形态还不一致）。与上一条 gpt-6.1-sol 同属「上游侧间歇拒绝」类。
+- 该账号限流极敏感：连续十来个探测请求就把 tpm 窗口打满（连极小请求也 429），
+  约 12 分钟后自愈。中转 /v1/models 里 kimi-k3 标的是 1M 上下文、定价 0
+  （free/tokenplan 档）。
+
+做法（router.py）：
+- `UPSTREAM_CAPABILITY_MARKERS` 增加 `"inference request is invalid"`：
+  这类 400 按上游故障处理（换 Key → 换下一家），全都不行才把最后一个 400 原文
+  透传给客户端（与 v2.4.9 的 A 方案同一机制）。
+- 顺带修记录 bug：客户端错误 / 全部失败两条路径的 history 此前固定记
+  `stream:false`；改成按请求实际 payload 记（查障时不再被误导）。
+
+`selftest.py`：假上游新增 `invalid_400` 行为；第 36 组补 4 项（换下一家、
+客户端不收 400 文案、失败记录带 stream=true）。
+
+验证：`python selftest.py` **540 项全过**；8010 已重启到 2.5.3（单进程）；
+经 8010 实测 kimi-k3 请求 200（sensenova 已自愈）。
+注意：只有一家上游在组里时，换家机制无处可换 —— kimi-k3 想要真兜底，
+得把 nexavlinks 的 kimi-k3 重新启用（实测直连可用）。
+
+## 2026-10-16 v2.5.2：新「日志」tab（弹窗提示留档）
+
+需求：点模型测试时右下角弹出很大一段文字，来不及看就消失了。
+
+做法（纯前端，`webui.html`）：
+- `toast()` 里加 `logAdd()`：每条弹窗提示都记一份（时间 + 类型 + 原文，单条截 4000 字），
+  存 localStorage（上限 300 条），页面刷新/版本自动重载后还在。只在这台浏览器里。
+- 新「日志」tab：倒序列表（时间 / ✓✗!分类 / 内容，颜色对应 ok/bad/warn），
+  「复制全部」「清空」两个按钮；切走时新日志在 tab 上累计小数字，打开即清零。
+- 日志逻辑的 node 行为自检（临时脚本，不入库）：落盘 / 未读计数 / 上限 300 /
+  超长截断 / 渲染行数，10 项全过；整段 JS 过 `node --check`。
+
+验证：8010 已重启到 2.5.2（后端无改动，纯为页面重载版本号）；浏览器实测未做。
+
+## 2026-10-16 v2.5.1：连接超时不再和首包超时叠加（15 秒是总预算）
+
+反馈：设置页 连接 10s + 首包 15s，最坏要等 25 秒才换下一家。
+
+做法：`open()` 里把首包超时改成**总时间预算** —— 从 `conn.connect()` 开始计时，
+连接到收到响应头合计 ≤ `first_timeout`。连接超时 = 连接阶段的单独上限，
+和预算取小（`min(connect_timeout, budget)`）；连接后剩余时间才用于等响应头
+（剩余 ≤ 0 直接算超时）。语义：最坏 15 秒一换，不是 25 秒。
+只改了时间语义，接口/字段没变（版本 2.5.1 只为让已跑的 2.5.0 页面自动重载）。
+
+验证：selftest 全过 + 8010 重启到 2.5.1。
+
+## 2026-10-16 v2.5.0：「设置」tab（全局默认参数）+ 超时改成首包 15 秒
+
+需求：加一个设置页配默认参数；默认超时不要 300s、改成 15s；「15s 内收到响应头就算有回复」；
+设置页保存的默认值要覆盖所有上游（不管之前有没有单独配置过）。
+
+做法：
+- 超时语义改为**首包超时**（等响应头）：`Upstream.first_timeout`（配置键
+  `first_timeout_seconds`，兼容读旧名 `read_timeout_seconds`），默认 300 → **15 秒**。
+  `open()` 里「等响应头」用它；响应头到手后 socket 超时换成 `BODY_READ_TIMEOUT`（300s）——
+  正在生成的长回答/流式不会被首包超时掐死。超时报错文案「超时（N 秒没收到响应头）」。
+- 新「设置」tab：全局默认 = 首包超时 + 连接超时。`POST /admin/defaults` 保存后
+  **写到每个上游**（不管之前有没有单独配过），新加的上游也继承；留空 = 回出厂默认（15/10）。
+  持久化在 state 的 `defaults`（还是出厂值就不写）；`/stats` 带 `defaults`；
+  每个上游快照带 `first_timeout_seconds`/`connect_timeout_seconds`。
+- 编辑弹窗「超时(秒)」改名「首包超时(秒)」，留空 = 用全局默认。
+- `selftest.py`：假上游 stall 模式修实战（流式 stall 睡完**关连接**——不关的话
+  HTTP/1.1 keep-alive 两边互相等，测不出换 Key；`QuietServer` 吞预期断连的 traceback）；
+  第 36 组扩到 20 项（换 Key / 换下一家 / 单 Key / 流式断流换 Key / 全局默认覆盖单个配置 /
+  新上游继承 / 留空回出厂 / 重启持久化）。
+
+验证：`python selftest.py` **536 项全过**；8010 已重启到 2.5.0。未做浏览器实测。
+
+## 2026-10-16 v2.4.9：读超时可配（多久没回复就切下一个 Key / 换下一家）
+
+需求：多 Key 时要能配「多少秒没回复就切下一个」；单 Key 也支持配置（超时 → 直接换下一家）。
+
+做法：
+- `Upstream.read_timeout`（本来就有，默认 300 秒，之前只能写配置文件）改成网页可配：
+  编辑弹窗新增「超时(秒)」输入框；`add/update_upstream` 透传；`state()` 非 300 才落盘；
+  `snapshot()` 带 `read_timeout_seconds`。流式下这个超时 = 两个数据块之间的最长等待。
+- `_try_upstream` 重写尝试循环：failover 下把**每个可用 Key 各试一次** ——
+  超时（read_timeout 秒没回复）、连不上、401/403/408/429、5xx、返回网页、读响应失败、
+  流式首块超时，都算这次尝试失败 → 换下一个 Key；全试完才换下一家。
+  round_robin / 单 Key 行为不变（次数=1）。5xx 也换 Key（按「出错就换下一个」的口径）。
+- `open()`：**超时不再换路径候选重试**（以前超时会在候选间重试，把「多久没回复」
+  直接翻倍）；直接抛给上层。其他异常（如 RemoteDisconnected）仍按原逻辑试下一个候选。
+- 流式：`_relay_stream` 在响应头发给客户端**之前**的失败（首块超时/空流/流内先报错）
+  会抛 Retryable，现在被外层接住换 Key；已经开始转发后的中断换不了（照旧报错收尾）。
+- 超时错误单独报「超时（N 秒没收到响应）」。
+- `selftest.py`：假上游新增「指定 Key 被拖住」模式（非流式：连响应头都不给；
+  流式：给响应头但首块迟迟不来）；第 36 组 14 项（换 Key / 全试完换下一家 / 单 Key /
+  流式首块 / 耗时上限 / 随重启持久化）。
+
+验证：`python selftest.py` **527 项全过**；8010 已重启到 2.4.9。未做浏览器实测。
+
+## 2026-10-16 v2.4.9：识破「上游能力限制 400」与「流内错误事件」
+
+背景：dli_gpt 的 gpt-6.1-sol 对带工具的请求回 400「requires Responses for tool calls;
+this account only supports Chat Completions」。排查确认是上游通道级间歇限制（见下条）；但此前的
+行为有真问题：400 被当「客户端错误」原样透传、不换上游，请求直接被打死；200 的流里夹错误事件
+也按成功记（卡片和统计全绿）。
+
+做法（A 方案）：
+- `UPSTREAM_CAPABILITY_MARKERS` + `looks_like_capability_error()`：400 且正文命中
+  「requires responses for tool calls」/「only supports chat completions」（大小写不敏感）
+  → 按上游故障处理：`record_neutral` + `Retryable`，换 Key / 换下一个上游重试。
+  中性记录不触发冷却（它只是干不了这类请求，没坏）；全都受限时仍把最后一个的 400 原文透传。
+- `collect_sse` / `make_sse_collector`：识别 200 流里的 `{"error":{...}}` 事件（取第一个 message）。
+- `_relay_stream`：首块就带错误事件 → 响应头还没发，按上游故障处理（换上游/换 Key）；
+  流中段才出现的错误 → 换不了上游，但这次记失败（history/trail 为 502 +「流式返回错误: …」，
+  上游 failures +1），不再记成功；Anthropic 客户端用 error 事件收尾（原先会被静默丢掉）。
+- `selftest.py`：假上游新增 `capability_400` / `stream_error_first` / `stream_error_mid` 行为；
+  第 36 组 15 项。
+
+验证：`python selftest.py` **514 项全过**。8010 已重启到 2.4.9。
+
+未做（用户未选 B）：完整上游 Responses 协议支持（每上游开关 chat|responses）。
+
+## 2026-10-16 dli_gpt gpt-6.1-sol 工具调用 400 排查（未复现，疑通道级间歇限制）
+
+现象：用户报 dli_gpt（api.dlizz.com）回 400：`gpt-6.1-sol requires Responses for tool calls; this account only supports Chat Completions`。llm-router 全部日志（history / admin / state / _restart）均无这条文案。
+
+实测（用该上游 5 个 Key、gpt-6.1-sol 直接探测，共 ~15 个小请求）：
+- `/v1/responses`：无工具 / 带工具（正常返回 function_call）/ 流式（response.created 事件序列）全部 200 可用。
+- `/v1/chat/completions` 带工具：非流式、流式、5 个 Key、tool_choice=function、parallel_tool_calls、工具结果回传（role:tool 往返）均 200 正常。
+- 通道不稳：偶发 SSLEOFError 断连；200 的 SSE 里能夹
+  `{"error":{"message":"Our servers are currently overloaded / The service is busy","type":"upstream_error"}}` 后直接 [DONE]。
+
+结论（待判）：那条 400 未能复现；最像 dli_gpt 内部多通道负载均衡——切到「只能 Chat Completions 的通道」时拒绝工具调用，好通道则正常。账户实测能用 Responses，非账户硬限制，也非我们请求格式问题。
+
+顺带发现（代码静态 + 实测上游行为，均未修）：
+1. `_relay_stream` / `collect_sse` 不识别「HTTP 200 + SSE error 事件」：这种流会按成功记录（ok=true、正文空）并原样透传给客户端。
+2. 工具调用回合的 `response_text` 本来就是空（collect_sse 只收 content / reasoning），history 里「空正文成功」无法区分正常工具回合与异常。
+
+已做（v2.4.9，见上条）：A 方案 —— 能力限制 400 自动换上游、SSE 错误事件不再记成功。
+未做：B（完整 Responses 上游协议支持），暂不需要。
+
 ## 2026-10-16 v2.4.8：Key 支持禁用/启用（不是只有删除）
 
 需求：上游里的 Key 要能禁用/启用，不能只有删除（临时坏 Key 想留着观察，不想删了重加）。
@@ -750,3 +959,157 @@ selftest 新增 3 项验证：禁用条目调用被跳过、snap 里还在、ena
   失败数只在 tooltip 里说明。`setTabNum("req", nCalls, false, ...)`。
 - 上游调用对比条：原来只要有失败就整条变红（414 次里错 16 次看起来像全挂了）。
   现在条长仍按调用量，条内按成功/失败比例分两段：`.track i.ok`（蓝）+ `.track i.fail`（红）。
+
+## 2026-10-17 iPad 全屏（去掉 Safari 地址栏）
+
+- 现象：iPad 经 Tailscale 访问控制台仍显示 Safari 地址栏；同一台 iPad 上的 opencode 网页没有
+  （opencode 有 `display:standalone` 的 manifest + `apple-mobile-web-app-capable`，且从主屏幕图标启动）。
+- 根因：`webui.html` 只有 viewport，缺 `apple-mobile-web-app-capable`；iOS「添加到主屏幕」后
+  仍按普通 Safari 网页处理，地址栏照常显示。Safari 标签页里地址栏永远存在，与 Tailscale 无关。
+- 修复：`<head>` 加 4 个 meta：`apple-mobile-web-app-capable`、`apple-mobile-web-app-status-bar-style=black`、
+  `apple-mobile-web-app-title`、`mobile-web-app-capable`。纯前端改动，后端不动。
+- `_serve_webui()` 每次请求重读文件，运行中的 8010 已验证直接返回新页面，无需重启。
+- 注意：iPad 上要删旧图标、重新「添加到主屏幕」，从新图标打开才生效；
+  暂无 `apple-touch-icon`，主屏幕图标会是页面截图，想要正式图标再补一张 PNG。
+
+## 2026-10-17 v2.6.0：每日签到（签到网址 / 过滤 / 每日提醒 + 手机推送）
+
+需求：每个上游可配签到网址并一键打开；快速过滤出支持签到的上游；每天提醒签到；手机弹系统通知。
+
+决策（用户确认）：签到 = 打开签到网页 + 标记今日已签；提醒可配时间（默认 09:00）、有未签的才提醒；
+手机通知**复用 opencode-web 推送链路**（llm-router 挂到 `https://desktop-noecbeh.tailcd9d62.ts.net/llm/`，
+同一个 HTTPS origin + 已有 SW，无需重新授权）。
+
+- `router.py`（2.6.0）：Upstream 加 `checkin_url`/`last_checkin_at`（非默认不写入状态文件，老状态干净）；
+  `checked_in_today()` 按本地日期判断；新接口 `POST /admin/checkin`（标记/撤销，{id,done}）、
+  `POST /admin/checkin/reminder`（{enabled,time}，HH:MM 归一化）、`POST /admin/checkin/notify`（手动测试推送）；
+  `/stats` 带 `checkin_reminder` + `checkin_pending`。后台线程 `_checkin_reminder_loop` 每 30 秒检查：
+  到点 && 有未签 && 今天没提醒过 → POST push 服务（环境变量 `LLMROUTER_PUSH_NOTIFY_URL` 可覆盖，
+  默认 `http://127.0.0.1:3000/pwa/push/notify`），发送成功才记 `last_reminded`（持久化，重启不重推）。
+  `_save_state` 加了 `_state_lock`（提醒线程与请求线程并发写，原来就有此隐患）。
+- `webui.html`：添加表单/编辑弹窗加「签到网址」；卡片加「签到」按钮（打开网址+标记）与「今日已签/未签」badge；
+  筛选下拉「签到：不限/只看支持签到/只看今日未签」；顶部计数带「今日 N 个未签」；设置页新增「每日签到提醒」卡片
+  （开关+时间+发测试推送）。`apiBase` 改为路径探测：挂在 /llm/ 下自动走 /llm 前缀。
+- `opencode-web`（私有，非 git）：`push-daemon.js` 新增 `POST /pwa/push/notify`（内部通知，
+  **不走前台抑制**——用户在用 opencode 时签到提醒也弹；send() 返回发送数）；`serve-ui-build.js` 新增 `/llm/*`
+  反代到 127.0.0.1:8010（剥前缀 + gzip）。
+
+验证：`python selftest.py` **561 项全过**（新增第 37 组 21 项：保存/拒非法/快照/标记/撤销/手动推送打到假 push
+  服务/内容含 /llm//全签完不发/时间归一化/push 不可达如实报错/重启持久化）。8010 已重启到 2.6.0（_restart.py），
+  3000 已重启（ui.pid 49352，手动 start）。实测：`/llm/` 返回新页面、`/llm/stats` 200、
+  `POST /pwa/push/notify` 返回 `{"sent":1}`（iPhone 真实推送已送达，等用户确认）。
+  注意：curl.exe 从 PowerShell 传 JSON 会被转义弄坏（400 title required），用 python 发。
+
+待办/注意：
+- iPhone 点击通知默认打开 `/llm/` —— 若 sw.js 对 data.url 有特殊处理（历史行为是打开会话页），观察一下实际点开行为。
+- 提醒默认开启（09:00）。目前无上游配签到网址 → pending 空 → 不会打扰。
+- `config.toml` 暂不支持 checkin_url（只能网页配；`_seed_from_config` 未加该字段，之后要加再补）。
+
+## 2026-10-17 v2.7.0：限流从「每分钟」改为「每天总量」配额
+
+需求：上游限流不要「每分钟 N 次」，要「一共 N 次」（如每天最多 100 次）。
+
+- `max_per_minute`（60 秒滑动窗口）整体废弃 → `max_per_day`（**本地自然日**计数，日期一变清零，
+  不按 24h 滑动）：CapacityGate 重写为单计数器 `_day_key/_day_used`（不存时间戳），
+  `used_last_minute` → `used_today`；acquire 文案「每天上限 N 已用满」；state 字段
+  `used_today/max_per_day`。计数从进程启动起累计（配了上限就按「今天已用数」卡）。
+- 旧字段无人配过（线上只有 max_concurrent=1），直接忽略、不做迁移；`_seed_from_config`/
+  add/update/set_capacity/_h_upstream_capacity/AUDIT 键同步改。
+- webui：编辑弹窗「每分钟」→「每天」（eCapM→eCapD）、capCell「/分」→「/天」、
+  capLiveText「今天 M/N」、文案与 CSS 注释同步；README/config.example.toml 文档同步。
+- 验证：selftest **564 项全过**（32 组容量测试改写：设「上限=已用数」→ has_room=False、
+  下一请求换家/429；清上限回 null；used_today 带出）。8010 已重启到 2.7.0；
+  `/llm/` 页面确认含「每天」列。旧 minutely 字段无残留（grep 仅剩注释）。
+- 注意：给某上游设 max_per_day=3 时若今天已发过 5 次，则立即用满（不是从设定时刻起算）。
+
+## 2026-10-17 v2.7.1：彻底去掉「并发」，限流只留「每天 N 次」
+
+用户反馈「文本还是写的并发，这不合适吧」——并发是配每分钟那套的，既然只按天限总量就一并删掉。
+
+- **删除** max_concurrent（并发）整条机制：CapacityGate 不再有 in_flight/释放凭据；
+  CapacityLease 整个类移除；acquire 简化（配了 max_per_day 才计数/挡，没配零开销）；
+  请求路径不再等并发腾坑（原来 queue_timeout 15 秒等待逻辑删除，只剩 queue_timeout_seconds 兼容保留）；
+  `_seed_from_config`/add/update/set_capacity/AUDIT 键全部清理。
+- **语义修正**：上限计数从「设上限那一刻」起算（之前是进程启动起累计，还在并发版时遗留的语义；
+  没配上限不计数）。当天用量持久化 `capacity_today={day,used}`（只认存的时间是今天），
+  落在每次状态保存里；后台签到线程每 30 秒顺带**轻量保存**（`_save_state(want_snapshot=False)`，
+  不轮转快照），重启后当天用量不归零。
+- webui：编辑弹窗只剩「每天」一格；模型路由行只剩「/天」；capLiveText「今天 M/N」；
+  toast/hint/CSS 注释全清；README/config.example.toml 同步（重新组织「每天上限」小节）。
+- 验证：selftest **560 项全过**（32 组重写为确定性：设 3 → 前 3 个 200 → 第 4 个 429「已用满」→
+  重启后计数恢复仍 429 → 清上限回 null）。8010 已重启到 2.7.1；/stats 的 capacity 只剩
+  has_room/max_per_day/used_today，全上游无 max_concurrent 残留。
+- 注意：旧状态文件里若有 max_concurrent（如 OpenCode Free Local=1），新代码不再读取，
+  下次保存时被自然清除，行为相当于「不再限并发」。
+
+## 2026-10-17 v2.7.4：移除签到功能（用户要求）
+
+签到整套删掉（保留当时的正常功能：每天上限、仅流式模型等）。
+
+- `router.py`：Upstream 删 `checkin_url`/`last_checkin_at`/`checked_in_today()`；
+  删 Router 的 `checkin_reminder`、`push_notify_url`、`_norm_checkin_time`、
+  `checkin_pending`/`set_checkin`/`set_checkin_reminder`/`send_checkin_reminder`/
+  `_checkin_reminder_tick`/`_checkin_reminder_loop`；删 `/admin/checkin*` 三个接口；
+  `/stats` 不再输出 checkin 字段；add/update/AUDIT 键清理。
+  原来的签到后台线程改为 `_capacity_flush_loop`（只保留「每天上限当天用量定期落盘」，
+  常量 `CAPACITY_FLUSH_INTERVAL=30s`）。
+- `webui.html`：删添加表单/编辑弹窗的签到网址、卡片签到按钮与「今日已签」badge、
+  签到筛选下拉、顶部未签计数、设置页「每日签到提醒」卡片及其 JS、doCheckin、事件绑定。
+- `selftest.py`：删第 37 组签到用例（21 项）。
+- `opencode-web`（私有，非 git）：`push-daemon.js` 移除 `POST /pwa/push/notify`
+  与 send() 的 ignorePresence 参数（签到提醒专用），回到原行为。
+  **保留** `serve-ui-build.js` 的 `/llm/` 反代（手机访问 llm-router 的通道，不是签到逻辑）。
+- 状态文件已触发一次保存：`config.state.json` 里 checkin_reminder / checkin_url /
+  last_checkin_at 全部消失。
+- 验证：selftest **539 项全过**；8010 重启到 2.7.4；3000 重启（pid 39052）；
+  `/llm/` 页面无签到文本；`/pwa/push/notify` 已不存在（落到 SPA fallback，text/html）。
+
+## 2026-10-17 v2.7.5：请求记录显示实际使用的 Key（多 Key 上游）
+
+需求：一个上游配了多个 Key 时，请求记录里看不出这次具体用的是哪个 Key。
+
+- `Retryable` 增加 `key_label` 字段；所有失败分支（_try_upstream / _relay_aggregated /
+  _relay_stream，含换 Key 重试）抛出时都带上本次实际用的 Key。
+- `Upstream.key_label(key)`：有名字用名字，没名字用打码值（mask_key）。
+- `_try_upstream` 每轮从 Authorization 取出 `_used_key` → `_used_label`；
+  `_relay_*` 增加 `key_label` 参数一路透传。
+- `_record_history` 增加 `key_label`，entry 落盘字段 `"key"`（旧记录没有 = 不显示）；
+  成功/客户端错误/路由层最终失败/流式聚合各路径都传。
+- trail 每一步（含换 Key 重试的中间失败、最终失败）都带 `"key"`。
+- `query_journal` 的列表字段白名单补上 `"key"`（否则列表页拿不到；展开详情走完整 entry 本来就有）。
+- webui：请求记录列表行在上游 badge 后显示 Key badge；展开详情「详情」块加
+  「实际使用的 Key」；尝试链每一步显示 Key。
+- selftest：多 Key 组新增 3 项（history.key = "二号"、trail 最后一步带 Key、落盘流水带 Key），
+  **542 项全过**。8010 已重启到 2.7.5；线上多 Key 上游 dli_gpt（5 个 Key，名字 0.12/0.23/...）
+  之后的新请求即可看到具体 Key；旧记录 key=None 不显示。
+
+## 2026-10-17 v2.7.6：请求记录默认按当天显示
+
+需求：请求记录打开时默认看当天，而不是全部日期。
+
+- webui.html `fillFilterOptions()`：日期下拉额外保留「今天」选项（今天还没请求也能选中，
+  列表会明确显示「所选条件下还没有请求记录」）；新增 `journalDayDefaulted` 标志，
+  **首次进入**把 `#sideDay` 设为今天（`dayKeyOf()` 本地日期），之后用户切到「全部日期」
+  不会被 2.5 秒一次的刷新抢回来；刷新页面重新默认今天。
+- 纯前端改动（+版本号让已打开的页面自动重载），8010 已重启到 2.7.6，页面确认含新逻辑。
+
+## 2026-10-17 v2.7.7：请求记录按「上游 · 真实模型」细分
+
+需求：同一分组里一个上游挂了 2 个模型时，请求记录只能看到整个上游的合计，看不到各模型的情况。
+
+- 统计聚合（StatsStore）：`_fresh_sub()` 增加 `models` 子字典；`_apply()` 把 trail 每一步的
+  真实模型（step.model）记到 `bucket[group].upstreams[up].models[real_model]`（calls/ok/failed/tokens），
+  `_normalize`/`_merge` 天然递归支持；`_render()` 的 groups[].upstreams[] 增加
+  `models: [{model,calls,ok,failed,usage}]`。
+- `query_journal`：upstreams 计数从「按上游」改为按 **(上游, 真实模型)**；新增 `model` 查询参数
+  （和 upstream 一起用），返回项带 `upstream/model/key`（key = "上游 · 模型"）。
+- 前端：上游下拉选项改为「上游 · 模型」（value 用 JSON [上游,模型] 编码，老值兼容）；
+  选中组合后统计面板显示该模型的 calls/令牌；分组统计的上游条下方列出模型细分条
+  （上游只有一个模型时不重复列）；请求列表按「上游+模型」匹配 trail 的步骤和主体显示。
+- 历史数据：重启后调用一次 `/admin/stats/rebuild`（按 15001 条流水重算），旧记录的模型细分也能看到。
+- selftest：假上游新增 `fail_model:<名字>` 行为；多 Key 组新增 5 项（同分组同上游两模型：
+  分组内换模型成功、journal 按模型分两条统计、失败标记、按上游+模型过滤、stats 带模型细分）；
+  修正 2 项旧断言（upstreams 的 key 现在含模型名，改按 upstream 字段匹配）。**547 项全过**。
+- 8010 已重启到 2.7.7。真实数据验证：deepseek 分组里 workbuddy 的两个模型已分开
+  （cn:deepseek-v4.1-flash 3175/50败、global:deepseek-v4.1-flash 1089/68败），
+  按上游+模型筛选条数正确（4235 总 / 3175 / 1089）。
