@@ -1,5 +1,16 @@
 # 你的配置和状态：不要提交
 config.toml
+# 配置被人/脚本改过之后留下的备份，同样是含 Key 的
+config.toml.bak*
+*.bak-*
+*.bak-import-*
+
+# 迁移 / 导出产物：里面是明文上游 Key（migrate.py export 生成的）
+迁移包/
+llm-router-migrate-*.zip
+upstreams.full.json
+bundle.json
+upstreams.toml
 
 # 状态目录（上游、模型路由、勾选、分组都存这里）
 .llmrouter/

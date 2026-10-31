@@ -1208,3 +1208,39 @@ selftest 新增 3 项验证：禁用条目调用被跳过、snap 里还在、ena
 验证：`ast.parse` 通过；定向脚本覆盖删除/改名/同名重建/按上游筛选/详情/统计卡 25 项全过；
 `selftest.py` **541/541 通过**。
 
+
+## 2026-10-31 新增迁移工具：导出全部上游 → 换机器一条命令导入
+
+起因：上游全在 `.llmrouter/`（含明文 Key，`.gitignore` 掉了），换台电脑 clone 下来是空的，
+只能一个个重新填地址和 Key，再重新勾模型、重新排路由。
+
+**为什么拆成 export/import 两个动作，而不是「把 state.json 拷过去」**
+
+直接拷贝 `.llmrouter/config.state.json` 能work，但有三个坑：配置文件名不一定叫 `config.toml`
+（状态文件名跟着走）、老机器状态里混着本机路径（`127.0.0.1:7863` 这类）和统计快照、
+以及没法只挑上游不给 Key（给同事看的时候）。所以 `migrate.py` 做归一化：
+
+- `export` 产出 `bundle.json`（全量：config.toml 原文 + state + 签到日志，**导入只认它**）、
+  `upstreams.full.json`（纯上游明文）、`upstreams.toml`（可直接粘进 config.toml 的
+  `[[upstreams]]` 片段，多 Key 的只在注释里点名 —— 因为 config.toml 一个上游只认一个
+  api_key）、`upstreams.masked.md`（脱敏清单，Key 只剩头尾），再打成一个 zip。
+- `import` 支持 zip / bundle.json / 解压目录；覆盖前把旧文件备份成 `.bak-import-<时间戳>`；
+  `--merge` 按 id、再按 `名字+base_url` 去重合进本机（本机模型路由优先保留），
+  `--dry-run` 只打印要改什么；打码过的包默认拒绝导入（`--allow-masked` 才放行）。
+
+**`deploy.ps1`** 是新机器上的那一步：找 3.11+ 的 Python（`python`/`python3`/`py` 都试）→
+有 `.git` 就 `git pull --ff-only`、有 `router.py` 就当现成项目、都没有才 `git clone` →
+解压迁移包调 `migrate.py import` → 没有 config.toml 就从 example 复制 → `--check` 自检 →
+前台启动。`-NoStart` 只装不跑。
+
+**`.gitignore` 同步收紧**：`config.toml.bak*` / `*.bak-import-*`（配置备份同样是明文 Key）、
+`迁移包/`、`llm-router-migrate-*.zip`、`bundle.json`、`upstreams.full.json`、`upstreams.toml`
+全部排除；`config.toml.bak-mirrors-20261028-135023` 挪进 `_backups/`（本来就该在那里）。
+
+验证（都是真跑，不是推断）：`migrate.py export` 对本机真实状态 → 41 上游 / 启用 40 /
+Key 47 / 模型路由 23 条 / 勾选 64 个模型；`migrate.py list` 读 zip 正常；
+再拿 `git archive HEAD` 在 %TEMP% 里造一个「新机器」（只有仓库文件，没有 config.toml、
+没有 .llmrouter），跑 `deploy.ps1 -Bundle <zip> -NoStart`：Python 检测 → import →
+`router.py --check` 全过，导入后核对 state 与源机器逐项一致（41/40/47/23、Key 前缀对得上）。
+`import --dry-run` 只打印不动文件；`export --no-secrets` 的包直接 import 会被拦下并提示
+`--allow-masked`。细节写在 `DEPLOY.md`。
