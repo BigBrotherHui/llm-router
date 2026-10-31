@@ -2837,62 +2837,27 @@ def main():
     finally:
         stop_router(p)
 
-    # ================= 32. 上游每天上限 =================
-    print("\n[32] 上游每天上限（自然日配额）")
+    # ================= 32. 上游每天上限（已移除） =================
+    print("\n[32] 上游每天上限已移除")
     cfg = write_config()
     p = start_router(cfg)
     try:
         admin("/admin/fetch-models")
         admin("/admin/select-models", {"id": "a1", "models": ["deepseek-chat"]})
 
-        # 计数从「设上限那一刻」起算：先设 3，然后连发 4 个
-        st, r = admin("/admin/upstream/capacity", {"id": "a1", "max_per_day": 3})
-        check("设置每天上限成功", st == 200 and r.get("max_per_day") == 3, str(r)[:200])
-        st, snap = get("/stats")
-        cap = next(u["capacity"] for u in snap["upstreams"] if u["id"] == "a1")
-        check("snapshot 带 capacity（含今天已用）",
-              cap.get("max_per_day") == 3 and cap.get("used_today") == 0
-              and cap.get("has_room") is True,
-              json.dumps(cap, ensure_ascii=False))
+        st, r = admin("/admin/upstream/capacity", {"id": "a1", "max_per_day": 1})
+        check("旧接口已移除（404）", st == 404, f"{st} {str(r)[:150]}")
 
-        for n in (1, 2, 3):
+        # 旧字段即使还在 payload 里也不再生效：不写入状态、不挡请求
+        admin("/admin/upstream/update", {"id": "a1", "max_per_day": 1})
+        st, snap = get("/stats")
+        up = next(u for u in snap["upstreams"] if u["id"] == "a1")
+        check("stats 不再返回 capacity", "capacity" not in up,
+              json.dumps(up, ensure_ascii=False)[:200])
+        for n in (1, 2):
             st, r = admin("/v1/chat/completions",
                           {"model": "deepseek-chat", "messages": [{"role": "user", "content": "hi"}]})
-            check(f"第 {n} 个请求成功（今天用满前）", st == 200, f"{st} {str(r)[:120]}")
-        st, snap = get("/stats")
-        cap = next(u["capacity"] for u in snap["upstreams"] if u["id"] == "a1")
-        check("用完额度的计数如实带出", cap.get("used_today") == 3 and cap.get("has_room") is False,
-              json.dumps(cap, ensure_ascii=False))
-        st, r = admin("/v1/chat/completions",
-                      {"model": "deepseek-chat", "messages": [{"role": "user", "content": "hi"}]})
-        check("超过每天上限被挡（429 已用满）", st == 429 and "已用满" in str(r)[:300],
-              f"{st} {str(r)[:300]}")
-
-        # 上限必须随状态持久化（重启后今天的用量还在、不会重新放行）。
-        # 任何管理操作都会顺带保存（后台线程每 30 秒也会轻量保存，测试不等它）。
-        admin("/admin/upstream/update", {"id": "a1", "name": "up-a"})
-        stop_router(p)
-        p = start_router(cfg)
-        st, snap = get("/stats")
-        cap = next(u["capacity"] for u in snap["upstreams"] if u["id"] == "a1")
-        check("重启后当天用量恢复（不归零）",
-              cap.get("used_today") == 3 and cap.get("has_room") is False,
-              json.dumps(cap, ensure_ascii=False))
-        st, r = admin("/v1/chat/completions",
-                      {"model": "deepseek-chat", "messages": [{"role": "user", "content": "hi"}]})
-        check("重启后超过上限仍被挡", st == 429, f"{st} {str(r)[:200]}")
-
-        # 清掉上限后回到不限量
-        st, r = admin("/admin/upstream/capacity", {"id": "a1", "max_per_day": 0})
-        check("清掉上限后返回 null", r.get("max_per_day") is None, str(r)[:200])
-        st, snap = get("/stats")
-        cap = next(u["capacity"] for u in snap["upstreams"] if u["id"] == "a1")
-        check("不限量时 has_room=True", cap.get("has_room") is True,
-              json.dumps(cap, ensure_ascii=False))
-
-        # 不存在的上游要报错
-        st, r = admin("/admin/upstream/capacity", {"id": "不存在"})
-        check("给不存在的上游设上限会报错", st >= 400, f"{st} {str(r)[:150]}")
+            check(f"不再受每天上限影响（第 {n} 次）", st == 200, f"{st} {str(r)[:120]}")
     finally:
         stop_router(p)
 
@@ -3192,7 +3157,32 @@ def main():
         check("不带的条目被删除", a1["key_count"] == 1
               and a1["key_hints"] == [hints2[1]], str(a1["key_hints"]))
 
-        # 10) 同一分组里同一个上游挂了两个模型：请求记录要能按「上游 · 模型」分开看
+        # 10) Key 名字的显示规则（放在这组末尾，前面的用例已把 Key 列表换过好几轮）：
+        #     多 Key + 有名字 → 显示名字；没起名字 or 单 Key → 不显示。
+        admin("/admin/upstream/update", {"id": "a1", "api_keys": [
+            {"id": None, "name": "", "key": "sk-noname-aaaa"},
+            {"id": None, "name": "", "key": "sk-noname-bbbb"},
+        ]})
+        reset_hits()
+        post(body={"model": "deepseek-chat",
+                   "messages": [{"role": "user", "content": "hi"}]})
+        st, hist = get("/admin/history")
+        entry = (hist.get("history") or [])[-1]
+        check("多 Key 但没起名字时不显示 Key",
+              entry.get("key") in (None, ""), str(entry.get("key")))
+
+        admin("/admin/upstream/update", {"id": "a1", "api_keys": [
+            {"id": 0, "name": "单号", "key": ""},
+        ]})
+        reset_hits()
+        post(body={"model": "deepseek-chat",
+                   "messages": [{"role": "user", "content": "hi"}]})
+        st, hist = get("/admin/history")
+        entry = (hist.get("history") or [])[-1]
+        check("单 Key 即使有名字也不显示",
+              entry.get("key") in (None, ""), str(entry.get("key")))
+
+        # 11) 同一分组里同一个上游挂了两个模型：请求记录要能按「上游 · 模型」分开看
         admin("/admin/upstream/update", {"id": "a1", "api_keys": [
             {"id": None, "name": "主号", "key": "sk-primary-000001"}]})
         behavior["a"] = "ok"

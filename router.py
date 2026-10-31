@@ -37,7 +37,9 @@ import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any, Optional
 
-__version__ = "2.7.7"
+import checkin as checkin_mod
+
+__version__ = "2.8.0"
 
 WEBUI_FILENAME = "webui.html"
 
@@ -66,8 +68,6 @@ def _looks_like_sse_head(head: bytes) -> bool:
     first = h.split(b"\n", 1)[0].strip()
     return first.startswith((b"data:", b"event:"))
 
-# 组里的上游全部因「每天上限用满」被跳过时，最多等这么久碰运气（秒）。
-# 0 = 不等，直接回 429。（v2.7 起保留兼容读取，但每天上限等也没用，已不再使用）
 QUEUE_TIMEOUT_DEFAULT = 15.0
 
 # 状态文件的历史版本保留份数（每次保存都会轮转出一份带时间戳的快照）。
@@ -89,10 +89,6 @@ DEFAULT_RETRY_STATUS = {401, 403, 408, 409, 425, 429, 500, 502, 503, 504, 520, 5
 DEFAULT_FIRST_TIMEOUT = 15.0
 DEFAULT_CONNECT_TIMEOUT = 10.0
 BODY_READ_TIMEOUT = 300.0
-
-# 后台维护线程多久跑一次（秒）：把「每天上限」的当天用量轻量落盘。
-# 计数走请求路径、不触发管理保存，不落盘的话进程重启后当天用量会归零。
-CAPACITY_FLUSH_INTERVAL = 30.0
 
 # 上游拒绝「这个模型/账户干不了这一单」时的特征文案（大小写不敏感）。
 # 已知案例：某些中转对工具调用要求 OpenAI Responses API，而账户只开 Chat Completions，
@@ -631,20 +627,20 @@ def api_paths(base_url: str, path: str) -> list[tuple[str, str]]:
         if suffix and not any(s == suffix for _, s in out):
             out.append((base + suffix, suffix))
 
-    # base 里有 /v3、路径里写的是 /v1 这种情况（火山方舟就是 /api/v3），
-    # 两边版本号不一致时也要能拼上，所以除了去掉路径里的版本段，
-    # 还要准备「把路径的版本段换成 base 的版本段」这种候选。
-    base_ver = ""
-    m_base = re.search(r"(/v\d+(?:beta|alpha)?)$", base)
-    if m_base:
-        base_ver = m_base.group(1)
+    # base 里有版本号、路径里写的也是版本号时（火山方舟 base=…/api/v3、
+    # 请求 path=/v1/chat/completions 就是这种），判断依据用 base_has_ver；
+    # 不再额外维护一份 base 的版本号——那会引出「补两次版本号」的坏候选。
 
     if path_ver:
         if base_has_ver:
-            add(stripped)                     # 推荐：去掉路径里重复的版本段
-            add(path)                         # 万一是子路径，比如 /v1/foo 这种真路径
-            if base_ver and base_ver != path_ver:
-                add(base_ver + stripped)      # 用 base 的版本号重拼
+            # base 和请求路径都带版本号（base=…/v1 或 …/api/v3，
+            # path=/v1/chat/completions）。只去掉路径里那一份 ——
+            # base 的版本号本来就在地址里了，不重拼。
+            # 绝不能把 path 原样再拼一次，也别再补一次 base 的版本号，
+            # 否则会得到 /v1/v1/chat/completions、/api/v3/v3/... 这种不存在的地址：
+            # 首选候选一旦因网络抖动失败就会掉到它上面，拿回一个 404，
+            # 把「连接被重置」误导成「接口/模型不存在」。
+            add(stripped)
         else:
             add(path)                         # 版本号只在路径里
             add(stripped)
@@ -659,68 +655,238 @@ def api_paths(base_url: str, path: str) -> list[tuple[str, str]]:
 
 
 # ---------------------------------------------------------------------------
-# 上游容量闸门（并发上限 + 每分钟速率上限）
+# 上游
 # ---------------------------------------------------------------------------
 
-class CapacityGate:
-    """一个上游的「本地自然日最多能发几个」闸门。
+class Mirror:
+    """同一家的一个镜像地址。
 
-    为什么放在路由器这一层而不是靠上游自己拒：
-    同一个厂商开了好几个账号分摊额度时，上游只知道「这个 Key 超了」，
-    它会直接拒绝，而路由器手里有整个组的信息 —— 可以先挑还有容量的那家发，
-    从源头上少撞 429。这里只管**自己这边的上限**（用户按上游手填的），
-    不做全局调度，也不猜上游的真实配额。
+    dli 这种中转会给你一堆域名（api.dlizz.com / us-v1.dli.li / hk-v1...），
+    它们模型和 Key 完全一样，只是线路不同。把「哪一面最快」交给它来学：
+    被动（真实请求的 TTFB）+ 主动（后台定时探测）双向喂样本。
 
-    每天额度按**本地自然日**计数（"每天最多 100 次"通常指的就是自然日）：
-    日期一变就清零，不按 24 小时滑动窗口。只留一个计数器 + 日期快照。
+    评分用 EWMA 而不是算术平均：对线路切换反应快，又不会被一次抖动毁掉。
     """
 
-    def __init__(self) -> None:
-        self.lock = threading.Lock()
-        self._day_key: str = ""
-        self._day_used: int = 0
+    __slots__ = ("url", "hint", "ewma", "ok", "fail", "consecutive_fails",
+                 "cooldown_until", "last_error", "last_ttfb", "last_probe_at",
+                 "samples", "dead")
 
-    # ---- 配置（存在 Upstream 上，这里只读）----
+    def __init__(self, url: str):
+        self.url: str = url
+        # 路径后缀提示（base 已经有 /v1、还是得自己补），每一面独立记
+        self.hint: list = [None]
+        self.ewma: Optional[float] = None      # 秒
+        self.ok: int = 0
+        self.fail: int = 0
+        self.samples: int = 0
+        self.consecutive_fails: int = 0
+        self.cooldown_until: float = 0.0
+        self.last_error: Optional[str] = None
+        self.last_ttfb: Optional[float] = None
+        self.last_probe_at: float = 0.0
+        # 这一面根本没有 API（/models 回 404）。
+        # 注意：404 是确定性的「路径不存在」，不是抖动 —— 不能因为快就选中它。
+        # 仍然会被后台探测，一旦哪天通了自动复活。
+        self.dead: bool = False
 
-    def _ensure_day(self) -> None:
-        key = time.strftime("%Y-%m-%d")
-        if key != self._day_key:
-            self._day_key = key
-            self._day_used = 0
+    @property
+    def available(self) -> bool:
+        return self.cooldown_until <= time.monotonic()
 
-    def used_today(self) -> int:
-        with self.lock:
-            self._ensure_day()
-            return self._day_used
+    @property
+    def score(self) -> float:
+        """越小越快。从没测过的排后面，让已知快的先上。"""
+        base = self.ewma if self.ewma is not None else 999.0
+        penalty = min(self.consecutive_fails, 5) * 2.0
+        if not self.available:
+            penalty += 60.0
+        if self.dead:
+            penalty += 600.0          # 没有 API 的面永远排最后
+        return base + penalty
 
-    def acquire(self, max_per_day: Optional[int]) -> tuple[bool, str]:
-        """尝试放行一次。返回 (是否放行, 不放行的原因)。
+    def record(self, ttfb: Optional[float], ok: bool, error: Optional[str] = None,
+               threshold: int = 3, cooldown: float = 30.0, alpha: float = 0.35) -> None:
+        self.last_probe_at = time.monotonic()
+        self.samples += 1
+        if ok:
+            if ttfb is not None and ttfb >= 0:
+                self.last_ttfb = ttfb
+                self.ewma = ttfb if self.ewma is None else (
+                    alpha * ttfb + (1.0 - alpha) * self.ewma)
+            self.ok += 1
+            self.consecutive_fails = 0
+            self.cooldown_until = 0.0
+            self.last_error = None
+            self.dead = False
+        else:
+            self.fail += 1
+            self.consecutive_fails += 1
+            self.last_error = (error or "未知错误")[:160]
+            # 404 = 这一面没有这个接口，直接判死，别让它靠低延迟抢头名
+            if "404" in (self.last_error or ""):
+                self.dead = True
+            if self.consecutive_fails >= threshold:
+                self.cooldown_until = time.monotonic() + max(cooldown, 1.0)
 
-        每天额度用满**不等待** —— 那要等到第二天，在这里等没有意义，
-        不如立刻试下一家。
-        """
-        with self.lock:
-            self._ensure_day()
-            if max_per_day is not None and self._day_used >= max_per_day:
-                return False, f"每天上限 {max_per_day} 已用满"
-            self._day_used += 1
-            return True, ""
+    def reset(self) -> None:
+        self.ewma = None
+        self.ok = 0
+        self.fail = 0
+        self.samples = 0
+        self.consecutive_fails = 0
+        self.cooldown_until = 0.0
+        self.last_error = None
+        self.last_ttfb = None
+        self.hint[0] = None
+        self.dead = False
 
-    def state(self, max_per_day: Optional[int]) -> dict:
-        with self.lock:
-            self._ensure_day()
-            used = self._day_used
+    def snapshot(self) -> dict:
         return {
-            "used_today": used,
-            "max_per_day": max_per_day,
-            # 还有没有容量（给前端标「已满」用；满了不代表坏了）
-            "has_room": (max_per_day is None or used < max_per_day),
+            "url": self.url,
+            "ewma_ms": round(self.ewma * 1000) if self.ewma is not None else None,
+            "last_ttfb_ms": round(self.last_ttfb * 1000) if self.last_ttfb is not None else None,
+            "score": round(self.score, 3),
+            "ok": self.ok,
+            "fail": self.fail,
+            "consecutive_fails": self.consecutive_fails,
+            "available": self.available,
+            "dead": self.dead,
+            "cooldown_remaining_seconds": round(max(0.0, self.cooldown_until - time.monotonic()), 1),
+            "last_error": self.last_error,
+            "last_probe_at": self.last_probe_at or None,
         }
 
 
-# ---------------------------------------------------------------------------
-# 上游
-# ---------------------------------------------------------------------------
+class MirrorProber:
+    """后台定时探测所有镜像的首字节延迟。
+
+    被动学习只在有请求时才有样本；空闲时排名会过时，切过去才发现变慢。
+    这里每 interval 秒并发打一遍 /models，把排名一直刷新。
+    """
+
+    def __init__(self, router, interval: float = 15.0, timeout: float = 2.5,
+                 enabled: bool = True) -> None:
+        self.router = router
+        self.interval = max(3.0, float(interval))
+        self.timeout = max(0.5, float(timeout))
+        self.enabled = bool(enabled)
+        self._stop = threading.Event()
+        self._thread: Optional[threading.Thread] = None
+
+    def start(self) -> None:
+        if not self.enabled or self._thread is not None:
+            return
+        self._thread = threading.Thread(target=self._loop, name="mirror-prober",
+                                        daemon=True)
+        self._thread.start()
+
+    def stop(self) -> None:
+        self._stop.set()
+
+    def _loop(self) -> None:
+        # 启动先等一拍，别和「拉模型」抢连接
+        if self._stop.wait(3.0):
+            return
+        while not self._stop.is_set():
+            try:
+                self.probe_all()
+            except Exception:  # noqa: BLE001 — 探测线程绝不能死
+                pass
+            if self._stop.wait(self.interval):
+                break
+
+    def probe_all(self) -> None:
+        """并发探测所有上游的所有镜像。"""
+        jobs: list[tuple[Upstream, Mirror]] = []
+        for up in list(getattr(self.router, "upstreams", [])):
+            if not up.enabled:
+                continue
+            for m in up.mirrors:
+                jobs.append((up, m))
+        if not jobs:
+            return
+
+        threads: list[threading.Thread] = []
+        for up, m in jobs:
+            t = threading.Thread(target=self._probe_one, args=(up, m), daemon=True)
+            t.start()
+            threads.append(t)
+        for t in threads:
+            t.join(timeout=self.timeout + 1.5)
+
+    def _probe_one(self, up, mirror) -> None:
+        """探测这一面。路径拼法和真正请求时一致（走 api_paths），
+        这样 base 带不带 /v1 都能测到。"""
+        try:
+            candidates = api_paths(mirror.url, "/models")
+        except Exception as exc:  # noqa: BLE001
+            mirror.record(None, False, f"地址不合法: {exc}",
+                          up.mirror_fail_threshold, up.mirror_cooldown)
+            return
+        if not candidates:
+            mirror.record(None, False, "没有可用路径",
+                          up.mirror_fail_threshold, up.mirror_cooldown)
+            return
+
+        # 上次成功的拼法优先
+        if mirror.hint[0]:
+            for i, (_, suffix) in enumerate(candidates):
+                if suffix == mirror.hint[0]:
+                    candidates.insert(0, candidates.pop(i))
+                    break
+
+        last = None
+        t_start = time.monotonic()
+        for target_url, suffix in candidates:
+            if time.monotonic() - t_start > self.timeout:
+                break
+            parts = urllib.parse.urlsplit(target_url)
+            if parts.scheme not in ("http", "https") or not parts.hostname:
+                continue
+            scheme = parts.scheme.lower()
+            port = parts.port or (443 if scheme == "https" else 80)
+            target = parts.path + (("?" + parts.query) if parts.query else "")
+            cls = (http.client.HTTPSConnection if scheme == "https"
+                   else http.client.HTTPConnection)
+
+            conn = None
+            t0 = time.monotonic()
+            try:
+                conn = cls(parts.hostname, port, timeout=self.timeout)
+                conn.connect()
+                hdrs = {"Accept": "application/json", "User-Agent": "llm-router-probe"}
+                if up.api_keys:
+                    hdrs["Authorization"] = f"Bearer {up.api_keys[0]}"
+                conn.request("GET", target, headers=hdrs)
+                resp = conn.getresponse()
+                ttfb = time.monotonic() - t0
+                resp.read(2048)
+
+                # 404/405 = 这个拼法不对，换下一种；其它 <500 都算这一面通
+                if resp.status in (404, 405) and len(candidates) > 1:
+                    last = f"HTTP {resp.status}"
+                    continue
+                ok = resp.status < 500 and resp.status not in (404, 405)
+                if ok:
+                    mirror.hint[0] = suffix
+                mirror.record(ttfb, ok, None if ok else f"HTTP {resp.status}",
+                              up.mirror_fail_threshold, up.mirror_cooldown)
+                return
+            except Exception as exc:  # noqa: BLE001
+                last = f"{type(exc).__name__}: {exc}"
+                if time.monotonic() - t_start > self.timeout:
+                    break
+            finally:
+                try:
+                    if conn is not None:
+                        conn.close()
+                except Exception:
+                    pass
+
+        mirror.record(None, False, last or "探测失败",
+                      up.mirror_fail_threshold, up.mirror_cooldown)
+
 
 class Upstream:
     """一个上游来源：名字、地址、Key。模型由拉取得到。"""
@@ -729,6 +895,43 @@ class Upstream:
         self.id: str = str(cfg.get("id") or f"u{index + 1}")
         self.name: str = str(cfg.get("name") or self.id)
         self.base_url: str = norm_base_url(cfg.get("base_url") or "")
+
+        # ---- 多镜像 ----------------------------------------------------------
+        # 同一家的多个域名（线路）。base_url 仍然是「主地址」，负责显示与
+        # 持久化；真正发请求时在 mirrors 里挑当前最快的那一面。
+        # 老配置只有 base_url → mirrors 只有一个元素，行为与以前完全一致。
+        raw_mirrors = cfg.get("base_urls") or cfg.get("mirrors") or []
+        urls: list[str] = []
+        if isinstance(raw_mirrors, list):
+            for item in raw_mirrors:
+                u = norm_base_url(str(item) if not isinstance(item, dict)
+                                  else str(item.get("url") or ""))
+                if u and u not in urls:
+                    urls.append(u)
+        if self.base_url and self.base_url not in urls:
+            urls.insert(0, self.base_url)
+        if not self.base_url and urls:
+            self.base_url = urls[0]
+        self.mirrors: list[Mirror] = [Mirror(u) for u in urls]
+        # 选面策略：fastest = 一直用最快的；priority = 按填写顺序（老行为）
+        self.mirror_strategy: str = str(cfg.get("mirror_strategy") or "fastest").lower()
+        if self.mirror_strategy not in ("fastest", "priority", "round_robin"):
+            self.mirror_strategy = "fastest"
+        # 某一面连续失败几次踢出、踢多久（秒）
+        try:
+            self.mirror_fail_threshold: int = max(
+                1, int(cfg.get("mirror_fail_threshold") or 3))
+        except (TypeError, ValueError):
+            self.mirror_fail_threshold = 3
+        try:
+            self.mirror_cooldown: float = max(
+                1.0, float(cfg.get("mirror_cooldown_seconds") or 30.0))
+        except (TypeError, ValueError):
+            self.mirror_cooldown = 30.0
+        # 运行时：最近一次实际用了哪一面
+        self.last_mirror: Optional[str] = None
+        self._mirror_rr: int = 0
+
         # 多 Key 轮转：api_keys 是完整列表，api_key 向后兼容取第一个
         raw_keys = cfg.get("api_keys") or []
         single = str(cfg.get("api_key") or "")
@@ -765,6 +968,26 @@ class Upstream:
         self.models_error: Optional[str] = cfg.get("models_error")
         # 最近一次余额查询结果（持久化，重启后还在）
         self.balance: Optional[dict] = cfg.get("balance")
+
+        # ---- 签到 ----------------------------------------------------------
+        # 签到用的是站点「个人设置 → 访问令牌」那个 token，和上面的 api_keys
+        # （sk- 推理 key）不是一回事，所以单独存一份，互不干扰。
+        raw_ck = cfg.get("checkin")
+        raw_ck = raw_ck if isinstance(raw_ck, dict) else {}
+        self.checkin_token: str = str(raw_ck.get("token") or "").strip()
+        self.checkin_user_id: str = str(raw_ck.get("user_id") or "").strip()
+        # 有令牌就默认参与签到；显式关了才不签
+        self.checkin_enabled: bool = bool(raw_ck.get("enabled", bool(self.checkin_token)))
+        # 站点用的是哪条签到路径（探测到之后记住，下次先问它）
+        self.checkin_path: str = str(raw_ck.get("path") or "").strip()
+        # 额度换算比（签到时顺手从 /api/status 学到，省得每次都问）
+        try:
+            self.checkin_quota_per_unit: float = float(raw_ck.get("quota_per_unit") or 0)
+        except (TypeError, ValueError):
+            self.checkin_quota_per_unit = 0.0
+        # 最近一次签到结果（持久化，重启后还在）
+        self.checkin_state: Optional[dict] = cfg.get("checkin_state")
+
         # 最近一次连通性测试结果(持久化，重启后还在)
         self.last_check: Optional[dict] = cfg.get("last_check")
         # 每个模型各测一次的结果(model -> {ok/latency/at/...})，持久化
@@ -772,6 +995,10 @@ class Upstream:
         self.last_checks: dict[str, dict] = (
             {str(k): v for k, v in raw_checks.items()} if isinstance(raw_checks, dict) else {}
         )
+        # 这些测速记录只在**当天**有效。记下他们是哪天测的，跨天一律作废——
+        # 否则卡片上会一直挂着好几天前的结果，看起来像「刚测过、是通的」。
+        self.checks_day: str = str(cfg.get("checks_day") or "")
+        self._expire_stale_checks()
 
         # 用户勾选了哪些模型要用（存的是上游这边的真实模型名）。
         # None 表示「状态文件里没这个字段」（升级前的老状态），
@@ -834,24 +1061,6 @@ class Upstream:
         self.first_timeout: float = _ft if _ft > 0 else DEFAULT_FIRST_TIMEOUT
         self.cooldown: float = float(cfg.get("cooldown_seconds") or 60)
 
-        # 容量上限（用户按上游手填）。None = 不限。
-        # max_per_day 是「本地自然日最多发几次」（日期一变清零），
-        # 适合「每天限 100 次」这类按天给的额度。
-        # 只影响**发往这家**的请求：用满就换下一家，而不是让请求失败。
-        self.max_per_day: Optional[int] = self._pos_int(cfg.get("max_per_day"))
-        self.gate = CapacityGate()
-        # 当天已用次数（配了上限才记）：随状态文件持久化，进程重启不归零。
-        # 只认「存的时候是今天」的计数；跨天后由 _ensure_day 自然清零。
-        raw_today = cfg.get("capacity_today")
-        if isinstance(raw_today, dict):
-            d = str(raw_today.get("day") or "")
-            if d == time.strftime("%Y-%m-%d"):
-                try:
-                    self.gate._day_key = d
-                    self.gate._day_used = max(0, int(raw_today.get("used") or 0))
-                except (TypeError, ValueError):
-                    pass
-
     @staticmethod
     def _pos_int(value: Any) -> Optional[int]:
         """把配置里的上限读成正整数；空/0/负数/看不懂的一律当「不限」。"""
@@ -893,28 +1102,6 @@ class Upstream:
 
     def cooling_remaining(self) -> float:
         return max(0.0, self.cooldown_until - time.time())
-
-    # ---- 容量 ----
-    def has_capacity_limit(self) -> bool:
-        return self.max_per_day is not None
-
-    def capacity_state(self) -> dict:
-        return self.gate.state(self.max_per_day)
-
-    def acquire(self) -> tuple[bool, str]:
-        """试一下还有没有每天额度。返回 (是否放行, 不放行的原因)。
-
-        没配上限的不计数、不挡（零开销）；配了上限的从**设置那一刻**起算当天用量。
-        """
-        if not self.has_capacity_limit():
-            return True, ""
-        return self.gate.acquire(self.max_per_day)
-
-    def capacity_persist(self) -> dict:
-        """要跟状态文件走的当天计数（配了上限才有；重启后不归零）。"""
-        with self.gate.lock:
-            return {"day": self.gate._day_key, "used": self.gate._day_used}
-
 
     def group_of(self, real_model: str) -> str:
         """上游真实模型名 → 分组名。没设映射就是它自己。"""
@@ -1011,6 +1198,32 @@ class Upstream:
             self.total_latency = 0.0
             self.latency_samples = 0
 
+    @staticmethod
+    def _today() -> str:
+        """本地自然日，形如 2026-10-28。"""
+        return time.strftime("%Y-%m-%d", time.localtime())
+
+    def _expire_stale_checks(self) -> bool:
+        """测速记录只在当天有效，跨天就清空。返回是否真的清了。
+
+        注意：会在 __init__ 里被调用（那时 _lock 还没建），
+        所以这里不加锁，只在单线程或已持锁的上下文里调用。
+        """
+        if not self.last_check and not self.last_checks:
+            self.checks_day = self._today()
+            return False
+        if self.checks_day != self._today():
+            self.last_check = None
+            self.last_checks = {}
+            self.checks_day = self._today()
+            return True
+        return False
+
+    def _current_checks(self) -> tuple[Optional[dict], dict]:
+        """取「有效的」测速记录；跨天自动作废。"""
+        self._expire_stale_checks()
+        return self.last_check, dict(self.last_checks)
+
     def _remember_check(self, result: dict) -> None:
         """记下最近一次连通性测试结果，随状态持久化。
 
@@ -1030,6 +1243,8 @@ class Upstream:
             "last_actual": result.get("last_actual"),
         }
         with self._lock:
+            self._expire_stale_checks()      # 跨天了就先清掉昨天的
+            self.checks_day = self._today()
             self.last_check = entry
             m = entry.get("model")
             if m:
@@ -1038,10 +1253,18 @@ class Upstream:
     def snapshot(self) -> dict:
         with self._lock:
             avg = (self.total_latency / self.latency_samples) if self.latency_samples else 0.0
+            # 测速记录只在当天有效：跨天自动返回空，卡片不会挂着几天前的结果
+            _chk, _chks = self._current_checks()
             return {
                 "id": self.id,
                 "name": self.name,
                 "base_url": self.base_url,
+                # 多镜像（同一家的多条线路）与当前实际在用的那一面
+                "mirrors": self.mirror_snapshots(),
+                "base_urls": self.base_urls(),
+                "mirror_count": len(self.mirrors),
+                "mirror_strategy": self.mirror_strategy,
+                "last_mirror": self.last_mirror,
                 "enabled": self.enabled,
                 "key_hint": mask_key(self.api_keys[0]) if self.api_keys else "",
                 "has_key": bool(self.api_keys),
@@ -1071,10 +1294,10 @@ class Upstream:
                 "last_error": self.last_error,
                 "avg_latency_seconds": round(avg, 3),
                 "last_used": self.last_used or None,
-                "last_check": self.last_check,
-                "last_checks": dict(self.last_checks),
-                # 容量：配了多少、现在用了多少（前端卡片要显示实时占用）
-                "capacity": self.capacity_state(),
+                # 测速记录只在当天有效（跨天返回空，前端不会挂着几天前的结果）
+                "last_check": _chk,
+                "last_checks": _chks,
+                "checks_day": self.checks_day or None,
                 # 最近一次余额查询结果（没查过就是 None）
                 "balance": self.balance,
                 "user_agent": self.user_agent,
@@ -1082,12 +1305,60 @@ class Upstream:
                 "stream_only_models": sorted(self.stream_only_models),
             }
 
+    def _checkin_cfg(self) -> dict:
+        """要落盘的签到配置。令牌原文存在这里（.llmrouter/ 整个目录不进仓库）。"""
+        out: dict[str, Any] = {"token": self.checkin_token}
+        if self.checkin_user_id:
+            out["user_id"] = self.checkin_user_id
+        out["enabled"] = self.checkin_enabled
+        if self.checkin_path:
+            out["path"] = self.checkin_path
+        if self.checkin_quota_per_unit:
+            out["quota_per_unit"] = self.checkin_quota_per_unit
+        return out
+
+    def checkin_ready(self) -> bool:
+        """这个上游现在能不能自动签到。"""
+        return bool(self.checkin_enabled and self.checkin_token)
+
+    def checkin_payload(self) -> dict:
+        """喂给 checkin.py 的结构（它不认识 Upstream 类，只认 dict）。"""
+        return {
+            "id": self.id,
+            "name": self.name,
+            "base_url": self.base_url,
+            "checkin": self._checkin_cfg(),
+        }
+
+    def checkin_view(self) -> dict:
+        """签到页要的一行。令牌只给打码值和「配没配」，原文不出后端。"""
+        root = checkin_mod.site_root(self.base_url)
+        return {
+            "id": self.id,
+            "name": self.name,
+            "base_url": self.base_url,
+            "site_root": root,
+            "enabled": self.enabled,
+            "configured": bool(self.checkin_token),
+            "checkin_enabled": self.checkin_enabled,
+            "token_hint": mask_key(self.checkin_token) if self.checkin_token else "",
+            "user_id": self.checkin_user_id,
+            "path": self.checkin_path,
+            # 把 sk- 推理 key 填进访问令牌是很常见的搞错方式，前端直接标出来
+            "token_looks_wrong": bool(self.checkin_token.lower().startswith("sk-")),
+            "state": self.checkin_state or None,
+        }
+
     def state(self) -> dict:
         """要持久化的部分。"""
         return {
             "id": self.id,
             "name": self.name,
             "base_url": self.base_url,
+            # 多镜像地址：只在配了 2 个以上时才写，老状态文件一字不变
+            **({"base_urls": self.base_urls()} if len(self.mirrors) > 1 else {}),
+            **({"mirror_strategy": self.mirror_strategy}
+               if self.mirror_strategy != "fastest" else {}),
             "api_keys": list(self.api_keys),
             # 名字全空就不写，老状态文件保持干净
             **({"api_key_names": list(self.api_key_names)} if any(self.api_key_names) else {}),
@@ -1103,11 +1374,13 @@ class Upstream:
             "models_error": self.models_error,
             "last_check": self.last_check,
             "last_checks": dict(self.last_checks),
+            # 测速记录属于哪一天；跨天后这些记录会作废（见 _expire_stale_checks）
+            **({"checks_day": self.checks_day} if self.checks_day else {}),
             "balance": self.balance,
-            # 只在上限设过时才写，保持老状态文件干净
-            **({"max_per_day": self.max_per_day} if self.max_per_day else {}),
-            **({"capacity_today": self.capacity_persist()}
-               if self.max_per_day and self.gate.used_today() else {}),
+            # 签到配置：没配令牌的上游一个字段都不写，老状态文件保持干净
+            **({"checkin": self._checkin_cfg()} if self.checkin_token else {}),
+            # 最近一次签到结果：没签过就不写
+            **({"checkin_state": self.checkin_state} if self.checkin_state else {}),
             **({"first_timeout_seconds": self.first_timeout}
                if self.first_timeout != DEFAULT_FIRST_TIMEOUT else {}),
             **({"user_agent": self.user_agent} if self.user_agent else {}),
@@ -1140,18 +1413,24 @@ class Upstream:
             return ""
 
     def key_label(self, key: str) -> str:
-        """Key 的展示名：配了名字用名字，否则用打码值（请求记录里显示）。"""
+        """Key 的展示名：只有「多 Key 且这个 Key 起了名字」时才返回名字。
+
+        单 Key、或没起名字，一律返回空串 —— 请求记录里就不显示 Key 这一栏，
+        免得把打码值当成名字摆出来（用户要的是名字，不是 Key）。
+        """
         if not key:
             return ""
         with self._lock:
+            if len(self.api_keys) <= 1:
+                return ""
             try:
                 idx = self.api_keys.index(key)
             except ValueError:
-                idx = -1
+                return ""
             names = list(self.api_key_names)
-        if 0 <= idx < len(names) and names[idx]:
-            return names[idx]
-        return mask_key(key)
+        if 0 <= idx < len(names):
+            return names[idx].strip()
+        return ""
 
     def rotate_key(self, failed_key: str) -> bool:
         """failover 模式下，当前 Key 出错时切到下一个可用的（跳过禁用的）。
@@ -1193,77 +1472,182 @@ class Upstream:
 
     def open(self, method: str, path: str, data: Optional[bytes] = None,
              headers: Optional[dict] = None, read_timeout: Optional[float] = None):
-        """连上游发一个请求。返回 (conn, resp, target_path)。"""
-        parts = urllib.parse.urlsplit(self.base_url)
-        if parts.scheme not in ("http", "https") or not parts.hostname:
+        """连上游发一个请求。返回 (conn, resp, target_path)。
+
+        配了多个镜像（base_urls）时，按「当前最快」顺序依次尝试：
+        某一面连不上 / 超时 / 回 5xx 就自动换下一面 —— 对上层完全透明。
+        只有一面时，行为与改造前完全一致。
+        """
+        mirrors = self._ordered_mirrors()
+        if not mirrors:
             raise ValueError(f"上游地址不合法: {self.base_url!r}")
+
+        last_exc: Optional[Exception] = None
+        for idx, mirror in enumerate(mirrors):
+            has_next = idx < len(mirrors) - 1
+            t0 = time.monotonic()
+            try:
+                conn, resp, target = self._open_via(
+                    mirror.url, mirror.hint, method, path, data, headers, read_timeout)
+            except (TimeoutError, socket.timeout) as exc:
+                # 超时不是「路径拼法」的问题：这一面卡了，换下一面
+                mirror.record(None, False, f"首包超时 >{self.first_timeout:g}s",
+                              self.mirror_fail_threshold, self.mirror_cooldown)
+                last_exc = exc
+                if has_next:
+                    continue
+                raise
+            except Exception as exc:  # noqa: BLE001
+                mirror.record(None, False, str(exc),
+                              self.mirror_fail_threshold, self.mirror_cooldown)
+                last_exc = exc
+                if has_next:
+                    continue
+                raise
+
+            ttfb = time.monotonic() - t0
+            # 404 = 这一面没有这个接口；5xx = 这一面网关坏了。
+            # 两种情况都换下一面 —— 此刻还没给客户端任何字节，换是安全的。
+            if resp.status in (404, 405) and has_next:
+                self._close(conn)
+                mirror.record(None, False, f"HTTP {resp.status}",
+                              self.mirror_fail_threshold, self.mirror_cooldown)
+                continue
+            if resp.status >= 500 and has_next:
+                self._close(conn)
+                mirror.record(None, False, f"HTTP {resp.status}",
+                              self.mirror_fail_threshold, self.mirror_cooldown)
+                continue
+
+            ok = resp.status < 500 and resp.status not in (404, 405)
+            mirror.record(ttfb, ok, None if ok else f"HTTP {resp.status}",
+                          self.mirror_fail_threshold, self.mirror_cooldown)
+            self._prefix_hint = mirror.hint[0]
+            self.last_mirror = mirror.url
+            return conn, resp, target
+
+        if last_exc is not None:
+            raise last_exc
+        raise RuntimeError("没有可用的上游路径")
+
+    def _ordered_mirrors(self) -> list:
+        """按策略排出这次要试的镜像顺序。"""
+        live = [m for m in self.mirrors if m.available and not m.dead]
+        if not live:
+            # 全在冷却里 / 全被判死：宁可再试一遍，也别直接判死
+            live = [m for m in self.mirrors if m.available] or list(self.mirrors)
+        if len(live) <= 1:
+            return live
+        mode = self.mirror_strategy
+        if mode == "priority":
+            return live
+        if mode == "round_robin":
+            self._mirror_rr = (self._mirror_rr + 1) % len(live)
+            return live[self._mirror_rr:] + live[:self._mirror_rr]
+        return sorted(live, key=lambda m: m.score)
+
+    def mirror_snapshots(self) -> list[dict]:
+        return [m.snapshot() for m in self.mirrors]
+
+    def base_urls(self) -> list[str]:
+        return [m.url for m in self.mirrors]
+
+    def rebuild_mirrors(self) -> None:
+        """换了上游地址 = 换了一家：镜像列表重置成只有新地址。"""
+        self.mirrors = [Mirror(self.base_url)] if self.base_url else []
+        self.last_mirror = None
+        self._mirror_rr = 0
+
+    def set_mirrors(self, urls: list[str]) -> None:
+        """整份替换镜像列表，尽量沿用已有那几面的学习结果。"""
+        old = {m.url: m for m in self.mirrors}
+        fresh: list[Mirror] = []
+        for u in urls:
+            fresh.append(old.get(u) or Mirror(u))
+        self.mirrors = fresh
+        self.last_mirror = None
+        self._mirror_rr = 0
+
+    def _open_via(self, base_url: str, hint: list, method: str, path: str,
+                  data: Optional[bytes] = None, headers: Optional[dict] = None,
+                  read_timeout: Optional[float] = None):
+        """在**指定的这一面**上发请求（原来的单地址逻辑，参数化成 base_url）。"""
+        parts = urllib.parse.urlsplit(base_url)
+        if parts.scheme not in ("http", "https") or not parts.hostname:
+            raise ValueError(f"上游地址不合法: {base_url!r}")
         scheme = parts.scheme.lower()
         port = parts.port or (443 if scheme == "https" else 80)
         cls = http.client.HTTPSConnection if scheme == "https" else http.client.HTTPConnection
 
-        candidates = api_paths(self.base_url, path)
-        if self._prefix_hint:
+        candidates = api_paths(base_url, path)
+        if hint[0]:
             # 上次成功的后缀优先试，省一次 404 往返
             for i, (_, suffix) in enumerate(candidates):
-                if suffix == self._prefix_hint:
+                if suffix == hint[0]:
                     candidates.insert(0, candidates.pop(i))
                     break
 
         last_exc: Optional[Exception] = None
         last_resp = None
         for target, suffix in candidates:
-            conn = None
-            try:
-                # 首包预算是**总时间**：从发起连接到收到响应头，合计不超过
-                # first_timeout（默认 15 秒）。连接超时只是连接阶段的单独上限，
-                # 和预算取小 —— 不会出现「连接 10 秒 + 收包 15 秒 = 25 秒」。
-                budget = self.first_timeout if read_timeout is None else read_timeout
-                t_first = time.monotonic()
-                conn = cls(parts.hostname, port, timeout=min(self.connect_timeout, budget))
-                conn.connect()
-                remain = budget - (time.monotonic() - t_first)
-                if remain <= 0:
-                    raise TimeoutError(f"连接就花掉了 {budget:g} 秒")
+            # 同一条路径上连接被重置/拒绝是很常见的瞬时故障（尤其是走代理时），
+            # 先原地重试一次再换拼法 —— 否则一次抖动就会掉到兜底拼法上，
+            # 拿回一个 404，把「连接被重置」误报成「接口不存在」。
+            for attempt in range(2):
+                conn = None
                 try:
-                    conn.sock.settimeout(remain)
-                except Exception:
-                    pass
-                conn.request(method, target, body=data, headers=headers or {})
-                resp = conn.getresponse()
-                # 响应头到手 = 这次尝试「有回复」；后面读正文/流式换成长超时，
-                # 别把正在生成的长回答按首包超时掐死。
-                try:
-                    conn.sock.settimeout(BODY_READ_TIMEOUT)
-                except Exception:
-                    pass
-                if resp.status == 404 and len(candidates) > 1:
-                    # 路径拼法不对，记下来换下一种；把响应留着，
-                    # 万一全都不行，至少能把这个 404 原样透传出去。
-                    # 之前攒下的那条要关掉，否则换候选时连接会泄漏。
-                    if last_resp is not None:
-                        self._close(last_resp[0])
-                    last_resp = (conn, resp, target, suffix)
-                    continue
-                if looks_like_html_page(resp.getheader("Content-Type") or ""):
-                    # 200 + 网页：这个地址根本没有 API（网关把首页兜底返回了），
-                    # 不能算成功，更不能把它记成「可用拼法」—— 否则后面每个
-                    # 请求都会优先打这个网页地址，表现为「测试通、调用必断」。
-                    # 留着响应，万一别的候选也不行，至少能把它透传出去。
-                    if last_resp is not None:
-                        self._close(last_resp[0])
-                    last_resp = (conn, resp, target, suffix)
-                    continue
-                self._prefix_hint = suffix
-                return conn, resp, target
-            except (TimeoutError, socket.timeout):
-                # 超时不是「路径拼法」的问题：换候选重试只会把「多久没回复」
-                # 翻倍。直接抛出去，让上层决定（换下一个 Key / 换下一家）。
-                self._close(conn)
-                raise
-            except Exception as exc:  # noqa: BLE001
-                last_exc = exc
-                self._close(conn)
-                continue
+                    # 首包预算是**总时间**：从发起连接到收到响应头，合计不超过
+                    # first_timeout（默认 15 秒）。连接超时只是连接阶段的单独上限，
+                    # 和预算取小 —— 不会出现「连接 10 秒 + 收包 15 秒 = 25 秒」。
+                    budget = self.first_timeout if read_timeout is None else read_timeout
+                    t_first = time.monotonic()
+                    conn = cls(parts.hostname, port, timeout=min(self.connect_timeout, budget))
+                    conn.connect()
+                    remain = budget - (time.monotonic() - t_first)
+                    if remain <= 0:
+                        raise TimeoutError(f"连接就花掉了 {budget:g} 秒")
+                    try:
+                        conn.sock.settimeout(remain)
+                    except Exception:
+                        pass
+                    conn.request(method, target, body=data, headers=headers or {})
+                    resp = conn.getresponse()
+                    # 响应头到手 = 这次尝试「有回复」；后面读正文/流式换成长超时，
+                    # 别把正在生成的长回答按首包超时掐死。
+                    try:
+                        conn.sock.settimeout(BODY_READ_TIMEOUT)
+                    except Exception:
+                        pass
+                    if resp.status == 404 and len(candidates) > 1:
+                        # 路径拼法不对，记下来换下一种；把响应留着，
+                        # 万一全都不行，至少能把这个 404 原样透传出去。
+                        # 之前攒下的那条要关掉，否则换候选时连接会泄漏。
+                        if last_resp is not None:
+                            self._close(last_resp[0])
+                        last_resp = (conn, resp, target, suffix)
+                        break                      # 换下一个候选
+                    if looks_like_html_page(resp.getheader("Content-Type") or ""):
+                        # 200 + 网页：这个地址根本没有 API（网关把首页兜底返回了），
+                        # 不能算成功，更不能把它记成「可用拼法」—— 否则后面每个
+                        # 请求都会优先打这个网页地址，表现为「测试通、调用必断」。
+                        # 留着响应，万一别的候选也不行，至少能把它透传出去。
+                        if last_resp is not None:
+                            self._close(last_resp[0])
+                        last_resp = (conn, resp, target, suffix)
+                        break                      # 换下一个候选
+                    hint[0] = suffix
+                    return conn, resp, target
+                except (TimeoutError, socket.timeout):
+                    # 超时不是「路径拼法」的问题：换候选重试只会把「多久没回复」
+                    # 翻倍。直接抛出去，让上层决定（换下一个 Key / 换下一家）。
+                    self._close(conn)
+                    raise
+                except Exception as exc:  # noqa: BLE001
+                    last_exc = exc
+                    self._close(conn)
+                    if attempt == 0:
+                        continue                   # 同一个候选再试一次
+                    break                          # 两次都失败，换下一个候选
 
         if last_resp is not None:
             conn, resp, target, suffix = last_resp
@@ -1271,7 +1655,7 @@ class Upstream:
             # 不要把它记成可用拼法；404 则可以记 —— 至少路径形状对，
             # 下次还是先试它，能省一次往返。
             if resp.status == 404:
-                self._prefix_hint = suffix
+                hint[0] = suffix
             return conn, resp, target
         if last_exc is not None:
             raise last_exc
@@ -1878,6 +2262,9 @@ class StatsStore:
         self._recent: list[dict] = []
         self._journal_lines = 0
         self._loaded = False
+        # 创建它的 Router 会在构造后回填这个引用（构造时上游列表还没建好）。
+        # 只在查询时用：判断记录里的上游是否已被删除，见 _known_upstreams()。
+        self.router: Any = None
 
     @classmethod
     def _fresh(cls) -> dict:
@@ -2220,6 +2607,46 @@ class StatsStore:
                  "status": entry.get("status"),
                  "reason": entry.get("error")}]
 
+    # ---- 已删除上游的记录过滤 ----
+    #
+    # 流水只增不减，删掉一个上游抹不掉它当年的记录；但配置里都没有了，
+    # 请求记录和统计里还一直挂着这个名字，只剩困扰。这里在**查询/渲染层**
+    # 以「当前配置里还存在的上游」为准过滤（文件本身一个字不动）：
+    # - id 还在：上游改过名，老记录照常显示；
+    # - id 不在但名字还在：删了又用同名新建的，也照常显示；
+    # - 都对不上：视为已删除，请求记录里不再出现。
+    # 聚合桶（stats.json）只按名字记账、没有 id，所以统计卡那一侧只能
+    # 按名字过滤 —— 上游改名后，旧名字的历史统计会跟着旧名字一起消失。
+
+    def _known_upstreams(self) -> tuple[set[str], set[str]]:
+        """当前配置里还存在的上游（名字集合 + id 集合）。"""
+        ups = getattr(self.router, "upstreams", None) or []
+        return ({u.name for u in ups}, {u.id for u in ups})
+
+    @staticmethod
+    def _ref_visible(name: Any, uid: Any, names: set[str], ids: set[str]) -> bool:
+        """一个上游引用（名字 + id）是否还指向配置里存在的上游。"""
+        name = str(name or "")
+        if not name or name == "-":
+            # 没落到任何上游的请求（无路由直接 503 之类），跟删除无关，照常显示
+            return True
+        if uid and uid in ids:      # id 还在 —— 改过名也算没删
+            return True
+        return name in names
+
+    @classmethod
+    def entry_visible(cls, entry: dict, names: set[str], ids: set[str]) -> bool:
+        """这条请求记录还要不要显示：最终落到的上游还在，才显示。"""
+        return cls._ref_visible(entry.get("upstream"), entry.get("upstream_id"),
+                                names, ids)
+
+    @classmethod
+    def visible_steps(cls, entry: dict, names: set[str], ids: set[str]) -> list[dict]:
+        """尝试链里仍然存在的上游步骤（已删除的剔除，不给界面看）。"""
+        return [s for s in cls._entry_trail(entry)
+                if cls._ref_visible(s.get("upstream"), s.get("upstream_id"),
+                                    names, ids)]
+
     def query_journal(self, day: str = "", month: str = "", group: str = "",
                       upstream: str = "", model: str = "",
                       offset: int = 0, limit: int = 100,
@@ -2238,8 +2665,12 @@ class StatsStore:
         同时回传 days / groups / upstreams 各维度的计数，前端用来做下拉和筛选提示。
         upstreams 按**每次尝试**统计（和右侧卡片同一口径），并按「上游 + 真实模型」
         细分 —— 同一个分组里一个上游挂了多个模型时，能分别看到各自用了多少。
+
+        已删除的上游不再出现：最终落到已删除上游的记录整条不返回，
+        还在的记录也把尝试链里已删除的上游剔掉（见 visible_steps）。
         """
         entries = self.journal_entries()
+        up_names, up_ids = self._known_upstreams()
         # 过滤
         keep: list[tuple[str, dict]] = []
         day_counts: dict[str, int] = {}
@@ -2248,6 +2679,8 @@ class StatsStore:
         # 下拉里只列当前分组真正用过的上游，并带失败数，方便一眼找到坏上游。
         up_counts: dict[tuple[str, str], list[int]] = {}
         for e in entries:
+            if not self.entry_visible(e, up_names, up_ids):
+                continue
             d = self._entry_day(e)
             g = self._entry_group(e)
             day_counts[d] = day_counts.get(d, 0) + 1
@@ -2261,7 +2694,9 @@ class StatsStore:
             if group:
                 if g != group:
                     continue
-            steps = self._entry_trail(e)
+            # 已删除的上游从尝试链里剔掉：这条请求当时确实试过它，但配置里
+            # 已经没有了，列表和展开详情里都不该再看到这个名字。
+            steps = self.visible_steps(e, up_names, up_ids)
             names = set()
             models_seen = set()
             for s in steps:
@@ -2296,17 +2731,18 @@ class StatsStore:
 
         out_entries: list[dict] = []
         for _, e in page:
-            if with_text:
-                out_entries.append(e)
-            else:
+            if not with_text:
                 # 只挑列表要用的字段，避免把几十 MB 的正文一起发出去
-                out_entries.append({
-                    k: e.get(k) for k in
-                    ("at", "time", "upstream_id", "upstream", "key", "model",
-                     "effective_model", "status", "elapsed_seconds", "ok",
-                     "stream", "attempts", "route_source", "error", "usage",
-                     "trail")
-                })
+                e = {k: e.get(k) for k in
+                     ("at", "time", "upstream_id", "upstream", "key", "model",
+                      "effective_model", "status", "elapsed_seconds", "ok",
+                      "stream", "attempts", "route_source", "error", "usage",
+                      "trail")}
+            else:
+                e = dict(e)      # 别把原始记录改了，trail 过滤只影响这一份响应
+            # 返回的尝试链只留还存在的上游（和列表计数同一口径）
+            e["trail"] = self.visible_steps(e, up_names, up_ids)
+            out_entries.append(e)
         return {
             "entries": out_entries,
             "total": total,
@@ -2336,11 +2772,15 @@ class StatsStore:
         时间戳是浮点数，经 URL 传一圈会有末位精度损失，所以按 0.1 秒
         比对（和列表页的 key 规则一致）；同一 0.1 秒里有多条时，
         再用上游名/状态挑最匹配的那条。
+
+        已删除上游的记录不返回（列表里也没有，列表和详情必须同一口径），
+        返回的那条也把尝试链里已删除的上游剔掉。
         """
         try:
             target = float(at)
         except (TypeError, ValueError):
             return None
+        up_names, up_ids = self._known_upstreams()
         # 优先精确命中：高并发时几条记录可能落在同一个 0.1 秒里，
         # 只按 0.1 秒窗匹配会取回「同一格里的另一条」，正文就对不上了。
         loose = None
@@ -2357,6 +2797,8 @@ class StatsStore:
                             continue
                         if not isinstance(item, dict) or not item.get("at"):
                             continue
+                        if not self.entry_visible(item, up_names, up_ids):
+                            continue
                         try:
                             value = float(item["at"])
                         except (TypeError, ValueError):
@@ -2365,17 +2807,28 @@ class StatsStore:
                             continue
                         if status is not None and item.get("status") != status:
                             continue
+                        if value != target and abs(value - target) >= 0.1:
+                            continue
+                        hit = dict(item)          # 别改原对象
+                        hit["trail"] = self.visible_steps(hit, up_names, up_ids)
                         if value == target:
-                            return item          # 精确命中，直接用它
-                        if abs(value - target) < 0.1 and loose is None:
-                            loose = item          # 兜底：同一 0.1 秒窗内
+                            return hit            # 精确命中，直接用它
+                        if loose is None:
+                            loose = hit           # 兜底：同一 0.1 秒窗内
             except OSError:
                 continue
         return loose
 
     def journal_retention(self) -> dict:
-        """流水保留情况：多少天、共多少条、最早最晚。"""
-        entries = self.journal_entries()
+        """流水保留情况：多少天、共多少条、最早最晚。
+
+        只算「最终上游还存在」的记录，和请求记录列表同一口径 ——
+        删掉上游后这里的天数和条数要跟着变，否则界面上会出现
+        「说有 N 条、列表里只有 M 条」的对不上。
+        """
+        up_names, up_ids = self._known_upstreams()
+        entries = [e for e in self.journal_entries()
+                   if self.entry_visible(e, up_names, up_ids)]
         if not entries:
             return {"entries": 0, "days": 0, "first": None, "last": None}
         ts = [float(e["at"]) for e in entries if e.get("at")]
@@ -2398,16 +2851,23 @@ class StatsStore:
 
         前端用它生成筛选下拉 —— 只列真有过请求的那几天，不给空选项。
         结果按文件（名字+大小+修改时间）缓存，避免每次开页面都全量扫。
+
+        只统计「最终上游还存在」的记录：删掉的上游不再占日期/分组的数，
+        否则选了那一天却是空的，分不清是没调用还是被隐藏了。
+        上游的增删改名会变缓存键，删完上游索引立刻按新口径重算。
         """
         files = self.journal_files()
+        up_names, up_ids = self._known_upstreams()
         try:
             stamp = tuple((os.path.basename(p), os.path.getsize(p), os.path.getmtime(p))
                           for p in files if os.path.exists(p))
         except OSError:
             stamp = ()
+        # 上游列表也算进缓存键：删一个上游，同一天/同一分组的条数就变了
+        up_stamp = tuple(sorted(up_names)) + tuple(sorted(up_ids))
 
         cache = getattr(self, "_journal_index_cache", None)
-        if cache is not None and cache.get("stamp") == stamp:
+        if cache is not None and cache.get("stamp") == (stamp, up_stamp):
             return cache["value"]
 
         days: dict[str, int] = {}
@@ -2426,6 +2886,8 @@ class StatsStore:
                         except Exception:  # noqa: BLE001
                             continue
                         if not isinstance(item, dict):
+                            continue
+                        if not self.entry_visible(item, up_names, up_ids):
                             continue
                         total += 1
                         at = item.get("at")
@@ -2452,7 +2914,7 @@ class StatsStore:
             "groups": [{"key": k, "calls": v}
                        for k, v in sorted(groups.items(), key=lambda kv: -kv[1])],
         }
-        self._journal_index_cache = {"stamp": stamp, "value": value}
+        self._journal_index_cache = {"stamp": (stamp, up_stamp), "value": value}
         return value
 
     def _load_journal(self) -> None:
@@ -2518,7 +2980,9 @@ class StatsStore:
         """按范围聚合，结构对齐 call_stats()，前端可以直接复用渲染。"""
         with self._lock:
             bucket = self._range_bucket(key)
-            return self._render(bucket, key or "all", self.max_entries)
+            known, _ = self._known_upstreams()
+            return self._render(bucket, key or "all", self.max_entries,
+                                known_names=known)
 
     def _range_bucket(self, key: str) -> dict:
         key = (key or "all").strip()
@@ -2545,10 +3009,20 @@ class StatsStore:
                  "input", "output", "total", "cache_read", "cache_write")}
 
     @classmethod
-    def _render(cls, bucket: dict, key: str, history_limit: int = MAX_ENTRIES) -> dict:
+    def _render(cls, bucket: dict, key: str, history_limit: int = MAX_ENTRIES,
+                known_names: Optional[set[str]] = None) -> dict:
+        # 已删除的上游不再渲染（known_names=None 不过滤，老调用方不受影响）。
+        # 聚合桶只按名字记账，所以这里只能按名字匹配；上游改名后旧名字的
+        # 历史统计会跟着旧名字消失 —— 请求记录列表那边有 id，不受改名影响。
+        # 「上游尝试」重算成现存上游之和，不然条数对不上（隐藏的上游占了次数）。
+        def live(items: list[dict]) -> list[dict]:
+            if known_names is None:
+                return items
+            return [u for u in items if str(u.get("upstream") or "") in known_names]
+
         groups = []
         for name, m in bucket.get("models", {}).items():
-            ups = sorted(
+            ups = live(sorted(
                 [{"upstream": un, "calls": int(u.get("calls", 0)),
                   "ok": int(u.get("ok", 0)), "failed": int(u.get("failed", 0)),
                   "usage": cls._usage_of(u),
@@ -2560,25 +3034,27 @@ class StatsStore:
                        for mn, mm in (u.get("models") or {}).items()],
                       key=lambda x: -x["calls"])}
                  for un, u in (m.get("upstreams") or {}).items()],
-                key=lambda x: -x["calls"])
+                key=lambda x: -x["calls"]))
             calls = int(m.get("calls", 0))
             groups.append({
                 "group": name,
                 "calls": calls, "ok": int(m.get("ok", 0)),
                 "failed": int(m.get("failed", 0)),
-                "attempts": int(m.get("attempts", 0)),
+                "attempts": sum(u["calls"] for u in ups),
                 "avg_elapsed": round(float(m.get("elapsed", 0.0)) / calls, 3)
                                if calls else 0,
                 "usage": cls._usage_of(m),
                 "upstreams": ups, "upstream_count": len(ups),
             })
         groups.sort(key=lambda x: -x["calls"])
-        ups = sorted(
+        ups = live(sorted(
             [{"upstream": n, "calls": int(u.get("calls", 0)), "ok": int(u.get("ok", 0)),
               "failed": int(u.get("failed", 0))}
              for n, u in bucket.get("upstreams", {}).items()],
-            key=lambda x: -x["calls"])
-        return {"groups": groups, "totals": cls._light(bucket),
+            key=lambda x: -x["calls"]))
+        totals = cls._light(bucket)
+        totals["attempts"] = sum(u["calls"] for u in ups)
+        return {"groups": groups, "totals": totals,
                 "upstreams": ups, "history_limit": history_limit, "range": key}
 
     @staticmethod
@@ -2616,6 +3092,8 @@ class Router:
         # 统计要跨重启：先把上次的明细找回来，再按需重建聚合
         self.stats = StatsStore(self._state_dir(), self._state_stem(),
                                 max_entries=self.history.maxlen)
+        # 查询时要靠它判断「这条记录的上游是不是已经被删了」
+        self.stats.router = self
         self.stats.load()
         self.history.extend(self.stats.recent_entries())
         if not self.stats.has_data() and self.history:
@@ -2654,6 +3132,18 @@ class Router:
         # _save_state 会被请求线程和后台维护线程并发调用，加锁避免互相踩
         self._state_lock = threading.Lock()
 
+        # ---- 签到 ------------------------------------------------
+        # 全局自动签到设置（什么时候签），单个上游的令牌存在 Upstream 上。
+        # 必须在 _apply_state 之前初始化：状态文件里可能带着上次的设置。
+        self.checkin_auto: dict = {
+            "enabled": False,       # 默认不自动签，用户自己去签到页打开
+            "at": "08:00",          # 基准时刻
+            "random_minutes": 30,   # 在这之后的多少分钟内随机
+        }
+        # 签到明细（签到页的统计和「最近记录」都来自这里）
+        self.checkin_stats = checkin_mod.CheckinStats(
+            self._state_dir(), self._state_stem())
+
         seed = self._seed_from_config(cfg)
         saved = self._load_state()
         if saved:
@@ -2661,6 +3151,26 @@ class Router:
         else:
             self._apply_state(seed)
             self._save_state()
+
+        # 多镜像自动测速：让「哪一面最快」一直是最新的（空闲时也刷新）
+        mirror_cfg = cfg.get("mirror_probe") or {}
+        try:
+            _mi = float(mirror_cfg.get("interval_seconds", 15) or 15)
+        except (TypeError, ValueError):
+            _mi = 15.0
+        try:
+            _mt = float(mirror_cfg.get("timeout_seconds", 2.5) or 2.5)
+        except (TypeError, ValueError):
+            _mt = 2.5
+        self.mirror_prober = MirrorProber(
+            self, interval=_mi, timeout=_mt,
+            enabled=bool(mirror_cfg.get("enabled", True)),
+        )
+        self.mirror_prober.start()
+
+        # 每日自动签到：设定时刻 + 随机窗口，见 checkin.CheckinScheduler
+        self.checkin_scheduler = checkin_mod.CheckinScheduler(self)
+        self.checkin_scheduler.start()
 
     # ---- 配置载入 ----
     @staticmethod
@@ -2672,13 +3182,15 @@ class Router:
                 "id": u.get("id") or f"u{i + 1}",
                 "name": u.get("name") or f"上游{i + 1}",
                 "base_url": u.get("base_url") or "",
+                # 多镜像线路（同一家的多个域名），配置里给了就带上
+                **({"base_urls": u["base_urls"]} if u.get("base_urls") else {}),
+                **({"mirror_strategy": u["mirror_strategy"]}
+                   if u.get("mirror_strategy") else {}),
                 "api_key": u.get("api_key") or "",
                 "enabled": u.get("enabled", True),
                 "available_models": models,
                 # 配置文件里写明的模型，视为「已经选用」，不然写完配置还得去网页勾一遍
                 "selected_models": [str(m) for m in (u.get("selected_models") or models)],
-                # 容量上限也可以写在配置文件里（网页上能改，会覆盖这里）
-"max_per_day": u.get("max_per_day"),
             })
         models_out: dict[str, dict] = {}
         for name, mcfg in (cfg.get("models") or {}).items():
@@ -2707,6 +3219,14 @@ class Router:
                 self.default_connect_timeout = ct if ct > 0 else DEFAULT_CONNECT_TIMEOUT
             except (TypeError, ValueError):
                 pass
+        # 自动签到设置
+        ck = data.get("checkin_settings")
+        if isinstance(ck, dict):
+            self.checkin_auto = {
+                "enabled": bool(ck.get("enabled", False)),
+                "at": str(ck.get("at") or "08:00"),
+                "random_minutes": max(0, int(_to_float(ck.get("random_minutes")) or 0)),
+            }
         self.upstreams = []
         for i, u in enumerate(data.get("upstreams") or []):
             up = Upstream(u, i)
@@ -2904,9 +3424,7 @@ class Router:
             return None
 
     def _save_state(self, want_snapshot: bool = True) -> None:
-        # 请求线程和后台维护线程会并发调用，串行化整个读写。
-        # want_snapshot=False = 轻量保存（不轮转快照）：每天上限计数用，
-        # 它会跟着后台线程每 30 秒走一次，不能每次都转一份快照。
+        # 请求线程和管理线程会并发调用，串行化整个读写。
         with self._state_lock:
             self._write_state(want_snapshot=want_snapshot)
 
@@ -2921,6 +3439,11 @@ class Router:
                              "connect_timeout_seconds": self.default_connect_timeout}}
                if (self.default_first_timeout != DEFAULT_FIRST_TIMEOUT
                    or self.default_connect_timeout != DEFAULT_CONNECT_TIMEOUT)
+               else {}),
+            # 自动签到设置：还是出厂值就不写，老状态文件保持干净
+            **({"checkin_settings": dict(self.checkin_auto)}
+               if self.checkin_auto != {"enabled": False, "at": "08:00",
+                                        "random_minutes": 30}
                else {}),
         }
         path = self._state_path()
@@ -3041,7 +3564,6 @@ class Router:
             # 新加的上游默认一个模型都不选，等用户拉取后自己勾
             "available_models": [],
             "selected_models": [],
-            "max_per_day": payload.get("max_per_day"),
             # 不指定就用「设置」页里的全局默认
             "first_timeout_seconds": payload.get("first_timeout_seconds")
                                      or self.default_first_timeout,
@@ -3083,6 +3605,36 @@ class Router:
                     if not route.entries:
                         del self.models[name]
             up.base_url = new_url
+            # 地址变了：镜像列表重建（上面已把模型/勾选清空）
+            up.rebuild_mirrors()
+
+        if payload.get("base_urls") is not None:
+            raw = payload["base_urls"]
+            if isinstance(raw, str):
+                raw = raw.replace(",", "\n").splitlines()
+            urls: list[str] = []
+            for item in (raw or []):
+                u = norm_base_url(str(item).strip())
+                if not u:
+                    continue
+                parts = urllib.parse.urlsplit(u)
+                if parts.scheme not in ("http", "https") or not parts.hostname:
+                    raise ValueError(f"镜像地址不合法: {u!r}")
+                if u not in urls:
+                    urls.append(u)
+            if not urls:
+                raise ValueError("镜像地址不能为空")
+            up.set_mirrors(urls)
+            up.base_url = urls[0]
+
+        if payload.get("mirror_strategy") is not None:
+            ms = str(payload["mirror_strategy"]).lower()
+            if ms in ("fastest", "priority", "round_robin"):
+                up.mirror_strategy = ms
+        if payload.get("mirror_reset"):
+            for m in up.mirrors:
+                m.reset()
+            up.last_mirror = None
         if payload.get("api_key") is not None:
             up.api_key = str(payload["api_key"])
             # 单 Key 更新也同步到 api_keys
@@ -3132,9 +3684,6 @@ class Router:
                 up.key_strategy = ks
         if payload.get("enabled") is not None:
             up.enabled = bool(payload["enabled"])
-        # 容量上限：显式传 null/"" 表示清掉（回到不限量）
-        if "max_per_day" in payload:
-            up.max_per_day = self._pos_int(payload.get("max_per_day"))
         # 首包超时：显式传空 = 回到全局默认
         if "first_timeout_seconds" in payload or "read_timeout_seconds" in payload:
             raw_ft = payload.get("first_timeout_seconds",
@@ -3151,23 +3700,6 @@ class Router:
                                append=bool(payload.get("stream_only_append")))
         self._save_state()
         return up
-
-    def set_capacity(self, uid: str, max_per_day: Any = None) -> dict:
-        """设置某个上游的每天上限（0 或空 = 不限量）。
-
-        上限挂在**上游**身上而不是某个分组：它反映的是这个账号/Key 的
-        真实配额，同一个账号被好几个分组引用时，配额是共用的一份。
-        按分组各记一套的话，同一个账号能用的总次数会被重复计数，
-        等于上限根本没生效。
-        """
-        up = self.find_upstream(uid)
-        if up is None:
-            raise KeyError(f"找不到上游 {uid!r}")
-        up.max_per_day = self._pos_int(max_per_day)
-        self._save_state()
-        return {"ok": True, "id": up.id, "name": up.name,
-                "max_per_day": up.max_per_day,
-                "capacity": up.capacity_state()}
 
     def set_defaults(self, first_timeout: Any = None,
                      connect_timeout: Any = None) -> dict:
@@ -3192,19 +3724,6 @@ class Router:
     def _pos_int(value: Any) -> Optional[int]:
         """把传入的上限读成正整数；空/0/负数/看不懂的一律当「不限」。"""
         return Upstream._pos_int(value)
-
-    def _capacity_flush_loop(self) -> None:
-        """后台线程：定期把「每天上限」的当天用量轻量落盘（不轮转快照）。
-
-        计数走请求路径、不触发管理保存，不落盘的话进程重启后当天的用量会归零。
-        """
-        while True:
-            try:
-                if any(u.has_capacity_limit() for u in self.upstreams):
-                    self._save_state(want_snapshot=False)
-            except Exception as exc:  # noqa: BLE001
-                sys.stderr.write(f"[warn] 每天上限计数落盘失败: {exc}\n")
-            time.sleep(CAPACITY_FLUSH_INTERVAL)
 
     def delete_upstream(self, uid: str) -> dict:
         up = self.find_upstream(uid)
@@ -3428,6 +3947,161 @@ class Router:
         results.sort(key=lambda r: order.get(r["id"], 999))
         self._save_state()
         return results
+
+    # ---- 签到 ----------------------------------------------------------
+    #
+    # 签到走站点自己的 /api/user/* 接口，用的是「访问令牌」，和推理用的
+    # sk- key 是两套凭据。所以这里单独一份配置，绝不碰 api_keys。
+    # 具体协议（两种签到路径、Cloudflare/Turnstile 识别）都在 checkin.py。
+
+    def checkin_settings(self) -> dict:
+        """当前自动签到设置（调度线程读它）。"""
+        return dict(self.checkin_auto)
+
+    def set_checkin_settings(self, payload: dict) -> dict:
+        """保存自动签到设置。时刻接受 "08:00"，乱填就退回 08:00。"""
+        hh, mm = checkin_mod.parse_hhmm(payload.get("at"), (8, 0))
+        try:
+            window = int(payload.get("random_minutes") or 0)
+        except (TypeError, ValueError):
+            window = 30
+        self.checkin_auto = {
+            "enabled": bool(payload.get("enabled")),
+            "at": f"{hh:02d}:{mm:02d}",
+            "random_minutes": max(0, min(240, window)),
+        }
+        # 改了时刻，今天就按新时刻重新抽一次，别沿用旧计划
+        sched = getattr(self, "checkin_scheduler", None)
+        if sched is not None:
+            sched.reset_plan()
+        self._save_state()
+        return self.checkin_settings()
+
+    def checkin_rows(self) -> list[dict]:
+        """签到页的表格：所有上游 + 各自的签到状态。"""
+        return [u.checkin_view() for u in self.upstreams]
+
+    def set_checkin_config(self, payload: dict) -> dict:
+        """保存一个上游的签到配置。
+
+        token 传 "__keep__" = 只改开关不动令牌；传空串 = 清掉令牌（不再签）。
+        """
+        uid = str(payload.get("id") or "")
+        up = self.find_upstream(uid)
+        if up is None:
+            raise ValueError(f"没有这个上游: {uid}")
+
+        token = payload.get("token")
+        if isinstance(token, str) and token != "__keep__":
+            token = token.strip()
+            if token != up.checkin_token:
+                up.checkin_token = token
+                # 换了令牌等于换了账号：学到的路径、上次结果、汇率都不再适用
+                up.checkin_path = ""
+                up.checkin_state = None
+                up.checkin_quota_per_unit = 0.0
+
+        if "user_id" in payload:
+            up.checkin_user_id = str(payload.get("user_id") or "").strip()
+
+        if "enabled" in payload:
+            up.checkin_enabled = bool(payload.get("enabled"))
+        elif up.checkin_token:
+            # 刚填了令牌、没说开关 = 就是要签这个上游
+            up.checkin_enabled = True
+        if not up.checkin_token:
+            up.checkin_enabled = False       # 没令牌就别留着「启用」这个假象
+
+        self._save_state()
+        return up.checkin_view()
+
+    def fetch_checkin(self, ids: Optional[list[str]] = None,
+                      press_checkin: bool = True,
+                      reason: str = "") -> list[dict]:
+        """并发签到。ids 为空 = 所有「配了令牌且启用」的上游。
+
+        显式点了某个上游的按钮时（ids 有值），即使它没勾启用也照签——
+        用户按下按钮就是明确意图，不该被开关挡住。
+        """
+        want = {str(i) for i in ids} if ids else None
+        targets = [u for u in self.upstreams
+                   if (want is None or u.id in want)
+                   and u.checkin_token
+                   and (u.checkin_enabled or want is not None)]
+        if not targets:
+            return []
+        results: list[dict] = []
+
+        def run_one(up: "Upstream") -> dict:
+            res = checkin_mod.run_one(up.checkin_payload(),
+                                      press_checkin=press_checkin)
+            # 结果写回上游：路径学下来，汇率学下来，状态留给签到页
+            up.checkin_state = res
+            if res.get("path"):
+                up.checkin_path = str(res["path"])
+            try:
+                per_unit = float(res.get("quota_per_unit") or 0)
+            except (TypeError, ValueError):
+                per_unit = 0.0
+            if per_unit > 0:
+                up.checkin_quota_per_unit = per_unit
+            # 只把「真的动过手」的记进统计：探测（press_checkin=False）不记
+            if press_checkin:
+                self.checkin_stats.append({
+                    "at": res.get("at") or time.time(),
+                    "day": res.get("day") or time.strftime("%Y-%m-%d"),
+                    "id": up.id,
+                    "name": up.name,
+                    "kind": res.get("kind", ""),
+                    "message": str(res.get("message") or "")[:300],
+                    "reward": res.get("reward", 0) or 0,
+                    "reward_usd": res.get("reward_usd", 0) or 0,
+                    "blocked": res.get("blocked", ""),
+                })
+            return {"id": up.id, "name": up.name, **res}
+
+        with concurrent.futures.ThreadPoolExecutor(
+                max_workers=min(6, len(targets))) as pool:
+            futures = [pool.submit(run_one, u) for u in targets]
+            for fut in concurrent.futures.as_completed(futures, timeout=180):
+                try:
+                    results.append(fut.result())
+                except Exception as exc:  # noqa: BLE001 — 一个站点炸了不影响别的
+                    results.append({"id": "", "name": "", "ok": False,
+                                    "kind": "error",
+                                    "message": f"{type(exc).__name__}: {exc}"})
+
+        order = {u.id: i for i, u in enumerate(self.upstreams)}
+        results.sort(key=lambda r: order.get(str(r.get("id") or ""), 999))
+        self._save_state()
+
+        # 签到奖励直接进余额，所以签完顺手重查一次（只查刚动过的这几个）
+        if press_checkin and any(r.get("ok") for r in results):
+            touched = [str(r["id"]) for r in results if r.get("id")]
+            if touched:
+                try:
+                    self.fetch_balance(touched)
+                except Exception:  # noqa: BLE001 — 余额查失败不影响签到结果
+                    pass
+
+        if reason:
+            self.admin_log("checkin-all", {
+                "reason": reason,
+                "count": len(results),
+                "ok": sum(1 for r in results if r.get("ok")),
+            }, ok=True)
+        return results
+
+    def checkin_all(self, reason: str = "manual") -> list[dict]:
+        """签所有配了令牌的上游。自动调度线程也走这里。"""
+        return self.fetch_checkin(None, press_checkin=True, reason=reason)
+
+    def checkin_stats_view(self, limit: int = 200) -> dict:
+        """签到页底部：汇总 + 最近记录。"""
+        return {
+            "summary": self.checkin_stats.summary(),
+            "recent": self.checkin_stats.recent(limit),
+        }
 
     # ---- 模型路由增删改 ----
     def save_model(self, payload: dict) -> ModelRoute:
@@ -3904,12 +4578,19 @@ class Router:
         它只用来给「刚发生、还没落进聚合」的几条补显示；
         界面上的统计数字一律走 stats_range（今天/本月/全部），
         那是全量累计、跨重启保留的，明细被裁剪不会让它缩水。
+
+        和流水查询同一口径：最终落到已删除上游的记录不统计，
+        尝试链里已删除的上游也剔除（见 StatsStore._ref_visible）。
         """
         with self.lock:
             hist = list(self.history)
+        up_names = {u.name for u in self.upstreams}
+        up_ids = {u.id for u in self.upstreams}
 
         groups: dict[str, dict] = {}
-        for h in hist:
+        visible_hist = [h for h in hist
+                        if StatsStore.entry_visible(h, up_names, up_ids)]
+        for h in visible_hist:
             name = h.get("model") or "-"
             g = groups.setdefault(name, {
                 "group": name,
@@ -3928,13 +4609,9 @@ class Router:
 
             # 这次请求依次试过的上游。老记录没有 trail 字段，
             # 就退回用「最后落到的那家 + 本次结果」补一条，保证旧数据也能统计。
-            trail = h.get("trail")
-            if not trail:
-                trail = [{"upstream": h.get("upstream") or "-",
-                          "upstream_id": h.get("upstream_id"),
-                          "ok": bool(h.get("ok")),
-                          "model": h.get("effective_model"),
-                          "status": h.get("status")}]
+            # 已删除的上游从这里剔掉，和请求记录列表看到的一致。
+            trail = [s for s in StatsStore.visible_steps(h, up_names, up_ids)
+                     if isinstance(s, dict)]
 
             usage_counted = False
             for step in trail:
@@ -3979,15 +4656,16 @@ class Router:
         out.sort(key=lambda x: -x["calls"])
 
         # 总量（请求层面 + 尝试层面，两个口径都给）
-        totals = {"calls": len(hist), "ok": 0, "failed": 0, "attempts": 0,
+        totals = {"calls": len(visible_hist), "ok": 0, "failed": 0, "attempts": 0,
                   "input": 0, "output": 0, "total": 0,
                   "cache_read": 0, "cache_write": 0}
-        for h in hist:
+        for h in visible_hist:
             if h.get("ok"):
                 totals["ok"] += 1
             else:
                 totals["failed"] += 1
-            trail = h.get("trail") or []
+            trail = [s for s in StatsStore.visible_steps(h, up_names, up_ids)
+                     if isinstance(s, dict)]
             totals["attempts"] += len(trail) if trail else 1
             use = h.get("usage") or {}
             for key in ("input", "output", "total", "cache_read", "cache_write"):
@@ -4007,7 +4685,7 @@ class Router:
 
         return {"groups": out, "totals": totals, "upstreams": upstreams,
                 "history_limit": self.history.maxlen,
-                "history_count": len(hist)}
+                "history_count": len(visible_hist)}
 
     # ---- 快照 ----
     def snapshot(self) -> dict:
@@ -4910,6 +5588,18 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send_json(200, out)
             if path == "/admin/history":
                 return self._send_json(200, {"history": list(self.router.history)})
+            if path == "/admin/checkin":
+                # 签到页一次性拿齐：上游表格、自动签到设置、历史统计
+                query = urllib.parse.parse_qs(urllib.parse.urlsplit(self.path).query)
+                try:
+                    limit = int((query.get("limit") or ["200"])[0])
+                except (TypeError, ValueError):
+                    limit = 200
+                return self._send_json(200, {
+                    "rows": self.router.checkin_rows(),
+                    "settings": self.router.checkin_settings(),
+                    **self.router.checkin_stats_view(limit),
+                })
             if path == "/admin/admin-log":
                 query = urllib.parse.parse_qs(urllib.parse.urlsplit(self.path).query)
                 try:
@@ -4953,10 +5643,12 @@ class Handler(BaseHTTPRequestHandler):
                 "/admin/upstream/add": self._h_upstream_add,
                 "/admin/upstream/update": self._h_upstream_update,
                 "/admin/upstream/delete": self._h_upstream_delete,
-                "/admin/upstream/capacity": self._h_upstream_capacity,
                 "/admin/defaults": self._h_defaults,
                 "/admin/fetch-models": self._h_fetch_models,
                 "/admin/balance": self._h_balance,
+                "/admin/checkin/run": self._h_checkin_run,
+                "/admin/checkin/config": self._h_checkin_config,
+                "/admin/checkin/settings": self._h_checkin_settings,
                 "/admin/select-models": self._h_select_models,
                 "/admin/set-group": self._h_set_group,
                 "/admin/rename-group": self._h_rename_group,
@@ -5010,8 +5702,7 @@ class Handler(BaseHTTPRequestHandler):
 
     # 哪些管理接口前后会改变状态，值得记一笔审计
     AUDIT_DETAIL_KEYS = ("id", "name", "upstream", "model", "models", "from", "to",
-                         "enabled", "mapping", "entries", "label", "strategy",
-                         "max_per_day")
+                         "enabled", "mapping", "entries", "label", "strategy")
 
     def _audit(self, path: str) -> None:
         """把这次管理调用记进审计日志（读 body 前先缓存，免得流被消费掉）。"""
@@ -5213,6 +5904,39 @@ class Handler(BaseHTTPRequestHandler):
         status, out = self._result(go)
         self._send_json(status, out)
 
+    def _h_checkin_run(self) -> None:
+        """执行签到。probe=true 时只探测接口、不按下签到。"""
+        def go():
+            payload = self._read_json_body()
+            ids = payload.get("ids")
+            if ids is not None and not isinstance(ids, list):
+                raise ValueError("ids 必须是数组")
+            probe_only = payload.get("probe") is True
+            results = self.router.fetch_checkin(
+                [str(i) for i in ids] if ids else None,
+                press_checkin=not probe_only,
+                reason="manual")
+            return {"ok": True, "results": results, "probe": probe_only,
+                    **self.router.checkin_stats_view()}
+        status, out = self._result(go)
+        self._send_json(status, out)
+
+    def _h_checkin_config(self) -> None:
+        """保存单个上游的签到令牌 / 开关。"""
+        def go():
+            view = self.router.set_checkin_config(self._read_json_body())
+            return {"ok": True, "upstream": view}
+        status, out = self._result(go)
+        self._send_json(status, out)
+
+    def _h_checkin_settings(self) -> None:
+        """保存自动签到设置（开关、时刻、随机窗口）。"""
+        def go():
+            settings = self.router.set_checkin_settings(self._read_json_body())
+            return {"ok": True, "settings": settings}
+        status, out = self._result(go)
+        self._send_json(status, out)
+
     def _h_model_save(self) -> None:
         def go():
             route = self.router.save_model(self._read_json_body())
@@ -5335,17 +6059,6 @@ class Handler(BaseHTTPRequestHandler):
             if not isinstance(mapping, dict):
                 raise ValueError("mapping 必须是对象，形如 {\"ds1\": \"deepseek\"}")
             return self.router.set_model_group(uid, mapping)
-        status, out = self._result(go)
-        self._send_json(status, out)
-
-    def _h_upstream_capacity(self) -> None:
-        """设置某个上游的每天上限（0 或空 = 不限量）。"""
-        def go():
-            payload = self._read_json_body()
-            uid = str(payload.get("id") or "")
-            if not uid:
-                raise ValueError("缺少 id")
-            return self.router.set_capacity(uid, payload.get("max_per_day"))
         status, out = self._result(go)
         self._send_json(status, out)
 
@@ -5694,16 +6407,9 @@ class Handler(BaseHTTPRequestHandler):
         # 左侧统计靠它才能和右侧卡片的「请求/成功/失败」对上。
         trail: list[dict] = []
         tried: set[int] = set()
-        # 因为「每天上限用满」被挡下的上游：它们没坏，只是今天的额度用完了，
-        # 换下一家试（全部都用完额度才报 429）。
-        cap_full: dict[int, str] = {}
 
         for i, (up, eff_model) in enumerate(pairs):
             if i in tried:
-                continue
-            ok, denied = up.acquire()
-            if denied:
-                cap_full[i] = denied
                 continue
             tried.add(i)
             try:
@@ -5724,22 +6430,6 @@ class Handler(BaseHTTPRequestHandler):
                     self.log_message("上游 %s 失败(%s)，换下一个（还剩 %d 个）",
                                      up.name, exc.reason, remaining)
                 continue
-
-        # 一条都没发出去，全卡在每天上限上：这既不是「上游坏了」也不是
-        # 「没配置」，得说清楚，否则客户端会以为是自己参数不对。
-        if last is None and not tried and cap_full:
-            detail = "；".join(f"{pairs[i][0].name}（{why}）" for i, why in sorted(cap_full.items()))
-            reason = f"所有上游都达到每天上限：{detail}"
-            self._record_history(None, requested_model, "-", 429,
-                                 time.time() - t_start, reason,
-                                 attempts=len(pairs), route_source=route_source)
-            self.log_message("容量已满，%d 个上游都已用完今天的额度：%s", len(cap_full), detail)
-            return self._send_json(429, {"error": {
-                "message": reason,
-                "type": "capacity_exhausted",
-                "retry_after_seconds": 1,
-                "upstreams": [{"name": pairs[i][0].name, "reason": why}
-                              for i, why in sorted(cap_full.items())]}})
 
         if last is not None:
             self._record_history(last.upstream, requested_model, "-", last.status,
@@ -6413,10 +7103,6 @@ def main(argv: Optional[list[str]] = None) -> int:
     httpd = ThreadingHTTPServer((router.host, router.port), Handler)
     httpd.daemon_threads = True
     httpd.router = router  # type: ignore[attr-defined]
-
-    # 后台维护线程：定期把「每天上限」的当天用量轻量落盘（重启不归零）
-    threading.Thread(target=router._capacity_flush_loop, daemon=True,
-                     name="capacity-flush").start()
 
     print("\n服务已启动，Ctrl+C 停止。")
     print(f"  客户端 base_url 用: http://{router.host}:{router.port}/v1\n")

@@ -92,6 +92,46 @@ api_key = "你的火山key"
 
 
 # ---------------------------------------------------------------------------
+# 多线路（同一家的多个域名 / 镜像）
+#
+# 很多中转会给同一套模型、同一个 Key 一堆域名（api.xxx.com、us-v1.xxx.com、
+# hk-v1.xxx.com…），线路快慢差别很大。把 base_urls 填上之后：
+#   · 每个请求自动走「当前最快」的那一条
+#   · 某一条连不上 / 超时 / 回 5xx，自动换下一条（还没给客户端吐字节之前才换，
+#     所以不会重复扣费、不会重复生成）
+#   · 后台每 15 秒并发探一遍全部线路，空闲时排名也是新的
+#   · 某条域名根本没有 API（/models 回 404）会被自动判死，不会因为它快就选中
+#
+# 只写 base_url 时行为与以前完全一致；base_urls 里的第一个会自动当 base_url。
+# 同一组的必须是「同一家的域名 + 同一套 Key」，不同厂商别混在一起。
+# ---------------------------------------------------------------------------
+
+# [[upstreams]]
+# name = "dli-deepseek"
+# id = "u6"
+# base_url = "https://api.dlizz.com/v1"     # 主地址（列表里的第一条）
+# base_urls = [                              # 可选：多线路，一行一条
+#   "https://api.dlizz.com/v1",
+#   "https://api.dli.li/v1",
+#   "https://us-v1.dli.li/v1",
+#   "https://us-v1.dlizz.com/v1",
+#   "https://hk-v1.dli.li/v1",
+#   "https://hk-v1.dlizz.com/v1",
+#   "https://us-1.dli.li/v1",
+# ]
+# mirror_strategy = "fastest"                # fastest（默认）| priority | round_robin
+# mirror_fail_threshold = 3                  # 某条连续失败几次踢出
+# mirror_cooldown_seconds = 30               # 踢出多久（秒）
+# api_key = "sk-你的key"
+
+# 全局控制后台线路探测（不写就是下面这些默认值）
+# [mirror_probe]
+# enabled = true
+# interval_seconds = 15      # 每轮间隔
+# timeout_seconds = 2.5      # 单条线路的超时；全并行，所以一轮最多 ≈ 这个时间
+
+
+# ---------------------------------------------------------------------------
 # 也可以在这里预先写好分组路由（可选）。
 # 网页上配好的内容会覆盖这里，所以平时用网页配就行。
 #

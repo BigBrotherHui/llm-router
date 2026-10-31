@@ -284,7 +284,7 @@
   .seg button.active:hover{color:#04121f}
   .pick{display:flex;align-items:center;gap:10px;background:var(--panel2);
     border:1px solid var(--line);border-radius:8px;padding:10px 12px;margin-bottom:7px;
-    /* 这一行挺宽（模型名 + 参与 + 额度 + 每天上限 + 测试），窗口窄时
+    /* 这一行挺宽（模型名 + 参与 + 额度 + 测试），窗口窄时
        让动作区整体换到第二行，别把上游名字挤成两行 */
     flex-wrap:wrap;
     /* 整行都可以按住拖（见拖动排序那段），所以不让选中文字；
@@ -323,14 +323,10 @@
   .quota-cell input[type=number]{width:80px;background:var(--bg);border:1px solid var(--line);
     border-radius:7px;color:var(--text);padding:5px 8px;font-size:12.5px}
   .quota-cell .badge.bad{opacity:.9}
-  /* 每天上限（这一列配的是**上游**的容量，不是这个分组的） */
   .cap-cell{display:flex;align-items:center;gap:4px;white-space:nowrap}
   .cap-cell input[type=number]{width:52px;background:var(--bg);border:1px solid var(--line);
     border-radius:7px;color:var(--text);padding:5px 6px;font-size:12.5px;text-align:center}
   .cap-k{font-size:11px;color:var(--dim)}
-  .cap-live{font-size:11px;font-family:Consolas,Monaco,monospace;color:var(--dim)}
-  .cap-live.full{color:var(--warn)}
-  .cap-live.off{opacity:.55}
   @media(max-width:680px){
     .up-actions{margin-left:0;width:100%}
     .modal{padding:15px}
@@ -343,6 +339,21 @@
   .collapsible-btn .arrow{font-size:10px;transition:transform .15s}
   .collapsible-btn[aria-expanded="true"] .arrow{transform:rotate(90deg)}
   .collapsible-body{padding-top:8px}
+
+  /* ---- 签到页 ---- */
+  .ck-row{display:flex;align-items:center;gap:10px;flex-wrap:wrap;
+    padding:9px 11px;border:1px solid var(--line);border-radius:9px;
+    margin-bottom:7px;background:var(--panel)}
+  .ck-name{flex:1 1 220px;min-width:0;display:flex;flex-direction:column;gap:2px}
+  .ck-name b{font-size:13.5px}
+  .ck-name .hint{font-size:11px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  .ck-state{display:flex;align-items:center;gap:6px;flex-wrap:wrap}
+  .ck-act{display:flex;align-items:center;gap:6px;flex-wrap:wrap}
+  .ck-main{flex:1 1 300px;min-width:0}
+  .ck-hist-row{display:flex;gap:9px;align-items:baseline;font-size:12px;
+    padding:4px 0;border-bottom:1px dashed var(--line)}
+  .ck-hist-row:last-child{border-bottom:none}
+  .ck-hist-row .t{color:var(--dim);white-space:nowrap;font-variant-numeric:tabular-nums}
 </style>
 </head>
 <body>
@@ -366,6 +377,9 @@
     </button>
     <button class="tab" data-tab="model" role="tab" aria-selected="false">
       <span>模型路由</span><span class="n" id="tabN-model" title="已配置路由的模型个数"></span>
+    </button>
+    <button class="tab" data-tab="ck" role="tab" aria-selected="false">
+      <span>签到</span><span class="n" id="tabN-ck" title="今天已签到的上游数"></span>
     </button>
     <button class="tab" data-tab="set" role="tab" aria-selected="false">
       <span>设置</span>
@@ -489,6 +503,58 @@
         </div>
 
         <div id="models"></div>
+      </div>
+    </section>
+
+    <!-- ============ 签到 ============ -->
+    <section class="pane" id="pane-ck" role="tabpanel" hidden>
+      <div class="card">
+        <h2>每日签到</h2>
+        <div class="hint" style="margin:-6px 0 12px">
+          签到用的是站点「个人设置 → 访问令牌」里那个 token，
+          <b>不是</b>上游卡片里 <code>sk-</code> 开头的推理 Key。
+          只有填了令牌的上游才会出现在自动签到里。
+        </div>
+
+        <div class="up-tools" style="margin-bottom:12px">
+          <span class="badge" id="ckSummary">—</span>
+          <div class="grow"></div>
+          <button class="mini" id="ckProbeAll"
+            title="只探测每个站点有没有签到接口、今天签没签，不真的按下签到">只探测</button>
+          <button class="primary" id="ckRunAll" title="对每个填了令牌的上游签到">一键签到</button>
+        </div>
+
+        <div id="ckRows"></div>
+      </div>
+
+      <div class="card" style="margin-top:14px">
+        <h2>自动签到</h2>
+        <div class="row" style="gap:14px;flex-wrap:wrap;align-items:flex-end">
+          <label style="display:flex;align-items:center;gap:7px;padding-bottom:8px"
+            title="打开后，每天在下面的时刻（加随机浮动）自动把填了令牌的上游签一遍">
+            <input type="checkbox" id="ckAutoOn">
+            <span>每天自动签到</span>
+          </label>
+          <label class="cap-cell" style="max-width:150px">
+            <span class="cap-k">基准时刻</span>
+            <input id="ckAutoAt" class="mono" placeholder="08:00" inputmode="numeric">
+          </label>
+          <label class="cap-cell" style="max-width:170px"
+            title="实际执行时刻 = 基准时刻 + 0~这个分钟数之间的随机值，每天重新抽">
+            <span class="cap-k">随机浮动(分钟)</span>
+            <input id="ckAutoWin" class="mono" type="number" min="0" max="240" placeholder="30">
+          </label>
+          <button class="primary" id="ckAutoSave" style="margin-bottom:2px">保存</button>
+        </div>
+        <div class="hint" style="margin-top:10px">
+          实际执行时刻 = 基准时刻 + 0～浮动分钟 内的随机值，每天重抽一次，不会分秒不差地打过去。
+          服务中途重启、而当天还没签过的话，会补签一次。
+        </div>
+      </div>
+
+      <div class="card" style="margin-top:14px">
+        <h2>签到记录</h2>
+        <div id="ckHistory" class="hint">还没有记录。</div>
       </div>
     </section>
 
@@ -665,6 +731,12 @@
         <input id="eUrl" class="mono">
       </label>
       <label class="grid" style="gap:5px">
+        <span class="hint">多线路 / 镜像地址（一行一个，可留空。<b>填了之后每个请求自动走当前最快的那条，失败自动换下一条</b>；必须是同一家的域名、同一套 Key）</span>
+        <textarea id="eMirrors" class="mono" rows="4" spellcheck="false"
+          style="font-size:12px;line-height:1.6;resize:vertical"
+          placeholder="https://api.dlizz.com/v1&#10;https://us-v1.dli.li/v1&#10;https://hk-v1.dli.li/v1"></textarea>
+      </label>
+      <label class="grid" style="gap:5px">
         <span class="hint">User-Agent（留空用默认 llm-router；有些上游按 UA 放行，如 agentrouter 需填 <code>claude-cli/2.0.30 (external, cli)</code>）</span>
         <input id="eUA" class="mono" placeholder="默认">
       </label>
@@ -683,15 +755,6 @@
       <label class="row" style="gap:7px;cursor:pointer">
         <input type="checkbox" id="eEnabled"> <span style="font-size:13px">启用这个上游</span>
       </label>
-      <div class="grid" style="gap:5px">
-        <span class="hint">每天上限（留空 = 不限量；配在这个上游上，所有分组共用）</span>
-        <div class="row" style="gap:10px">
-          <label class="cap-cell" title="本地自然日最多发几次（日期一变清零，适合「每天限 100 次」这类上游）。用满就换下一家。">
-            <span class="cap-k">每天</span>
-            <input type="number" min="0" step="1" id="eCapD" placeholder="∞">
-          </label>
-        </div>
-      </div>
       <div class="grid" style="gap:5px">
         <span class="hint">首包超时(秒)（从发起请求到收到响应头的总时间，含连接；超了就换下一个 Key，
           全试完换下一家。留空 = 用「设置」页的全局默认）</span>
@@ -798,6 +861,39 @@ function esc(s) {
   return String(s == null ? "" : s).replace(/[&<>"']/g, c =>
     ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
 }
+// ---------------- 多线路（镜像）实时排名 ----------------
+// 只在配了 2 条以上线路时出现；显示每条线路的实时延迟、谁最快、谁没接口。
+// 注意：必须放在顶层（和 esc 一起），不能塞进文件末尾的 boot()。
+function renderMirrors(u) {
+  const ms = u.mirrors || [];
+  if (ms.length < 2) return "";
+  const sorted = [...ms].sort((a, b) => a.score - b.score);
+  const alive = ms.filter(m => !m.dead && m.available).length;
+  const best = sorted.find(m => !m.dead) || null;
+
+  const rows = sorted.slice(0, 6).map(m => {
+    const lat = m.ewma_ms == null ? "—" : m.ewma_ms + "ms";
+    let tag = "";
+    if (m.dead) tag = `<span style="color:var(--bad)">无接口</span>`;
+    else if (!m.available) tag = `<span style="color:var(--warn)">冷却 ${Math.ceil(m.cooldown_remaining_seconds || 0)}s</span>`;
+    else if (best && m.url === best.url) tag = `<span style="color:var(--ok)">★ 最快</span>`;
+    else if (m.url === u.last_mirror) tag = `<span style="color:var(--accent)">刚用过</span>`;
+    const dim = m.dead ? "opacity:.45;" : "";
+    return `<div style="display:flex;gap:8px;align-items:baseline;${dim}">` +
+      `<span style="flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:var(--dim)">${esc(m.url)}</span>` +
+      `<span style="min-width:58px;text-align:right">${lat}</span>` +
+      `<span style="min-width:62px;text-align:right;font-size:11px">${tag}</span></div>`;
+  }).join("");
+
+  const more = ms.length > 6 ? `<div class="hint">…还有 ${ms.length - 6} 条</div>` : "";
+  const strat = (u.mirror_strategy && u.mirror_strategy !== "fastest")
+    ? "（策略 " + esc(u.mirror_strategy) + "）" : "";
+  return `<div style="margin-top:8px;padding:8px 10px;background:rgba(255,255,255,.03);` +
+    `border:1px solid var(--line);border-radius:8px;font-family:ui-monospace,Consolas,monospace;` +
+    `font-size:11.5px;line-height:1.75">` +
+    `<div class="hint" style="margin-bottom:5px;font-family:inherit">多线路 · 在线 ${alive}/${ms.length} · 自动走最快${strat}</div>` +
+    `${rows}${more}</div>`;
+}
 function fmtLat(v) {
   if (v == null) return "—";
   if (v < 1) return Math.round(v * 1000) + " ms";
@@ -890,19 +986,6 @@ function renderCheckResults(u) {
   }).join("");
   return `<div class="models-wrap" style="margin-top:8px">${rows}</div>`;
 }
-// 上游卡片上的容量标记：设了上限才显示，顺带带上此刻的占用。
-// 上限是配在**上游**上的（所有引用它的分组共用），所以放在卡片上而不是分组弹窗里。
-function capBadge(u) {
-  const c = u.capacity;
-  if (!c || c.max_per_day == null) return "";
-  const full = c.has_room === false;
-  const tip = full
-    ? "此刻已满：新请求会先换别家；整组都满才排队等一会儿"
-    : "此刻还有余量";
-  return `<span class="badge ${full ? "warn" : "mono"}" title="${tip}">${
-    capLiveText(c)}</span>`;
-}
-
 // 余额标记：查过的显示金额，没查过/查不到显示「—」。
 // 各厂商余额接口不统一，只有 New API / One API 那套能查（见后端 fetch_balance)。
 function moneyText(v) {
@@ -1045,7 +1128,6 @@ function renderUpstreams() {
         ${nAvail
           ? `<span class="badge ${nSel ? "blue" : "warn"}">已选用 ${nSel} / ${nAvail} 个模型</span>`
           : `<span class="badge warn">还没拉取模型</span>`}
-        ${capBadge(u)}
         ${balanceBadge(u)}
         ${u.models_fetched_at ? `<span class="badge">${whenText(u.models_fetched_at)}拉取</span>` : ""}
         <div class="up-actions">
@@ -1061,6 +1143,7 @@ function renderUpstreams() {
         </div>
       </div>
       <div class="url" style="margin-top:8px">${esc(u.base_url)}</div>
+      ${renderMirrors(u)}
       <div class="kv">
         <div class="stat"><b>${u.requests}</b><span>请求</span></div>
         <div class="stat"><b style="color:var(--ok)">${u.successes}</b><span>成功</span></div>
@@ -1562,42 +1645,6 @@ function requestAttemptLabel(h, trail) {
   return "实际尝试次数未知";
 }
 
-// 实时占用的文案，弹窗里和卡片上共用一份，免得两处对不上。
-// 只在设了对应上限时显示那一项 —— 没设就是「不限量」，数字没意义。
-function capLiveText(cap) {
-  const parts = [];
-  if (cap.max_per_day != null) parts.push(`今天 ${cap.used_today || 0}/${cap.max_per_day}`);
-  return (cap.has_room === false ? "满 · " : "") + parts.join(" · ");
-}
-
-// 这一行的每天上限 + 实时占用。
-//
-// 上限是配在**上游**身上的（反映那个账号/Key 的真实配额），不是这个分组独有的：
-// 同一个上游出现在多个分组里时，配额是共用的一份 —— 每个分组各设一套的话，
-// 同一个账号能用的总次数会被重复计数，上限就白设了。
-// 所以这里改的是一份共用配置，界面上也直说。
-function capCell(p, i) {
-  const u = (state.upstreams || []).find(x => x.id === p.id);
-  const cap = (u && u.capacity) || {};
-  const md = cap.max_per_day == null ? "" : cap.max_per_day;
-  const hasLimit = md !== "";
-  // 实时占用：只有设了上限才值得显示（没设就是「不限量」，数字没意义）
-  let live = "";
-  if (hasLimit) {
-    live = `<span class="cap-live${cap.has_room === false ? " full" : ""}" title="${
-      cap.has_room === false
-        ? "今天额度已用满：新请求会先换别家，明天清零"
-        : "今天还有余量"
-    }">${capLiveText(cap)}</span>`;
-  }
-  return `<span class="cap-cell" title="每天上限（留空 = 不限）。
-配在这个**上游**上：它在别的分组里也共用同一份配额。
-用满就自动换下一个上游，不影响调用。">
-      <span class="cap-k">/天</span>
-      <input type="number" min="0" step="1" data-cap-d="${i}" placeholder="∞" value="${md}">
-      ${live}
-    </span>`;
-}
 const detailedTests = {};
 function detailedTestReport(p, model) {
   const t = detailedTests[`${p.id}|${model}`];
@@ -1658,7 +1705,6 @@ function renderModal() {
                    placeholder="不限量" value="${p.quota === "" || p.quota == null ? "" : p.quota}">
             ${p.quota === 0 ? `<span class="badge bad">不调用</span>` : ""}
           </label>
-          ${capCell(p, i)}
           <button class="mini" data-act="test" data-idx="${i}"
                   title="测试该模型的短请求，并提示最近实际调用错误；不验证长上下文或流式兼容性">测试</button>
           ${pickTestBadge(p)}
@@ -1801,60 +1847,16 @@ function bindModal() {
     inp.addEventListener("keydown", e => { if (e.key === "Enter") { commit(); inp.blur(); } });
   });
 
-  // 每天上限：改完立刻落盘（这个不跟着「保存」走 ——
-  // 它属于上游的容量配置，和这个分组的路由是两回事，没必要等到点保存）
-  document.querySelectorAll("#mPicks input[data-cap-d]").forEach(inp => {
-    const commit = async () => {
-      const i = Number(inp.dataset.capD);
-      const p = editing.picks[i];
-      if (!p) return;
-      const cell = inp.closest(".cap-cell");
-      const d = cell.querySelector("input[data-cap-d]");
-      const num = v => {
-        const raw = (v.value || "").trim();
-        if (raw === "") return 0;                       // 空 = 不限量
-        const n = Math.floor(Number(raw));
-        return Number.isFinite(n) && n > 0 ? n : 0;     // 0/负数/乱填 = 不限量
-      };
-      const payload = { id: p.id, max_per_day: num(d) };
-      try {
-        const r = await api("/admin/upstream/capacity", payload);
-        // 回填规范化后的值（填 0 或乱填会被后端当「不限量」）
-        d.value = r.max_per_day == null ? "" : r.max_per_day;
-        // 同步到本地 state，免得下次 renderModal 又拿旧值覆盖
-        const u = (state.upstreams || []).find(x => x.id === p.id);
-        if (u) {
-          u.capacity = Object.assign({}, u.capacity, {
-            max_per_day: r.max_per_day,
-          });
-        }
-        toast(`${p.name} 的容量上限：每天 ${r.max_per_day == null ? "不限" : r.max_per_day} 次`, "ok");
-      } catch (e) {
-        toast("容量上限保存失败：" + e.message, "bad");
-      }
-    };
-    inp.addEventListener("change", commit);
-    inp.addEventListener("keydown", e => { if (e.key === "Enter") { e.preventDefault(); commit(); inp.blur(); } });
-  });
 }
 
 function renderQuotaHint() {
   const picks = editing.picks || [];
   const n0 = picks.filter(p => p.quota === 0).length;
   const nSet = picks.filter(p => p.quota !== "" && p.quota != null && p.quota !== 0).length;
-  // 「每天上限」是配在上游身上的，和分组里的额度不是一回事，分开说
-  const nCap = picks.filter(p => {
-    const u = (state.upstreams || []).find(x => x.id === p.id);
-    const c = (u && u.capacity) || {};
-    return c.max_per_day != null;
-  }).length;
-  const capNote = nCap
-    ? ` 另有 ${nCap} 个上游设了每天上限（那个是配在上游上的，所有分组共用）。`
-    : "";
-  $("#mQuotaHint").innerHTML = ((n0 || nSet)
+  $("#mQuotaHint").innerHTML = (n0 || nSet)
     ? `其中 ${n0} 个上游设为 0（不调用）${nSet ? `，${nSet} 个设了调用额度` : ""}。
        额度为 0 的上游调用时会被直接跳过，排序时也放在最后。`
-    : `不填就代表不限量。填 0 表示这家不用。`) + capNote;
+    : `不填就代表不限量。填 0 表示这家不用。`;
 }
 /* ================= 拖动排序（鼠标 + 触屏） =================
    旧实现用 HTML5 的 dragstart/dragover/drop —— 触屏浏览器根本不发这些事件，
@@ -2537,6 +2539,11 @@ function editUpstream(id) {
   editId = id;
   $("#eName").value = u.name;
   $("#eUrl").value = u.base_url;
+  // 多线路：把现有镜像铺到文本框（含主地址），改完保存时整体回传
+  const mirs = (u.base_urls && u.base_urls.length > 1)
+    ? u.base_urls
+    : [u.base_url].filter(Boolean);
+  $("#eMirrors").value = mirs.join("\n");
   $("#eUA").value = u.user_agent || "";
   const hints = u.key_hints || (u.has_key ? [u.key_hint] : []);
   const names = u.key_names || [];
@@ -2548,8 +2555,6 @@ function editUpstream(id) {
   renderKeyList();
   $("#eKeyStrategy").value = u.key_strategy || "failover";
   $("#eEnabled").checked = u.enabled;
-  const cap = u.capacity || {};
-  $("#eCapD").value = cap.max_per_day == null ? "" : cap.max_per_day;
   $("#eTimeout").value = u.first_timeout_seconds || "";
   // 仅流式模型：有就按逗号铺开显示，没有就是空（留空 = 全按原样发）
   $("#eStreamOnly").value = (u.stream_only_models || []).join(", ");
@@ -2586,7 +2591,6 @@ async function saveUpstreamEdit() {
     name: $("#eName").value.trim(),
     base_url: $("#eUrl").value.trim(),
     enabled: $("#eEnabled").checked,
-    max_per_day: capNum($("#eCapD")),
     first_timeout_seconds: capNum($("#eTimeout")),
     user_agent: $("#eUA").value.trim(),
     api_keys: keys,
@@ -2597,6 +2601,13 @@ async function saveUpstreamEdit() {
       .filter((v, i, a) => a.indexOf(v) === i),
   };
   if (!patch.base_url) { toast("\u5730\u5740\u4e0d\u80fd\u4e3a\u7a7a", "bad"); return; }
+
+  // 多线路：文本域一行一个；主地址一定在里面（不在就补到最前面）
+  const mirrorLines = String($("#eMirrors").value || "")
+    .split(/\r?\n/).map(s => s.trim()).filter(Boolean)
+    .filter((v, i, a) => a.indexOf(v) === i);
+  if (!mirrorLines.includes(patch.base_url)) mirrorLines.unshift(patch.base_url);
+  patch.base_urls = mirrorLines;
 
   const btn = $("#eSave");
   btn.disabled = true;
@@ -3200,7 +3211,7 @@ function renderSide() {
         ${badge}
         <span class="req-model" title="${esc(h.model)}">${esc(h.model)}</span>
         <span class="badge">${esc(subjUp)}</span>
-        ${h.key ? `<span class="badge" title="实际使用的 Key">${esc(h.key)}</span>` : ""}
+        ${h.key ? `<span class="badge" title="这个请求用的是哪个 Key（名字）">${esc(h.key)}</span>` : ""}
         ${fellBack ? `<span class="hint">→ ${esc(h.upstream)}</span>` : ""}
         <div class="grow"></div>
         ${use.total != null ? `<span class="badge">${fmtNum(use.total)} tok</span>` : ""}
@@ -3218,7 +3229,7 @@ function renderSide() {
           <h5>详情</h5>
           <div class="hint" style="line-height:1.8">
             实际发往上游的模型：<code>${esc(h.effective_model || "-")}</code><br>
-            ${h.key ? `实际使用的 Key：<code>${esc(h.key)}</code><br>` : ""}
+            ${h.key ? `实际使用的 Key：<code>${esc(h.key)}</code>（Key 名字）<br>` : ""}
             路由来源：${esc(h.route_source || "-")}　·　${requestAttemptLabel(h, trail)}
             ${h.error || h.status >= 400 ? `<br><span style="color:var(--bad)">错误：${esc(explainHttpError(h.error, h.status))}</span>` : ""}
           </div>
@@ -3284,8 +3295,8 @@ async function ensureEntryText(at, upstream) {
 }
 
 /* ================= 左侧 tab：请求记录 / 上游来源 / 模型路由 ================= */
-const TABS = ["req", "up", "model", "set", "log"];
-const TAB_LABEL = { req: "请求记录", up: "上游来源", model: "模型路由", set: "设置", log: "日志" };
+const TABS = ["req", "up", "model", "ck", "set", "log"];
+const TAB_LABEL = { req: "请求记录", up: "上游来源", model: "模型路由", ck: "签到", set: "设置", log: "日志" };
 let curTab = null;
 
 function setTab(name) {
@@ -3303,6 +3314,8 @@ function setTab(name) {
     setTabNum("log", 0);
     renderLog();
   }
+  // 切到签到：立刻拉一次表格（不靠 2.5 秒轮询等）
+  if (tab === "ck") loadCheckin();
   // 换 tab 时回到顶部，免得带着上一屏的滚动位置落进新内容中间
   if (curTab !== null && curTab !== tab) window.scrollTo(0, 0);
   curTab = tab;
@@ -3450,6 +3463,8 @@ async function refresh() {
     renderUpstreams();
     renderModels();
     renderSettings();
+    // 签到页：只在这一页上才刷（读的是后端本地状态，不产生上游请求）
+    if (curTab === "ck") loadCheckin();
     // 流水索引（有哪些天/月/分组）→ 填筛选下拉；再取当前筛选下的一页记录。
     // 两步都要在 renderSide 之前完成，否则列表拿到的是空页。
     await loadJournalIndex();
@@ -3473,44 +3488,9 @@ async function refresh() {
       lastSideHash = hash;
       renderSide();
     }
-    // 模型弹窗开着时不重渲染，否则会打断正在拖拽排序的手感。
-    // 但「今天用量」是会变的，得单独就地刷新那几个数字。
-    updateCapacityLive();
   } catch (e) {
     $("#health").className = "dot off";
   }
-}
-
-// 只更新弹窗里那几行的「占用/满」标记，不重排 DOM、不动输入框。
-function updateCapacityLive() {
-  if (!editing || $("#modal").hidden) return;
-  document.querySelectorAll("#mPicks input[data-cap-d]").forEach(inp => {
-    const i = Number(inp.dataset.capD);
-    const p = editing.picks[i];
-    if (!p) return;
-    const cell = inp.closest(".cap-cell");
-    if (!cell) return;
-    const u = (state.upstreams || []).find(x => x.id === p.id);
-    const cap = (u && u.capacity) || {};
-    const md = cap.max_per_day;
-    let live = cell.querySelector(".cap-live");
-    if (md == null) {
-      // 刚被改成不限量：把标记去掉
-      if (live) live.remove();
-      return;
-    }
-    if (!live) {
-      // 刚设上限：标记还没渲染出来，这儿补一个（省得非要重开弹窗才看得见）
-      live = document.createElement("span");
-      cell.appendChild(live);
-    }
-    const full = cap.has_room === false;
-    live.textContent = capLiveText(cap);
-    live.className = "cap-live" + (full ? " full" : "");
-    live.title = full
-      ? "今天额度已用满：新请求会先换别家，明天清零"
-      : "今天还有余量";
-  });
 }
 
 /* ================= 事件绑定 ================= */
@@ -3811,6 +3791,264 @@ $("#mSortName").addEventListener("keydown", e => {
 $("#mSortApply").onclick = () => applyOrdering($("#mSortSel").value);
 $("#mSortDelete").onclick = () => deleteOrdering($("#mSortSel").value);
 $("#mSortBySpeed").onclick = reorderBySpeed;
+
+/* ================= 签到 ================= */
+// 后端：GET /admin/checkin 一串拿齐（rows + settings + summary + recent），
+// POST /admin/checkin/run 执行，/config 存单个上游的令牌，/settings 存自动签到。
+let ckData = null;      // 最近一次拿到的签到数据
+let ckEditing = "";     // 正在编辑令牌的上游 id：编辑时暂停自动刷新，别把输入刷掉
+
+const CK_STYLE = {
+  ok:      { cls: "ok",   text: "签到成功" },
+  already: { cls: "ok",   text: "今天已签" },
+  blocked: { cls: "warn", text: "需人机验证" },
+  auth:    { cls: "bad",  text: "令牌无效" },
+  error:   { cls: "bad",  text: "失败" },
+  none:    { cls: "",     text: "无签到接口" },
+  nocfg:   { cls: "",     text: "未配置令牌" },
+  unknown: { cls: "",     text: "未检测" },
+};
+
+function ckRowState(r) {
+  const st = r.state || null;
+  let kind, title;
+  if (!r.configured) {
+    kind = "nocfg";
+    title = "还没填访问令牌，点「令牌」配置";
+  } else if (!st) {
+    kind = "unknown";
+    title = "还没签过，点「签到」试一次";
+  } else {
+    kind = st.kind || "unknown";
+    title = st.message || "";
+    if (st.at) title += "（" + new Date(st.at * 1000).toLocaleString() + "）";
+  }
+  return { kind, title, st, meta: CK_STYLE[kind] || CK_STYLE.unknown };
+}
+
+function renderCheckin() {
+  const box = $("#ckRows");
+  if (!box) return;
+  const rows = (ckData && ckData.rows) || [];
+  if (!rows.length) {
+    applyHtml("checkin", box, '<div class="hint">还没有上游。</div>');
+    return;
+  }
+
+  const html = rows.map(r => {
+    const { title, st, meta } = ckRowState(r);
+
+    // ---- 正在编辑令牌：换成输入框 ----
+    if (ckEditing === r.id) {
+      return `<div class="ck-row" data-id="${esc(r.id)}">
+        <div class="ck-name">
+          <b>${esc(r.name)}</b>
+          <span class="hint mono">${esc(r.site_root)}</span>
+        </div>
+        <div class="ck-main">
+          <input class="mono" data-ck="token" type="password" autocomplete="off"
+                 placeholder="访问令牌（站点「个人设置 → 访问令牌」）"
+                 value="" style="width:100%">
+          <input class="mono" data-ck="uid" placeholder="User id（老版本才要，可空）"
+                 value="${esc(r.user_id || "")}" style="width:100%;margin-top:6px">
+        </div>
+        <div class="ck-act">
+          <button class="mini primary" data-ck-act="save">保存</button>
+          <button class="mini" data-ck-act="cancel">取消</button>
+        </div>
+      </div>`;
+    }
+
+    // ---- 常规行 ----
+    const reward = (st && st.reward_text)
+      ? `<span class="hint" title="这次签到拿到的额度">+${esc(st.reward_text)}</span>` : "";
+    const wrong = r.token_looks_wrong
+      ? `<span class="badge bad" title="这里要填站点的访问令牌，不是 sk- 开头的推理 Key">填成了 sk-</span>`
+      : "";
+    const hintBadge = r.configured
+      ? `<span class="badge mono" title="访问令牌（打码）">${esc(r.token_hint)}</span>` : "";
+    const partBox = r.configured
+      ? `<label class="hint" style="display:flex;align-items:center;gap:5px"
+           title="关掉后「一键签到」和自动签到都会跳过这个上游">
+           <input type="checkbox" data-ck-act="toggle" ${r.checkin_enabled ? "checked" : ""}> 参与</label>`
+      : "";
+
+    return `<div class="ck-row" data-id="${esc(r.id)}">
+      <div class="ck-name">
+        <b>${esc(r.name)}</b>
+        <span class="hint mono">${esc(r.site_root)}</span>
+      </div>
+      <div class="ck-state">
+        <span class="badge ${meta.cls}" title="${esc(title)}"
+          ${meta.cls ? "" : 'style="color:var(--dim)"'}>${esc(meta.text)}</span>
+        ${reward}${wrong}${hintBadge}
+      </div>
+      <div class="ck-act">
+        ${partBox}
+        <button class="mini" data-ck-act="edit">令牌</button>
+        <button class="mini primary" data-ck-act="run"
+          ${r.configured ? "" : "disabled"}>签到</button>
+      </div>
+    </div>`;
+  }).join("");
+
+  applyHtml("checkin", box, html);
+}
+
+function renderCkSummary() {
+  const s = (ckData && ckData.summary) || {};
+  const rows = (ckData && ckData.rows) || [];
+  const configured = rows.filter(r => r.configured).length;
+  const el = $("#ckSummary");
+  if (el) {
+    el.textContent = `已配置令牌 ${configured} / ${rows.length} 个上游` +
+      ` · 今天已签 ${s.today_checked || 0}`;
+  }
+  const n = $("#tabN-ck");
+  if (n) n.textContent = s.today_checked ? String(s.today_checked) : "";
+}
+
+function renderCkHistory() {
+  const box = $("#ckHistory");
+  if (!box) return;
+  const recent = (ckData && ckData.recent) || [];
+  if (!recent.length) {
+    box.className = "hint";
+    box.textContent = "还没有记录。签到过一次之后这里会留下流水。";
+    return;
+  }
+  box.className = "";
+  box.innerHTML = recent.slice(0, 60).map(e => {
+    const meta = CK_STYLE[e.kind] || CK_STYLE.unknown;
+    const at = e.at ? new Date(e.at * 1000).toLocaleString() : "";
+    const reward = e.reward_text ? ` <span class="hint">+${esc(e.reward_text)}</span>`
+      : (e.reward_usd ? ` <span class="hint">+$${esc(e.reward_usd)}</span>` : "");
+    const msg = e.message ? `<span class="hint" style="flex:1;min-width:0;
+      overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${esc(e.message)}</span>` : "";
+    return `<div class="ck-hist-row">
+      <span class="t">${esc(at)}</span>
+      <b style="white-space:nowrap">${esc(e.name || e.id || "")}</b>
+      <span class="badge ${meta.cls}" ${meta.cls ? "" : 'style="color:var(--dim)"'}>${esc(meta.text)}</span>
+      ${reward}${msg}
+    </div>`;
+  }).join("");
+}
+
+function renderCkSettings() {
+  const s = (ckData && ckData.settings) || {};
+  const setIfIdle = (sel, val) => {
+    const el = $(sel);
+    // 用户正把光标放在这个框里就别覆盖他打了一半的内容
+    if (el && document.activeElement !== el) el.value = val;
+  };
+  const on = $("#ckAutoOn");
+  if (on && document.activeElement !== on) on.checked = !!s.enabled;
+  setIfIdle("#ckAutoAt", s.at || "08:00");
+  setIfIdle("#ckAutoWin", s.random_minutes == null ? 30 : s.random_minutes);
+}
+
+async function loadCheckin(force) {
+  if (!force && ckEditing) return;      // 正在编辑令牌，别把输入刷掉
+  try {
+    ckData = await api("/admin/checkin?limit=200");
+  } catch (e) {
+    return;                             // 后端旧版本没有这个接口时安静跳过
+  }
+  renderCheckin();
+  renderCkSummary();
+  renderCkHistory();
+  renderCkSettings();
+}
+
+// ids 为空 = 所有配了令牌且勾了「参与」的上游
+async function runCheckin(ids, probe) {
+  const body = {};
+  if (ids && ids.length) body.ids = ids;
+  if (probe) body.probe = true;
+  const label = probe ? "探测" : "签到";
+  toast(`正在${label}…`);
+  try {
+    const res = await api("/admin/checkin/run", body);
+    if (res.summary) ckData = Object.assign({}, ckData || {}, {
+      summary: res.summary, recent: res.recent });
+    await loadCheckin(true);
+    const list = res.results || [];
+    const good = list.filter(r => r.ok).length;
+    const blocked = list.filter(r => r.kind === "blocked").length;
+    let msg = `${label}完成：${good}/${list.length} 成功`;
+    if (blocked) msg += `，${blocked} 个需要人机验证`;
+    toast(msg, good ? "" : "bad");
+  } catch (e) {
+    toast(`${label}失败：` + e.message, "bad");
+  }
+}
+
+async function saveCkConfig(id, token, userId) {
+  try {
+    await api("/admin/checkin/config", { id, token: token, user_id: userId });
+    ckEditing = "";
+    await loadCheckin(true);
+    toast("已保存");
+  } catch (e) {
+    toast("保存失败：" + e.message, "bad");
+  }
+}
+
+async function toggleCkPart(id, on) {
+  try {
+    // "__keep__" = 只改开关，别动已经存好的令牌
+    await api("/admin/checkin/config", { id, token: "__keep__", enabled: on });
+    await loadCheckin(true);
+  } catch (e) {
+    toast("保存失败：" + e.message, "bad");
+  }
+}
+
+async function saveCkSettings() {
+  const body = {
+    enabled: $("#ckAutoOn").checked,
+    at: ($("#ckAutoAt").value || "").trim() || "08:00",
+    random_minutes: Number($("#ckAutoWin").value || 0),
+  };
+  try {
+    const res = await api("/admin/checkin/settings", body);
+    await loadCheckin(true);
+    const s = res.settings || body;
+    toast(s.enabled
+      ? `已开启：每天 ${s.at} 起 ${s.random_minutes} 分钟内随机签到`
+      : "已关闭自动签到");
+  } catch (e) {
+    toast("保存失败：" + e.message, "bad");
+  }
+}
+
+// 签到页的事件：行内按钮用委托，整页按钮直接绑
+$("#ckRows").addEventListener("click", e => {
+  const btn = e.target.closest("button[data-ck-act]");
+  if (!btn || btn.disabled) return;
+  const row = btn.closest(".ck-row");
+  if (!row) return;
+  const id = row.dataset.id;
+  const act = btn.dataset.ckAct;
+  if (act === "run") runCheckin([id], false);
+  else if (act === "edit") { ckEditing = id; renderCheckin(); }
+  else if (act === "cancel") { ckEditing = ""; renderCheckin(); }
+  else if (act === "save") {
+    const token = (row.querySelector('[data-ck="token"]') || {}).value || "";
+    const uid = (row.querySelector('[data-ck="uid"]') || {}).value || "";
+    if (!token.trim()) { toast("令牌不能为空（想停用这个上游就取消勾选「参与」）", "bad"); return; }
+    saveCkConfig(id, token.trim(), uid.trim());
+  }
+});
+$("#ckRows").addEventListener("change", e => {
+  const cb = e.target.closest('input[data-ck-act="toggle"]');
+  if (!cb) return;
+  const row = cb.closest(".ck-row");
+  if (row) toggleCkPart(row.dataset.id, cb.checked);
+});
+$("#ckRunAll").onclick = () => runCheckin(null, false);
+$("#ckProbeAll").onclick = () => runCheckin(null, true);
+$("#ckAutoSave").onclick = saveCkSettings;
 
 (async function boot() {
   serverUrl = location.origin;

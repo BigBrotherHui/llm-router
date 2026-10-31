@@ -37,6 +37,32 @@ print(client.chat.completions.create(
 ).choices[0].message.content)
 ```
 
+## 换电脑（导出全部上游 → 一条命令导入）
+
+上游、Key、勾选、分组、模型路由都存在 `.llmrouter/` 里（含明文 Key，不进仓库），
+所以换机器不能只 clone 代码。两步搞定：
+
+```bash
+# 老机器：导出全部上游（生成 迁移包/ + 一个 zip）
+python migrate.py export
+
+# 新机器：一条命令 = 拉代码 + 导入 + 自检 + 启动（需要 Python 3.11+）
+.\deploy.ps1 -Bundle .\llm-router-migrate-20261031-113234.zip
+```
+
+不用脚本时手动三行：
+
+```bash
+git clone git@github.com:BigBrotherHui/llm-router.git && cd llm-router
+python migrate.py import .\llm-router-migrate-20261031-113234.zip -y
+python 启动.py
+```
+
+`migrate.py export` 产出：`bundle.json`（全量，导入只认它）、`upstreams.full.json`（纯上游明文）、
+`upstreams.toml`（可直接粘进 config.toml 的片段）、`upstreams.masked.md`（脱敏清单）。
+导入支持 `--merge`（和本机现有配置合并）、`--dry-run`（只看要改什么）。
+细节和踩坑见 [DEPLOY.md](DEPLOY.md)。
+
 ## 工作方式
 
 分成三步：加上游 → 勾模型 → 给模型起统一的名字。
@@ -150,35 +176,6 @@ deepseek 分组
 > 和「参与」勾选框的区别：勾掉「参与」是从这个分组里**摘掉**（保存后就不在列表里了）；
 > 填 0 是**留着但不用**（位置、顺序都保留，随时改回来）。
 
-### 每天上限：别把同一个账号打爆
-
-额度是「用不用这家」，每天上限是「用多少」。同一家厂商的账号（尤其免费/低价额度）往往会
-限每天的调用次数 —— 自己预先把上限卡住，从源头少撞 429。
-
-配在上游身上（上游卡片 → 编辑，或者模型路由弹窗里每行右边那个框）：
-
-| 框 | 含义 | 留空 | 填 N |
-|---|---|---|---|
-| **/天** | 本地自然日最多发几次（日期一变清零） | 不限 | 超过就换别家 |
-
-```
-模型路由 → 点 ds1 → 每行右边：
-  上游A  [不限量] /天 [ 100 ]  今天 0/100
-  上游B  [不限量] /天 [    ]  （不限）
-```
-
-要点：
-
-- **满了不等于坏了**：撞上限时会**自动换下一家**，请求照样成功。只有整个分组都满了，
-  才会回 `429 capacity_exhausted`，并明确告诉你是哪家、卡在什么限制上。
-- **被挡下不算失败**：不会记进失败数、不会触发冷却 —— 它只是今天的额度用完了，不是出问题了。
-- **上限是按上游记的，所有分组共用**。同一个账号被好几个分组引用时，配额是同一份，
-  不会因分组多而翻倍。所以这里刻意不按分组存。
-- 界面上有**实时占用**（`今天 0/100`），用满时会标「满」，一眼看出现在堵在哪。
-- 按**本地自然日**计数，日期一变自动清零（不是 24 小时滑动窗口）。
-- 模型路由弹窗里改完**立刻生效**（不用点保存），因为它属于上游的容量配置，
-  和这个分组的路由是两件事。
-
 ## 网页控制台
 
 左侧是三个 tab：**请求记录 / 上游来源 / 模型路由**，点着切换；看的是哪个会记在浏览器里，
@@ -277,6 +274,42 @@ model 名和状态文件位置。
 流水只增不减（攒满 1 万行会归档成带时间戳的文件 —— 改的是文件名，不是内容），
 统计只随时间往上加。配置想回退就在工具栏点「配置快照」。
 
+### 签到
+
+左侧「签到」tab，把 New API / One API 类站点的每日签到集中到一页。
+
+**凭证是两套，别填错**
+- 上游卡片里的 `sk-...` 是**推理 Key**，只能打 `/v1/*`
+- 签到要的是站点「个人设置 → 访问令牌」那个 token，走 `/api/user/*`
+
+所以签到页给每个上游单独存一个访问令牌，和上游卡片的 Key 各存各的、互不影响。
+填成 `sk-` 开头会当场标红提示。
+
+**怎么用**
+
+- 每行：上游名 + 站点根地址 + 状态徽章 + 「令牌」「签到」按钮
+- 「令牌」展开输入框填访问令牌（老版本 New API 还要填 User id，新版本留空）
+- 「签到」只签这一家；「一键签到」签所有勾了「参与」的
+- 「只探测」只查有没有签到接口、今天签没签，**不真的按下**
+- 「参与」勾掉后，一键签到和自动签到都会跳过它（但单独点「签到」仍然会签）
+
+**自动签到**
+
+基准时刻 + 随机浮动分钟：实际执行时刻 = 基准时刻 + `0～浮动` 内的随机值，
+每天重抽一次，不会分秒不差地打过去。服务中途重启、当天还没签过会补签一次。
+
+**站点差异都做了兼容**
+
+- 两种签到路径都试：`/api/user/self/checkin`（新）和 `/api/user/checkin`
+  （老，`v1.0.0-rc.46` 这种只有它），能用的那条记下来，下次先问它
+- Cloudflare / Turnstile 挂在签到上时**只识别不绕过**：标记成「需人机验证」并短路，
+  之后不再浪费请求。请在站点上用浏览器手动签，或在站点关掉验证后再试
+- 签到奖励按 `/api/status` 的 `quota_per_unit` 换算成金额显示
+- 签到后顺带重查这几个上游的余额（奖励直接进钱包）
+
+签到明细落在 `.llmrouter/<配置名>.checkin.json`（保留最近 2000 条），
+签到页底部能看到每家累计签了几次、拿了多少、上次为什么没签上。
+
 ### 其他
 
 - 「拉取模型」和「测速」在**每个上游卡片里**各点各的（顶部那两个批量按钮已去掉：
@@ -344,7 +377,7 @@ curl -X POST http://127.0.0.1:8010/v1/messages \
 | `failure_threshold` | `3` | 连续失败几次后暂时踢出队列 |
 | `cooldown_seconds` | `60` | 踢出后多久自动恢复 |
 | `history_limit` | `500` | 内存里保留的请求明细条数（只影响界面能翻出多少条；落盘流水不受影响，统计始终全量累计） |
-| `queue_timeout_seconds` | `15` | 兼容保留（v2.7 起不再使用；原为分组里所有上游都撞上限时等待的时限） |
+| `queue_timeout_seconds` | `15` | 兼容保留（已不再使用） |
 
 ### `[[upstreams]]`
 
@@ -356,11 +389,10 @@ curl -X POST http://127.0.0.1:8010/v1/messages \
 | `api_key` | 否 | 该上游的 Key（本地 Ollama 随便填） |
 | `enabled` | 否 | `false` 可临时禁用 |
 | `models` | 否 | 想预先声明可用模型时才写；平时让它拉取就行。写了会被视为「已勾选」 |
-| `max_per_day` | 否 | 本地自然日最多发几次；不写/`0` = 不限。日期一变清零 |
 | `connect_timeout_seconds` | 否 | 连上游的超时，默认 10 |
 | `read_timeout_seconds` | 否 | 读上游响应的超时，默认 300 |
 
-> 平时不用手写。网页上的勾选、分组、排序、容量上限都会存进 `.llmrouter/` 子目录（见下）。
+> 平时不用手写。网页上的勾选、分组、排序都会存进 `.llmrouter/` 子目录（见下）。
 
 ## 遇到问题
 
@@ -399,16 +431,6 @@ curl -X POST http://127.0.0.1:8010/v1/messages \
 只作为**记录**（给已知额度少的来源做个标注，界面上会显示「限额度」）。路由器不会
 因为用满了就停用它——要停用就填 0。想让「用尽就换下一个」自动生效，靠的是上游自己
 返回 429/额度用尽的错误码，那时路由器会自动切换下一个。
-
-**Q：额度（填 0 = 不调用）和每天上限有什么区别？**
-额度管**用不用**这家（填 0 就是彻底不用）；每天上限管**用多少**（自然日最多几次，
-日期一变清零，适合「每天限 100 次」这类按天给的额度）。前者是分组级的（同一家在不同
-分组可以不一样），后者是上游级的（那个账号的配额是共用的一份）。
-用满都会自动换下一家，请求照样成功。
-
-**Q：撞上每天上限算不算这个上游挂了？**
-不算。它只是没轮到，不记失败、不触发冷却。只有整个分组都满了才会短暂排队等一会儿，
-等不到才回 `429 capacity_exhausted`，并在错误里说清是哪家、卡在什么限制上。
 
 **Q：Claude Code / Anthropic SDK 能直接用吗？**
 能，见上面「接入 Anthropic 客户端」。请求和响应两个方向都会转换，
@@ -459,7 +481,7 @@ curl -X POST http://127.0.0.1:8010/v1/messages \
 支持，SSE 逐块透传，不会被缓冲。上游返回 200 但流是空的，也会判定失败并切换到下一个。
 
 **Q：怎么自测？**
-`python selftest.py` 会起几个假上游，验证 **560 项**行为（模型拉取、勾选、分组合并、按顺序/轮询/故障转移、流式、增删改、路径拼接、持久化、明细上限、中文名、多套具名排序、上游额度、Anthropic 适配、每天上限、每日签到等）。
+`python selftest.py` 会起几个假上游，验证一整套行为（模型拉取、勾选、分组合并、按顺序/轮询/故障转移、流式、增删改、路径拼接、持久化、明细上限、中文名、多套具名排序、上游额度、Anthropic 适配等）。
 
 其中专门有一组测试模拟「ABCD 四个上游，同一个模型分别叫 ds1/ds2/ds3/ds4」：
 验证统一成分组名之后能正确合并、按顺序调用、并且各家收到的是自己的真实名字。
@@ -472,9 +494,6 @@ curl -X POST http://127.0.0.1:8010/v1/messages \
 （system 数组、图片、tools、tool_result），响应确实被转回 Anthropic 结构
 （`content` 块、`stop_reason`、`input_tokens`），流式的事件序列也是 Anthropic 那套。
 另外还验了错误体转换和「缺 model/messages 要报 400」。
-
-**每天上限**那组用「上限 3 次」连发 4 个：前 3 个成功、第 4 个 429「已用满」，
-并验证重启后当天用量不归零（计数随状态文件落盘）。
 
 假上游里有一个是「严格模式」的：它只接受 `/v1/xxx` 形式的路径，拼成 `/v1/v1/xxx` 就返回 404。
 现实中的厂商（硅基流动、火山方舟）就是这样，所以这个测试专门用来防路径拼错的回归。
@@ -530,13 +549,6 @@ curl -X POST -H "Content-Type: application/json" \
 curl -X POST -H "Content-Type: application/json" -d '{"id":"u1"}' \
   http://127.0.0.1:8010/admin/upstream/delete
 
-# 给上游设每天上限（0 或省略 = 不限量；null 会回成 null）
-curl -X POST -H "Content-Type: application/json" \
-  -d '{"id":"u1","max_per_day":100}' \
-  http://127.0.0.1:8010/admin/upstream/capacity
-# 改完立刻生效。返回里带 capacity：今天已用了几次
-# 也可以走 /admin/upstream/update 一起改（字段名相同）
-
 # 保存某个模型的路由（数组顺序 = 调用顺序；quota 可省略 = 不限量）
 curl -X POST -H "Content-Type: application/json" -d '{
   "name":"deepseek-chat","strategy":"priority",
@@ -580,6 +592,26 @@ curl -X POST -H "Content-Type: application/json" -d '{
 curl -X POST -H "Content-Type: application/json" -d '{}' \
   http://127.0.0.1:8010/admin/auto-configure
 
+# 签到：看当前表格 / 存访问令牌 / 执行 / 自动签到设置
+curl http://127.0.0.1:8010/admin/checkin
+curl -X POST -H "Content-Type: application/json" \
+  -d '{"id":"u1","token":"nap_你的访问令牌"}' \
+  http://127.0.0.1:8010/admin/checkin/config
+# "__keep__" = 只改开关，不动已存的令牌
+curl -X POST -H "Content-Type: application/json" \
+  -d '{"id":"u1","token":"__keep__","enabled":false}' \
+  http://127.0.0.1:8010/admin/checkin/config
+# 只签指定上游；不传 ids = 签所有勾了「参与」的
+curl -X POST -H "Content-Type: application/json" -d '{"ids":["u1"]}' \
+  http://127.0.0.1:8010/admin/checkin/run
+# probe=true 只探测接口，不真的按下签到
+curl -X POST -H "Content-Type: application/json" -d '{"probe":true}' \
+  http://127.0.0.1:8010/admin/checkin/run
+# 每天 08:00 起 30 分钟内随机签一次
+curl -X POST -H "Content-Type: application/json" \
+  -d '{"enabled":true,"at":"08:00","random_minutes":30}' \
+  http://127.0.0.1:8010/admin/checkin/settings
+
 # 测速 / 复位冷却 / 恢复成配置文件的样子
 curl -X POST -H "Content-Type: application/json" -d '{}' http://127.0.0.1:8010/admin/speedtest
 curl -X POST -H "Content-Type: application/json" -d '{}' http://127.0.0.1:8010/admin/reset
@@ -621,5 +653,10 @@ curl -X POST -H "Content-Type: application/json" -d '{}' \
 | `.llmrouter/config.history.jsonl` | 请求流水（含输入输出），**只增不减**；攒满 1 万行归档成 `config.history.<时间戳>.jsonl` |
 | `.llmrouter/config.admin.log` | 管理操作审计（改了什么、什么时候、来自哪个地址） |
 | `.llmrouter/trash/` | 重置时把旧状态移到这里，可恢复 |
+| `.llmrouter/config.checkin.json` | 签到记录（每天签了谁、给了多少） |
+| `checkin.py` | 签到模块（New API / One API 站点的每日签到，可选） |
 | `启动.cmd` / `启动.py` | 一键启动 |
+| `migrate.py` | 迁移工具：导出/导入全部上游（含 Key、勾选、分组、路由） |
+| `deploy.ps1` | 新机器一键部署：拉代码 + 导入迁移包 + 自检 + 启动 |
+| `DEPLOY.md` | 换电脑的完整步骤和踩坑清单 |
 | `selftest.py` | 自测脚本 |
