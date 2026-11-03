@@ -1,5 +1,90 @@
 # NOTES
 
+## 2026-11-01 v2.9.1：把「直连」的谎话堵住（TUN + fake-ip 实测）
+
+用户追问：「在 llm-router 里配好了还要粘到 Clash？不能配了就生效吗？」
+这个问题逼出三个必须实测的事实（`_tun_probe.py` 就是那次实测的存根）：
+
+1. `Resolve-DnsName api.deepseek.com` → **198.18.2.68**。TUN 开着 fake-ip，
+   所有域名都是假地址，真 IP 只有 Clash 知道。
+2. 不绑定直接连 → 成功，但 `getsockname()` 的本地源是 **198.18.0.1**（TUN 自己的地址），
+   说明连接在本地就被 mihomo 接走了，0ms。
+3. 把 socket `bind()` 到物理网卡 `192.168.1.209` 再连 → **超时**（连 1.1.1.1 也超时）。
+   路由表里 198.18.0.0/30 只在 TUN 上，绑定源地址也逃不出去。
+
+结论：**TUN + fake-ip 下，进程层面绕不出 Clash**。所以「直连」不可能只在本程序里
+配好就生效 —— 它本质是「让 Clash 别管这条流量」，只有 Clash 自己能做到。
+但「规则 / 强制代理」两种不需要碰 Clash：显式连 7897 就走规则了。
+
+于是分三档告诉用户：①把 Verge 从 TUN 切成系统代理模式（完全不改配置，直连即真直连）；
+②Clash 加 DOMAIN-SUFFIX 直连规则（最简单，全局模式下失效）；③加 proxy: DIRECT
+的 listener（最稳，Verge Rev 用「编辑扩展配置」写，订阅更新不冲掉）。
+
+**顺手修掉的假话**：之前「测所有上游的几条路」在没配直连端口时，会给出一条
+「直连 xx ms」—— 那个数字是真的，但它其实也过了 TUN，和「规则」是同一条路。
+用户拿它去比较就会得出「直连比规则快/慢」的错误结论。现在：
+`host_is_fake_ip()` 解析上游域名判断是否 fake-ip（结果缓存 60s，避免把 /stats 拖慢），
+fake-ip 且没配直连端口 → 那条路标 `tun_intercepted`，界面显示「（被 TUN 接管）」，
+**不参与「最快」评选**，auto_net 也会明确拒绝：「先去开直连端口，别在这里选」。
+
+## 2026-11-01 v2.9.0：每个上游自己选出口（直连 / 规则 / 强制代理）
+
+起因：Clash Verge 一开 TUN，「规则模式」就把所有上游都塞进代理，那些本来就该
+直连的（本地中转、国内 API、同城站点）慢到没法用；而有的上游直连根本不通。
+想要的效果是**逐上游**决定：这家直连、那家走节点。
+
+**根本问题不在客户端，在 TUN**。进程「自己不设代理」在 TUN 下毫无意义 ——
+TUN 在网络层把 TCP 全接走了，走直连还是走节点由 Clash 的规则决定。
+所以「直连」这个诉求没法靠「不发 proxy 环境变量」实现，只能**主动连一个
+出口被写死的本地端口**。mihomo 的 `listeners` 里 `proxy: DIRECT` 就是干这个的：
+入站的出站被监听器写死，规则、TUN、全局模式全都不参与。
+（文档：入站通用字段 https://wiki.metacubex.one/config/inbound/listeners/
+和 mixed 类型 https://wiki.metacubex.one/config/inbound/listeners/mixed/）
+
+于是设计成三个端口：`rule`（规则决定）/ `proxy`（绑死策略组）/ `direct`（写死
+DIRECT）。每个上游 `net_mode` 四选一，另有 `proxy_url` 给某一家单独指定。
+一个端口都不填 = 不加干预，老行为一字不变（`inherit` 不落盘、`proxy_settings`
+等于出厂值不落盘，所以老状态文件不会被改脏）。
+
+**传输层为什么要自己实现**：`http.client` 的 `HTTPSConnection` 只会直接
+`create_connection`，没有 proxy 概念；`urllib` 的 ProxyHandler 不支持 socks5，
+也不走 CONNECT 之外的方式。所以自己 `dial()`：连代理 → HTTP CONNECT 或
+SOCKS5 握手 → 自己包 TLS → 把 socket 塞进 `HTTPConnection.sock`。
+关键陷阱：**塞完 socket 不能再调 `conn.connect()`**，否则会把隧道覆盖成一条
+直连（`connect()` 里会重建 socket）。注释里写死了这一条。
+
+http 目标也走 CONNECT（而不是绝对 URI）：实现只要一套，而且明文请求不必把
+完整 URL 交给代理。
+
+**测路（挑哪条最快）踩到的坑**：
+
+1. Windows 上 `time.monotonic()` 的分辨率只有 ~15.6ms（GetTickCount64），
+   量什么都是 0/15/31ms，直连和代理根本分不出来。改用 `time.perf_counter()`
+   （QPC，微秒级）。这条不实测发现不了 —— 代码看着完全正常。
+2. 只做 TCP/CONNECT 会得到**假的 0ms**：代理先回 200 CONNECT，之后才发现目标
+   端口没人监听。所以 http 要多发一次极小往返（`GET /` 只读 1 字节），有响应
+   才算通。
+3. 单次测量会被抖动骗（同一家两次 15ms / 63ms 很常见）。改成每条路测 5 次，
+   报中位数 + [最快–最慢] 区间；选择和排序都用中位数 —— 拿最侥幸的那次当真会选错。
+4. 自动选路加了切换门槛（快 20% 且省 25ms 以上），没切的在 `kept` 里说明原因，
+   免得抖动把上游在两条路之间来回甩。
+
+**本机端口探测**：与其让用户去 Clash 里翻端口号，不如直接扫。
+`socks5` 用 `\x05\x01\x00` 探测，`http` 用 CONNECT 探测 —— 但**只看有没有回
+HTTP 状态行是不够的**：普通网站对 CONNECT 回 501/400「不支持这个方法」，
+会被误判成代理。只有 200/407/502/503/504 才算（`HTTP_PROXY_CODES`）。
+实测这台机器上认出了 `socks5://127.0.0.1:7897`（verge-mihomo）。
+
+**签到也要走同一个出口**：签到用另一套凭据打 `/api/user/*`，如果它偷偷走直连，
+就会出现「推理通、签到不通」的假故障。所以 `checkin._request` 接了 `proxy`，
+经 `router.make_upstream_connection` 发（延迟 import router 避免循环依赖），
+http 与 socks5 都支持。
+
+**测试**：新增 `_net_test.py`（68 项，不连外网）：本地起假上游 + 假 HTTP 代理 +
+假 SOCKS5 代理 + 自签 HTTPS，验证传输层、决策层、落盘、管理接口，以及端到端
+「同一个上游切成直连就真的不走代理、切成规则就真的过代理」。
+`selftest.py` 的 541 项全部照旧通过。
+
 ## 2026-10-30 v2.8.0：新增「签到」页（New API / One API 每日签到）
 
 起因：手上几十个 New API 中转站，每家的每日签到都要单独打开网页点一次，

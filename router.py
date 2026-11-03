@@ -19,15 +19,19 @@ llm-router —— 多上游 LLM API 路由代理（零依赖，只用 Python 标
 from __future__ import annotations
 
 import argparse
+import base64
 import collections
 import concurrent.futures
 import http.client
+import ipaddress
 import json
 import os
 import random
 import re
 import shutil
 import socket
+import ssl
+import struct
 import sys
 import threading
 import time
@@ -39,7 +43,7 @@ from typing import Any, Optional
 
 import checkin as checkin_mod
 
-__version__ = "2.8.0"
+__version__ = "2.9.1"
 
 WEBUI_FILENAME = "webui.html"
 
@@ -655,6 +659,439 @@ def api_paths(base_url: str, path: str) -> list[tuple[str, str]]:
 
 
 # ---------------------------------------------------------------------------
+# 网络出口：直连 / 规则 / 强制代理
+# ---------------------------------------------------------------------------
+#
+# 背景：Clash Verge 这类客户端一开 TUN，进程「自己不设代理」是没用的 ——
+# TUN 在网络层把 TCP 全接走了，最后走直连还是走节点，由 Clash 的规则说了算。
+# 于是会出现「规则模式一开，所有上游都走代理，本来就该直连的那几个慢到没法用」。
+#
+# 这里给每个上游一个**显式**的出口选择，靠主动连代理端口来施加控制：
+#
+#   direct  直连：不经过任何代理端口。TUN 场景下要真正绕开规则，就在 Clash 里
+#           加一个 `proxy: DIRECT` 的 listener，把地址填进「直连出口」——
+#           端口就在本机，TUN 拦不到它，出口被 Clash 强制成直连。
+#   rule    规则：把请求丢给规则端口（通常是混合端口），去处由 Clash 规则决定。
+#   proxy   强制代理：丢给绑定了具体节点/策略组的端口，绕开规则。
+#
+# 一个端口都不配 = 不显式用代理 = 老行为，一个字节都不变。
+
+NET_MODES = ("inherit", "rule", "direct", "proxy")
+NET_MODE_LABELS = {
+    "inherit": "跟随全局默认",
+    "rule": "规则（走代理端口，由规则决定）",
+    "direct": "直连（不走代理）",
+    "proxy": "强制代理（忽略规则）",
+}
+# 只认这几种代理协议：Clash 的混合端口同时支持 http 与 socks5，
+# 填哪个都行（socks5 会把域名交给代理解析，DNS 也一起走代理）。
+PROXY_SCHEMES = ("http", "socks5", "socks5h")
+# 全局出口设置的出厂值：关闭、默认按规则、三个端口都没填 = 完全不加干预
+PROXY_DEFAULTS = {"enabled": False, "default_mode": "rule",
+                  "urls": {"rule": "", "proxy": "", "direct": ""}}
+SOCKS5_ERRORS = {
+    1: "代理内部错误", 2: "规则不允许", 3: "网络不可达", 4: "主机不可达",
+    5: "连接被拒绝", 6: "TTL 过期", 7: "不支持的命令", 8: "不支持的地址类型",
+}
+
+
+def norm_proxy_settings(raw: Any) -> dict:
+    """把配置文件 / 接口传来的一坨整理成规范的出口设置。
+
+    兼容两种写法：`urls = {rule=..., proxy=..., direct=...}` 和三个平铺的键。
+    """
+    out = {"enabled": False, "default_mode": "rule",
+           "urls": dict(PROXY_DEFAULTS["urls"])}
+    if not isinstance(raw, dict):
+        return out
+    out["enabled"] = bool(raw.get("enabled", False))
+    mode = str(raw.get("default_mode") or "rule").strip().lower()
+    out["default_mode"] = mode if mode in ("rule", "direct", "proxy") else "rule"
+    urls = raw.get("urls") if isinstance(raw.get("urls"), dict) else {}
+    for key in ("rule", "proxy", "direct"):
+        val = urls.get(key)
+        if val is None:
+            val = raw.get(key)
+        out["urls"][key] = str(val or "").strip()
+    return out
+
+
+class ProxySpec:
+    """一个代理出口（http 代理或 socks5 代理）。"""
+
+    __slots__ = ("kind", "host", "port", "username", "password")
+
+    def __init__(self, kind: str, host: str, port: int,
+                 username: str = "", password: str = ""):
+        self.kind = kind
+        self.host = host
+        self.port = port
+        self.username = username
+        self.password = password
+
+    @property
+    def label(self) -> str:
+        """给界面/报错看的一行，永远不带账号密码。"""
+        return f"{self.kind}://{self.host}:{self.port}"
+
+    def same_as(self, other: Optional["ProxySpec"]) -> bool:
+        if other is None:
+            return False
+        return (self.kind, self.host, self.port) == (other.kind, other.host, other.port)
+
+    def __repr__(self) -> str:  # pragma: no cover - 只为调试时好读
+        return f"<ProxySpec {self.label}>"
+
+    @classmethod
+    def parse(cls, raw: Any) -> Optional["ProxySpec"]:
+        """把配置里的地址解析成 ProxySpec。空 / "direct" / "none" → None（=不走代理）。"""
+        text = str(raw or "").strip()
+        if not text:
+            return None
+        if text.lower() in ("direct", "none", "off", "no", "-"):
+            return None
+        if "://" not in text:
+            text = "http://" + text            # 只写 127.0.0.1:7897 也认
+        try:
+            parts = urllib.parse.urlsplit(text)
+            port = parts.port
+        except ValueError as exc:
+            raise ValueError(f"代理地址不合法: {raw!r}（{exc}）") from exc
+        scheme = (parts.scheme or "").lower()
+        if scheme not in PROXY_SCHEMES:
+            raise ValueError(
+                f"代理只支持 http:// 和 socks5:// 两种，不认识 {scheme or '(空)'}://"
+                f"（Clash 的混合端口两种都吃，填 http://127.0.0.1:7897 就行）")
+        if not parts.hostname:
+            raise ValueError(f"代理地址缺主机: {raw!r}")
+        if not port:
+            port = 1080 if scheme.startswith("socks5") else 7897
+        return cls("socks5" if scheme.startswith("socks5") else "http",
+                   parts.hostname, int(port),
+                   urllib.parse.unquote(parts.username or ""),
+                   urllib.parse.unquote(parts.password or ""))
+
+
+def _recv_exact(sock: socket.socket, count: int, what: str = "") -> bytes:
+    """从 socket 上精确读 count 个字节（短读循环）。"""
+    buf = b""
+    while len(buf) < count:
+        chunk = sock.recv(count - len(buf))
+        if not chunk:
+            raise ConnectionError(f"代理在握手阶段就断开了{f'（{what}）' if what else ''}")
+        buf += chunk
+    return buf
+
+
+def _http_tunnel(sock: socket.socket, host: str, port: int, spec: ProxySpec) -> None:
+    """在已连上 HTTP 代理的 socket 上开 CONNECT 隧道。
+
+    http 目标也走 CONNECT：一是统一，二是明文请求不必把完整 URL 交给代理，
+    三是 Clash/mihomo 对任意端口都接受 CONNECT。
+    """
+    lines = [f"CONNECT {host}:{port} HTTP/1.1", f"Host: {host}:{port}"]
+    if spec.username or spec.password:
+        token = base64.b64encode(
+            f"{spec.username}:{spec.password}".encode("utf-8")).decode("ascii")
+        lines.append(f"Proxy-Authorization: Basic {token}")
+    lines += ["Proxy-Connection: keep-alive", "", ""]
+    sock.sendall("\r\n".join(lines).encode("latin-1", "replace"))
+
+    buf = b""
+    while b"\r\n\r\n" not in buf:
+        chunk = sock.recv(1024)
+        if not chunk:
+            raise ConnectionError(f"代理 {spec.label} 没回应 CONNECT {host}:{port}")
+        buf += chunk
+        if len(buf) > 16384:
+            raise ConnectionError(f"代理 {spec.label} 的 CONNECT 应答异常（太长）")
+    head = buf.split(b"\r\n\r\n", 1)[0].decode("latin-1", "replace")
+    status = head.split("\r\n", 1)[0]
+    match = re.match(r"HTTP/\d+(?:\.\d+)?\s+(\d{3})", status)
+    if not match:
+        raise ConnectionError(f"代理 {spec.label} 的应答不是 HTTP：{status[:120]}")
+    code = int(match.group(1))
+    if code != 200:
+        raise ConnectionError(
+            f"代理 {spec.label} 拒绝 CONNECT {host}:{port}：{status[:120]}")
+
+
+def _socks5_tunnel(sock: socket.socket, host: str, port: int, spec: ProxySpec) -> None:
+    """在已连上 SOCKS5 代理的 socket 上开隧道（域名交给代理解析，DNS 不出本机）。"""
+    methods = b"\x00"
+    if spec.username or spec.password:
+        methods += b"\x02"
+    sock.sendall(bytes([5, len(methods)]) + methods)
+    ver, method = _recv_exact(sock, 2, "socks5 方法协商")
+    if ver != 5:
+        raise ConnectionError(f"{spec.label} 不是 SOCKS5 代理（版本字节 {ver}）")
+    if method == 0xFF:
+        raise ConnectionError(f"{spec.label} 不接受我们的认证方式（可能要账号密码）")
+    if method == 0x02:
+        user = spec.username.encode("utf-8")
+        pwd = spec.password.encode("utf-8")
+        sock.sendall(bytes([1, len(user)]) + user + bytes([len(pwd)]) + pwd)
+        _, status = _recv_exact(sock, 2, "socks5 认证")
+        if status != 0:
+            raise ConnectionError(f"{spec.label} 的 SOCKS5 账号密码被拒绝")
+
+    host_bytes = host.encode("idna")
+    sock.sendall(bytes([5, 1, 0, 3, len(host_bytes)]) + host_bytes
+                 + struct.pack("!H", port))
+    _, rep, _, atyp = _recv_exact(sock, 4, "socks5 连接应答")
+    if rep != 0:
+        raise ConnectionError(
+            f"{spec.label} 连 {host}:{port} 失败："
+            f"{SOCKS5_ERRORS.get(rep, f'错误码 {rep}')}")
+    if atyp == 1:
+        _recv_exact(sock, 4 + 2, "socks5 绑定地址")
+    elif atyp == 3:
+        _recv_exact(sock, _recv_exact(sock, 1, "socks5 绑定域名长度")[0] + 2,
+                    "socks5 绑定域名")
+    elif atyp == 4:
+        _recv_exact(sock, 16 + 2, "socks5 绑定地址")
+
+
+def dial(host: str, port: int, timeout: float,
+         spec: Optional[ProxySpec] = None) -> socket.socket:
+    """连到 host:port —— spec 为 None 就直连，否则经代理开隧道。
+
+    连不上 / 隧道被拒都抛 ConnectionError，报错里带代理地址，
+    这样卡片上的「最近错误」一眼能看出是代理挂了还是上游挂了。
+    """
+    if spec is None:
+        return socket.create_connection((host, port), timeout=timeout)
+    try:
+        sock = socket.create_connection((spec.host, spec.port), timeout=timeout)
+    except OSError as exc:
+        raise ConnectionError(f"连不上代理 {spec.label}：{exc}") from exc
+    try:
+        sock.settimeout(timeout)
+        if spec.kind == "socks5":
+            _socks5_tunnel(sock, host, port, spec)
+        else:
+            _http_tunnel(sock, host, port, spec)
+        return sock
+    except Exception:
+        try:
+            sock.close()
+        except Exception:  # noqa: BLE001
+            pass
+        raise
+
+
+def make_upstream_connection(scheme: str, host: str, port: int, timeout: float,
+                             spec: Optional[ProxySpec] = None):
+    """建一个**已经连好**的 http.client 连接（必要时先过代理隧道）。
+
+    和 http.client 自带的 connect() 的差别只有一处：底层 socket 是我们自己
+    建的（可能套了隧道），TLS 也自己包。返回对象可以直接 request()——
+    不能再调它的 connect()，否则会把隧道覆盖成一条直连。
+    """
+    raw = dial(host, port, timeout, spec)
+    if scheme == "https":
+        ctx = ssl.create_default_context()
+        try:
+            tls = ctx.wrap_socket(raw, server_hostname=host)
+        except Exception:
+            try:
+                raw.close()
+            except Exception:  # noqa: BLE001
+                pass
+            raise
+        conn = http.client.HTTPSConnection(host, port, timeout=timeout, context=ctx)
+        conn.sock = tls
+    else:
+        conn = http.client.HTTPConnection(host, port, timeout=timeout)
+        conn.sock = raw
+    return conn
+
+
+def measure_route(scheme: str, host: str, port: int, timeout: float,
+                  spec: Optional[ProxySpec] = None) -> dict:
+    """量一次「真的能通到它」要多久，用来给上游挑出口。
+
+    https 走完 TLS 握手就足以证明连通（握手本身把往返全量到了）。
+    http 光有 TCP/CONNECT 不够 —— 代理可能先回 200 CONNECT、之后才发现
+    上游根本没人监听，那会测出一个假的 0ms。所以 http 再补一次极小的
+    往返（GET / 只读到状态行），有响应就算通，状态码是什么不重要。
+    """
+    # 用 perf_counter 而不是 monotonic：Windows 上 time.monotonic() 的分辨率
+    # 只有 ~15.6ms（GetTickCount64），量什么都是 0/15/31ms，直连和代理根本分不出来。
+    started = time.perf_counter()
+    sock = None
+    try:
+        sock = dial(host, port, timeout, spec)
+        if scheme == "https":
+            sock = ssl.create_default_context().wrap_socket(sock, server_hostname=host)
+        else:
+            sock.settimeout(timeout)
+            sock.sendall(
+                f"GET / HTTP/1.0\r\nHost: {host}\r\nUser-Agent: llm-router-probe\r\n\r\n"
+                .encode("latin-1", "replace"))
+            first = sock.recv(1)
+            if not first:
+                raise ConnectionError("连上了但对方没有回任何数据（端口没有服务）")
+        return {"ok": True, "ms": round((time.perf_counter() - started) * 1000, 1)}
+    except Exception as exc:  # noqa: BLE001
+        return {"ok": False, "ms": None, "error": f"{type(exc).__name__}: {exc}"}
+    finally:
+        try:
+            if sock is not None:
+                sock.close()
+        except Exception:  # noqa: BLE001
+            pass
+
+
+# 探到 CONNECT 之后，回这些状态码才说明对面是代理：
+#   200 = 隧道开了；407 = 要代理认证；502/503/504 = 它试过转发但目标不通
+HTTP_PROXY_CODES = (200, 407, 502, 503, 504)
+
+# TUN + fake-ip 时，系统 DNS 对**所有**域名都回这些网段里的假地址，
+# 真 IP 只有 Clash 自己知道。落在这里的地址意味着「这条连接一定被 TUN 接走」。
+#   198.18.0.0/15 → mihomo / Clash Verge 默认（198.18.0.1/16）
+#   28.0.0.0/8    → 老版 Clash 的 fake-ip-range
+FAKE_IP_NETS = ("198.18.0.0/15", "28.0.0.0/8")
+
+_FAKE_IP_CACHE: dict[str, tuple[float, bool]] = {}
+_FAKE_IP_TTL = 60.0
+
+
+def is_fake_ip(addr: str) -> bool:
+    """这个地址是不是 fake-ip（TUN 伪造的地址，只有 Clash 认）。"""
+    try:
+        ip = ipaddress.ip_address(str(addr).strip())
+    except ValueError:
+        return False
+    for net in FAKE_IP_NETS:
+        try:
+            if ip in ipaddress.ip_network(net):
+                return True
+        except ValueError:
+            continue
+    return False
+
+
+def host_is_fake_ip(host: str, timeout: float = 2.0) -> Optional[bool]:
+    """解析这个域名，看它是不是被 fake-ip 接管了。
+
+    返回 True/False；解析不出来返回 None（不要瞎猜）。
+    结果缓存 60 秒 —— 每个上游都解析一次会让 /stats 变慢。
+    """
+    host = str(host or "").strip().lower()
+    if not host:
+        return None
+    now = time.monotonic()
+    hit = _FAKE_IP_CACHE.get(host)
+    if hit and now - hit[0] < _FAKE_IP_TTL:
+        return hit[1]
+    try:
+        # getaddrinfo 没有超时参数，用 resolver 的默认行为即可（fake-ip 是本地应答，很快）
+        infos = socket.getaddrinfo(host, None, proto=socket.IPPROTO_TCP)
+    except OSError:
+        return None
+    addrs = {str(i[4][0]) for i in infos if i[4]}
+    if not addrs:
+        return None
+    fake = any(is_fake_ip(a) for a in addrs)
+    _FAKE_IP_CACHE[host] = (now, fake)
+    return fake
+
+
+def probe_local_proxy(host: str, port: int, timeout: float = 1.2) -> dict:
+    """看看本机这个端口上是不是代理，是哪种。
+
+    先按 SOCKS5 打个招呼（\x05\x01\x00），回 0x05 的就是 socks5；
+    否则用 CONNECT 试一次 —— 只要回的是 HTTP 状态行，就是 http 代理。
+    Clash 的「混合端口」两种都吃，会先命中 socks5 这条。
+    """
+    result = {"url": f"http://{host}:{port}", "port": port,
+              "kind": "", "ok": False, "error": ""}
+    # --- SOCKS5 ---
+    try:
+        sock = socket.create_connection((host, port), timeout=timeout)
+    except OSError as exc:
+        result["error"] = f"{type(exc).__name__}: {exc}"
+        return result
+    try:
+        sock.settimeout(timeout)
+        sock.sendall(b"\x05\x01\x00")
+        head = sock.recv(2)
+        if head[:1] == b"\x05" and len(head) == 2 and head[1] in (0x00, 0x02):
+            result.update(kind="socks5", ok=True, url=f"socks5://{host}:{port}")
+            return result
+    except OSError:
+        pass
+    finally:
+        try:
+            sock.close()
+        except OSError:
+            pass
+
+    # --- HTTP（CONNECT 的目标随便给一个，只看它怎么回应）---
+    try:
+        sock = socket.create_connection((host, port), timeout=timeout)
+    except OSError as exc:
+        result["error"] = f"{type(exc).__name__}: {exc}"
+        return result
+    try:
+        sock.settimeout(timeout)
+        sock.sendall(b"CONNECT 1.1.1.1:443 HTTP/1.1\r\nHost: 1.1.1.1:443\r\n\r\n")
+        head = sock.recv(64)
+        if head[:5] == b"HTTP/":
+            status = head.split(b"\r\n", 1)[0].decode("latin-1", "replace")
+            # 关键：普通网站对 CONNECT 是 501/400/405「不支持这个方法」，
+            # 那不是代理。只有「接受了隧道 / 要代理认证 / 试过但目标连不上」
+            # 这几种回应才说明它真的在扮演代理。
+            match = re.match(r"HTTP/\d+(?:\.\d+)?\s+(\d{3})", status)
+            code = int(match.group(1)) if match else 0
+            if code in HTTP_PROXY_CODES:
+                result.update(kind="http", ok=True, http_status=status)
+    except OSError:
+        pass
+    finally:
+        try:
+            sock.close()
+        except OSError:
+            pass
+    return result
+
+
+# 常见客户端的默认本地端口：Clash / Verge / mihomo / v2rayN / sing-box 之类。
+COMMON_PROXY_PORTS = (7890, 7891, 7892, 7893, 7897, 7898, 7899, 7900,
+                      1080, 1081, 10808, 10809, 20171, 20172, 6152, 6153,
+                      8889, 8080, 8118, 12639)
+
+
+def scan_local_proxies(extra_ports: Optional[list[int]] = None,
+                       host: str = "127.0.0.1",
+                       timeout: float = 1.2) -> list[dict]:
+    """并发扫一遍本机常见端口，报出「哪个端口是代理」。"""
+    ports: list[int] = []
+    for p in list(COMMON_PROXY_PORTS) + list(extra_ports or []):
+        try:
+            n = int(p)
+        except (TypeError, ValueError):
+            continue
+        if 0 < n < 65536 and n not in ports:
+            ports.append(n)
+    found: list[dict] = []
+    if not ports:
+        return found
+    with concurrent.futures.ThreadPoolExecutor(max_workers=len(ports)) as pool:
+        futures = {pool.submit(probe_local_proxy, host, p, timeout): p for p in ports}
+        for fut in concurrent.futures.as_completed(futures, timeout=timeout * 4):
+            try:
+                res = fut.result()
+            except Exception:  # noqa: BLE001
+                continue
+            if res.get("ok"):
+                found.append(res)
+    found.sort(key=lambda r: r["port"])
+    return found
+
+
+# ---------------------------------------------------------------------------
 # 上游
 # ---------------------------------------------------------------------------
 
@@ -847,14 +1284,14 @@ class MirrorProber:
             scheme = parts.scheme.lower()
             port = parts.port or (443 if scheme == "https" else 80)
             target = parts.path + (("?" + parts.query) if parts.query else "")
-            cls = (http.client.HTTPSConnection if scheme == "https"
-                   else http.client.HTTPConnection)
 
             conn = None
             t0 = time.monotonic()
             try:
-                conn = cls(parts.hostname, port, timeout=self.timeout)
-                conn.connect()
+                # 探测必须和真实请求走**同一个出口**，否则测出来的「哪条线路最快」
+                # 是另一条路的延迟，选面逻辑会跟着选错。
+                conn = make_upstream_connection(
+                    scheme, parts.hostname, port, self.timeout, up.proxy_spec())
                 hdrs = {"Accept": "application/json", "User-Agent": "llm-router-probe"}
                 if up.api_keys:
                     hdrs["Authorization"] = f"Bearer {up.api_keys[0]}"
@@ -960,6 +1397,17 @@ class Upstream:
         # UA 不在它的白名单里直接 401（"unauthorized client detected"）。
         # 留空用默认 llm-router/<版本>。
         self.user_agent: str = str(cfg.get("user_agent") or "").strip()
+
+        # ---- 网络出口 ------------------------------------------------------
+        # 每个上游自己选直连 / 规则 / 强制代理：有的上游直连延迟更低，
+        # 有的必须走代理才通。inherit = 跟随「设置」页里的全局默认。
+        self.net_mode: str = str(cfg.get("net_mode") or "inherit").strip().lower()
+        if self.net_mode not in NET_MODES:
+            self.net_mode = "inherit"
+        # 单独给这个上游指一个代理地址（留空 = 用全局那一套端口）
+        self.proxy_url: str = str(cfg.get("proxy_url") or "").strip()
+        # 由 Router 在装配时挂上（要读全局出口设置，见 resolve_net）
+        self.router: Optional["Router"] = None
 
         # 拉取到的模型列表（运行时状态，会持久化）
         raw_models = cfg.get("available_models") or []
@@ -1301,6 +1749,8 @@ class Upstream:
                 # 最近一次余额查询结果（没查过就是 None）
                 "balance": self.balance,
                 "user_agent": self.user_agent,
+                # 这个上游实际从哪儿出去（直连 / 规则 / 强制代理 + 具体端口）
+                **self.net_view(),
                 # 只认流式的模型（前端编辑框用来回显；空 = 没配）
                 "stream_only_models": sorted(self.stream_only_models),
             }
@@ -1323,11 +1773,24 @@ class Upstream:
 
     def checkin_payload(self) -> dict:
         """喂给 checkin.py 的结构（它不认识 Upstream 类，只认 dict）。"""
+        # 签到也走这个上游的出口 —— 有的站点直连能开、走代理反而被人机验证拦；
+        # 有的反过来。出口一致，签到结果才不会和推理结果打架。
+        proxy_url = ""
+        try:
+            _mode, spec, _source = self.resolve_net()
+        except ValueError:
+            spec = None
+        if spec is not None:
+            auth = (f"{urllib.parse.quote(spec.username)}:"
+                    f"{urllib.parse.quote(spec.password)}@"
+                    if (spec.username or spec.password) else "")
+            proxy_url = f"{spec.kind}://{auth}{spec.host}:{spec.port}"
         return {
             "id": self.id,
             "name": self.name,
             "base_url": self.base_url,
             "checkin": self._checkin_cfg(),
+            "proxy_url": proxy_url,
         }
 
     def checkin_view(self) -> dict:
@@ -1367,6 +1830,9 @@ class Upstream:
                if any(self.api_key_disabled) else {}),
             "key_strategy": self.key_strategy,
             "enabled": self.enabled,
+            # 出口选择：跟随全局就不写，老状态文件一字不变
+            **({"net_mode": self.net_mode} if self.net_mode != "inherit" else {}),
+            **({"proxy_url": self.proxy_url} if self.proxy_url else {}),
             "available_models": list(self.available_models),
             "selected_models": list(self.selected()),
             "model_groups": dict(self.model_groups),
@@ -1451,6 +1917,70 @@ class Upstream:
                     self._key_index = idx
                     return True
             return False
+
+    # ---- 网络出口 ----
+    #
+    # 一个上游到底走直连还是走代理，由「全局出口设置 + 这个上游自己的选择」
+    # 一起决定。解析顺序：全局开关关着 → 除非上游单独填了代理，否则一律直连；
+    # 开着 → 用上游选的那个模式的端口（上游填了 proxy_url 就覆盖端口）。
+
+    def _global_proxy(self) -> dict:
+        settings = getattr(self.router, "proxy_settings", None)
+        if isinstance(settings, dict):
+            return settings
+        return {"enabled": False, "default_mode": "rule",
+                "urls": {"rule": "", "proxy": "", "direct": ""}}
+
+    def net_mode_effective(self) -> str:
+        """实际生效的出口模式（inherit 会解析成全局默认）。"""
+        if self.net_mode in ("rule", "direct", "proxy"):
+            return self.net_mode
+        mode = str(self._global_proxy().get("default_mode") or "rule").lower()
+        return mode if mode in ("rule", "direct", "proxy") else "rule"
+
+    def resolve_net(self) -> tuple[str, Optional[ProxySpec], str]:
+        """算这次请求的出口：返回 (模式, 代理, 来源)。
+
+        代理为 None = 不显式走代理（直连，TUN 下仍会被规则接管）；
+        来源 upstream = 这个上游单独指定的，global = 全局那套端口，none = 没配。
+        """
+        mode = self.net_mode_effective()
+        global_cfg = self._global_proxy()
+        if self.proxy_url:
+            return mode, ProxySpec.parse(self.proxy_url), "upstream"
+        if not global_cfg.get("enabled"):
+            return "direct", None, "none"
+        urls = global_cfg.get("urls") or {}
+        raw = str(urls.get(mode) or "")
+        if not raw and mode == "proxy":
+            # 没单独配「强制代理端口」时借用规则端口，至少别退化成直连
+            raw = str(urls.get("rule") or "")
+        spec = ProxySpec.parse(raw)
+        return mode, spec, ("global" if spec is not None else "none")
+
+    def proxy_spec(self) -> Optional[ProxySpec]:
+        """这次请求要用的代理（None = 直连）。解析失败按直连处理，不让坏配置卡死请求。"""
+        try:
+            return self.resolve_net()[1]
+        except ValueError:
+            return None
+
+    def net_view(self) -> dict:
+        """给界面看的出口情况。"""
+        try:
+            mode, spec, source = self.resolve_net()
+            error = None
+        except ValueError as exc:
+            mode, spec, source, error = self.net_mode_effective(), None, "none", str(exc)
+        return {
+            "net_mode": self.net_mode,
+            "net_mode_effective": mode,
+            "net_mode_label": NET_MODE_LABELS.get(mode, mode),
+            "proxy_url": self.proxy_url,
+            "proxy_effective": spec.label if spec is not None else "",
+            "proxy_source": source,
+            "proxy_error": error,
+        }
 
     # ---- 请求上游 ----
     def headers(self, content_type: str = "application/json",
@@ -1577,7 +2107,11 @@ class Upstream:
             raise ValueError(f"上游地址不合法: {base_url!r}")
         scheme = parts.scheme.lower()
         port = parts.port or (443 if scheme == "https" else 80)
-        cls = http.client.HTTPSConnection if scheme == "https" else http.client.HTTPConnection
+        # 这个上游这次该走直连还是走代理 —— 解析一次，整轮尝试都用它
+        try:
+            net_mode, proxy, _source = self.resolve_net()
+        except ValueError as exc:
+            raise ValueError(f"上游「{self.name}」的出口配置有问题: {exc}") from exc
 
         candidates = api_paths(base_url, path)
         if hint[0]:
@@ -1601,8 +2135,11 @@ class Upstream:
                     # 和预算取小 —— 不会出现「连接 10 秒 + 收包 15 秒 = 25 秒」。
                     budget = self.first_timeout if read_timeout is None else read_timeout
                     t_first = time.monotonic()
-                    conn = cls(parts.hostname, port, timeout=min(self.connect_timeout, budget))
-                    conn.connect()
+                    # 连接（含代理隧道 + TLS）由 make_upstream_connection 一次做完，
+                    # 所以这里不能再调 conn.connect()——那会把隧道覆盖成直连。
+                    conn = make_upstream_connection(
+                        scheme, parts.hostname, port,
+                        min(self.connect_timeout, budget), proxy)
                     remain = budget - (time.monotonic() - t_first)
                     if remain <= 0:
                         raise TimeoutError(f"连接就花掉了 {budget:g} 秒")
@@ -3125,6 +3662,8 @@ class Router:
         # 全局默认参数（「设置」页可改）：保存后覆盖到所有上游，新加的上游也用它
         self.default_first_timeout: float = DEFAULT_FIRST_TIMEOUT
         self.default_connect_timeout: float = DEFAULT_CONNECT_TIMEOUT
+        # 全局出口设置（config.toml 的 [proxy] 起初始值，之后网页上的改动说了算）
+        self.proxy_settings: dict = norm_proxy_settings(cfg.get("proxy"))
         # 用户显式删掉的路由：sync_routes 不许按「勾选+分组」把它再建回来，
         # 直到用户重新保存这个路由 / 手动分组 / 自动配好为止。
         self.suppressed_models: set[str] = set()
@@ -3188,6 +3727,9 @@ class Router:
                    if u.get("mirror_strategy") else {}),
                 "api_key": u.get("api_key") or "",
                 "enabled": u.get("enabled", True),
+                # 出口：配置里写了就带上，不写 = 跟随全局
+                **({"net_mode": u["net_mode"]} if u.get("net_mode") else {}),
+                **({"proxy_url": u["proxy_url"]} if u.get("proxy_url") else {}),
                 "available_models": models,
                 # 配置文件里写明的模型，视为「已经选用」，不然写完配置还得去网页勾一遍
                 "selected_models": [str(m) for m in (u.get("selected_models") or models)],
@@ -3227,10 +3769,15 @@ class Router:
                 "at": str(ck.get("at") or "08:00"),
                 "random_minutes": max(0, int(_to_float(ck.get("random_minutes")) or 0)),
             }
+        # 全局出口设置：状态文件里没有就保留 config.toml 给的那份
+        if "proxy_settings" in data:
+            self.proxy_settings = norm_proxy_settings(data.get("proxy_settings"))
         self.upstreams = []
         for i, u in enumerate(data.get("upstreams") or []):
             up = Upstream(u, i)
             up.cooldown = self.cooldown_default
+            # 上游要读全局出口设置，才能解析「跟随全局」
+            up.router = self
             if not up.base_url:
                 sys.stderr.write(f"[warn] 上游 {up.name!r} 没有填 URL，已跳过\n")
                 continue
@@ -3445,6 +3992,9 @@ class Router:
                if self.checkin_auto != {"enabled": False, "at": "08:00",
                                         "random_minutes": 30}
                else {}),
+            # 全局出口设置：没开也没有端口就不写，老状态文件保持干净
+            **({"proxy_settings": norm_proxy_settings(self.proxy_settings)}
+               if norm_proxy_settings(self.proxy_settings) != PROXY_DEFAULTS else {}),
         }
         path = self._state_path()
         try:
@@ -3572,8 +4122,12 @@ class Router:
             "user_agent": payload.get("user_agent") or "",
             # 只有传了才生效；不传 = 没有仅流式模型，老行为
             "stream_only_models": payload.get("stream_only_models") or [],
+            # 出口：不传就跟随全局
+            "net_mode": payload.get("net_mode") or "inherit",
+            "proxy_url": payload.get("proxy_url") or "",
         }, len(self.upstreams))
         up.cooldown = self.cooldown_default
+        up.router = self
         self.upstreams.append(up)
         self._save_state()
         return up
@@ -3693,6 +4247,16 @@ class Router:
         # 空串 = 回到默认 UA（llm-router/<版本>）
         if "user_agent" in payload:
             up.user_agent = str(payload.get("user_agent") or "").strip()
+        # 出口模式：inherit / rule / direct / proxy，认不出就跟随全局
+        if "net_mode" in payload:
+            mode = str(payload.get("net_mode") or "inherit").strip().lower()
+            up.net_mode = mode if mode in NET_MODES else "inherit"
+        # 单独指定的代理地址：空串 = 改回用全局那套端口。配错在这里就报出来，
+        # 别等到请求时才在每个上游上炸一遍。
+        if "proxy_url" in payload:
+            raw = str(payload.get("proxy_url") or "").strip()
+            ProxySpec.parse(raw)               # 不合法直接 ValueError
+            up.proxy_url = raw
         # 仅流式模型名单：传列表 = 整体覆盖（空列表 = 清掉，回到老行为）；
         # 传 append=true 只追加。不传这个键 = 一个字节都不动。
         if "stream_only_models" in payload:
@@ -3719,6 +4283,364 @@ class Router:
                 "defaults": {"first_timeout_seconds": self.default_first_timeout,
                              "connect_timeout_seconds": self.default_connect_timeout},
                 "upstreams": len(self.upstreams)}
+
+    # ---- 全局出口设置 / 测路 / 生成 Clash 片段 ----
+
+    def proxy_view(self) -> dict:
+        """「设置」页要的出口设置，外加每个上游当前实际从哪儿出去。"""
+        settings = norm_proxy_settings(self.proxy_settings)
+        return {
+            **settings,
+            "defaults": dict(PROXY_DEFAULTS),
+            "modes": [{"value": m, "label": NET_MODE_LABELS[m]} for m in NET_MODES],
+            "upstreams": [
+                {"id": u.id, "name": u.name, **u.net_view()} for u in self.upstreams
+            ],
+            # 现成的 Clash 片段：三个端口 + 需要钉死的域名规则
+            "clash": self.clash_hint(),
+        }
+
+    def set_proxy_settings(self, payload: dict) -> dict:
+        """保存全局出口设置。地址写错当场报，别等到发请求时才炸。"""
+        settings = norm_proxy_settings(payload)
+        for key, raw in settings["urls"].items():
+            try:
+                ProxySpec.parse(raw)
+            except ValueError as exc:
+                raise ValueError(f"{key} 出口填得不对: {exc}") from exc
+        self.proxy_settings = settings
+        self._save_state()
+        return {"ok": True, "proxy": self.proxy_view()}
+
+    @staticmethod
+    def _upstream_endpoint(up: "Upstream", url: Optional[str] = None):
+        """上游主机 + 端口 + 协议（测路只用得到这三个）。"""
+        parts = urllib.parse.urlsplit(url or up.base_url)
+        scheme = (parts.scheme or "https").lower()
+        port = parts.port or (443 if scheme == "https" else 80)
+        return parts.hostname or "", port, scheme
+
+    def _net_routes(self) -> list[tuple[str, str, Optional[ProxySpec]]]:
+        """当前设置下可测的几条路：[(模式, 显示名, 代理)]。
+
+        某个模式的端口没填就不测它 —— 测出来的只是同一件事，白跑。
+        """
+        urls = norm_proxy_settings(self.proxy_settings)["urls"]
+        routes: list[tuple[str, str, Optional[ProxySpec]]] = []
+        for mode in ("direct", "rule", "proxy"):
+            try:
+                spec = ProxySpec.parse(urls.get(mode) or "")
+            except ValueError:
+                spec = None
+            if mode != "direct" and spec is None:
+                continue
+            routes.append((mode, spec.label if spec else "本机直连", spec))
+        return routes or [("direct", "本机直连", None)]
+
+    def bench_net(self, ids: Optional[list[str]] = None,
+                  timeout: float = 5.0, custom_url: str = "",
+                  samples: int = 5) -> list[dict]:
+        """给每个上游实测几条路各要多久（TCP + 代理隧道 + TLS + 一次最小往返）。
+
+        这就是「哪个上游直连更快、哪个走代理更快」的答案。每条路测 samples 次：
+        单次测量会被抖动骗（同一家两次测出 15ms 和 63ms 很常见），所以
+        主指标用中位数（典型表现），同时报 min（最干净的一次）和 max。
+        排序、判定、选择都看中位数 —— 拿一次侥幸的最快值当真会选错。
+        """
+        wanted = {str(i) for i in ids} if ids else None
+        targets = [u for u in self.upstreams
+                   if u.enabled and (wanted is None or u.id in wanted)]
+        routes = self._net_routes()
+        if custom_url:
+            spec = ProxySpec.parse(custom_url)      # 不合法直接报给用户
+            if spec is not None and not any(spec.same_as(s) for _m, _l, s in routes):
+                routes = routes + [("custom", spec.label, spec)]
+        repeats = max(1, min(int(samples or 1), 9))
+        jobs: list[tuple[Upstream, str, int, str, str, str, Optional[ProxySpec]]] = []
+        for up in targets:
+            host, port, scheme = self._upstream_endpoint(up)
+            if not host:
+                continue
+            for mode, label, spec in routes:
+                jobs.append((up, host, port, scheme, mode, label, spec))
+        if not jobs:
+            return []
+
+        # 逐 (上游, 模式) 收集样本
+        samples_map: dict[tuple[str, str], dict] = {}
+        workers = max(1, min(24, len(jobs) * repeats))
+        with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as pool:
+            futures = {}
+            for (up, host, port, scheme, mode, label, spec) in jobs:
+                for _ in range(repeats):
+                    fut = pool.submit(measure_route, scheme, host, port,
+                                      max(1.0, float(timeout)), spec)
+                    futures[fut] = (up, mode, label, spec)
+            deadline = max(40.0, timeout * 10)
+            for fut in concurrent.futures.as_completed(futures, timeout=deadline):
+                up, mode, label, spec = futures[fut]
+                try:
+                    res = fut.result()
+                except Exception as exc:  # noqa: BLE001
+                    res = {"ok": False, "ms": None,
+                           "error": f"{type(exc).__name__}: {exc}"}
+                slot = samples_map.setdefault((up.id, mode), {
+                    "up": up, "mode": mode, "label": label, "spec": spec,
+                    "ms": [], "error": ""})
+                if res.get("ok") and res.get("ms") is not None:
+                    slot["ms"].append(float(res["ms"]))
+                elif not slot["error"]:
+                    slot["error"] = str(res.get("error") or "失败")
+
+        measured: dict[str, dict] = {}
+        for (_uid, _mode), slot in samples_map.items():
+            up = slot["up"]
+            host = self._upstream_endpoint(up)[0]
+            fake = host_is_fake_ip(host)
+            row = measured.setdefault(up.id, {
+                "id": up.id, "name": up.name,
+                "host": host,
+                # 这个域名是不是被 TUN 的 fake-ip 接走了：是的话「直连」那条
+                # 根本没绕开 Clash，测出来的数字不代表一条独立的路。
+                "fake_ip": fake,
+                "net_mode": up.net_mode,
+                "net_mode_effective": up.net_mode_effective(),
+                "samples": repeats,
+                "routes": [],
+            })
+            got = sorted(slot["ms"])
+            ok = bool(got)
+            route = {
+                "mode": slot["mode"],
+                "label": slot["label"],
+                "ok": ok,
+                # ms = 中位数（典型值，用来比较和选择）；min_ms = 最好的一次
+                "ms": round(got[len(got) // 2], 1) if ok else None,
+                "min_ms": round(got[0], 1) if ok else None,
+                "max_ms": round(got[-1], 1) if ok else None,
+                "median_ms": round(got[len(got) // 2], 1) if ok else None,
+                "ok_samples": len(got),
+                "samples": repeats,
+                "error": "" if ok else (slot["error"] or "连不上"),
+            }
+            # 「直连」但实际上没配直连端口 → 流量还是被 TUN 接走，按规则走。
+            # 必须标出来，否则用户会以为自己在比较两条不同的路。
+            if slot["mode"] == "direct" and slot.get("spec") is None and fake:
+                route["tun_intercepted"] = True
+            row["routes"].append(route)
+
+        out: list[dict] = []
+        for up in targets:
+            row = measured.get(up.id)
+            if not row:
+                continue
+            row["routes"].sort(key=lambda r: (not r.get("ok"),
+                                              r.get("ms") if r.get("ms") is not None else 1e9))
+            # 能被当作「独立一条路」去比较和选择的候选：排除被 TUN 接管的假直连
+            usable = [r for r in row["routes"]
+                      if r.get("ok") and not r.get("tun_intercepted")]
+            row["fastest"] = usable[0]["mode"] if usable else None
+            row["fastest_ms"] = usable[0]["ms"] if usable else None
+            row["blocked_direct"] = any(r.get("tun_intercepted") for r in row["routes"])
+            # 当前在用的那条路在这次测量里拿到多少，auto_net 靠它判断「值不值得切」
+            cur = next((r for r in row["routes"]
+                        if r["mode"] == row["net_mode_effective"]), None)
+            row["current_ms"] = cur.get("ms") if cur else None
+            row["current_ok"] = bool(cur and cur.get("ok")) and not (cur or {}).get("tun_intercepted")
+            out.append(row)
+        return out
+
+    # 换路的门槛：新的一边要明显更快才切，免得抖动把上游来回甩。
+    AUTO_NET_MIN_GAIN = 0.20      # 至少快 20%
+    AUTO_NET_MIN_ABS_MS = 25.0    # 且至少省 25ms
+
+    def auto_net(self, ids: Optional[list[str]] = None,
+                 timeout: float = 5.0, samples: int = 5) -> dict:
+        """量一遍，把每个上游切到它自己最快的那条路（只在明显更快时才切）。"""
+        rows = self.bench_net(ids, timeout=timeout, samples=samples)
+        changed: list[dict] = []
+        kept: list[dict] = []
+        for row in rows:
+            fast = row.get("fastest")
+            up = self.find_upstream(row["id"])
+            if not up or not fast:
+                continue
+            before = up.net_mode_effective()
+            fast_ms = row.get("fastest_ms")
+            cur_ms = row.get("current_ms")
+            if before == fast:
+                continue
+            # 当前那条路根本没测通 → 直接换；都通就要求「明显更快」
+            if row.get("current_ok") and fast_ms is not None and cur_ms is not None:
+                gain = cur_ms - fast_ms
+                need = max(cur_ms * self.AUTO_NET_MIN_GAIN, self.AUTO_NET_MIN_ABS_MS)
+                if gain < need:
+                    kept.append({"id": up.id, "name": up.name, "mode": before,
+                                 "current_ms": cur_ms, "fastest": fast,
+                                 "fastest_ms": fast_ms,
+                                 "reason": f"只快 {round(gain,1)}ms，不到 {round(need,1)}ms 的门槛，先不动"})
+                    continue
+            up.net_mode = fast
+            changed.append({"id": up.id, "name": up.name,
+                            "from": before, "to": fast, "ms": fast_ms})
+        # 想选「直连」但那条其实被 TUN 接管的：告诉它该去配直连端口，而不是骗它切过去
+        for row in rows:
+            if not row.get("blocked_direct"):
+                continue
+            up = self.find_upstream(row["id"])
+            if not up:
+                continue
+            kept.append({
+                "id": up.id, "name": up.name,
+                "mode": up.net_mode_effective(), "fastest": "direct",
+                "reason": ("这台机器的 DNS 是 fake-ip（TUN 在管），没配「直连端口」时"
+                           "「直连」这条根本没绕开 Clash，测出来的数不代表另一条路 —— "
+                           "先去 Clash 开一个 proxy: DIRECT 的监听器并填进「直连端口」"
+                           "（或者把 Verge 改用系统代理模式），再回来测"),
+            })
+        if changed:
+            self._save_state()
+        return {"ok": True, "changed": changed, "kept": kept, "results": rows}
+
+    def detect_proxies(self) -> dict:
+        """扫本机端口，猜出哪个是代理、是 http 还是 socks5 —— 省得用户自己找端口。"""
+        extra: list[int] = []
+        for raw in (norm_proxy_settings(self.proxy_settings).get("urls") or {}).values():
+            try:
+                spec = ProxySpec.parse(raw)
+            except ValueError:
+                continue
+            if spec is not None:
+                extra.append(spec.port)
+        found = scan_local_proxies(extra)
+        return {
+            "ok": True,
+            "found": found,
+            # 一个都没找到时给个明确的下一步，而不是留个空表让人猜
+            "hint": ("没在本机常见端口上发现代理。Clash Verge 的端口在"
+                     "「设置 → 端口」里看（默认 7890/7897），或者把 TUN 模式关掉再试。"
+                     if not found else
+                     "挑一个当「规则端口」；再在 Clash 里加 proxy: DIRECT 的监听器"
+                     "当「直连端口」，两个都填上就能让每个上游各走各的。"),
+        }
+
+    def auto_detect_fill(self) -> dict:
+        """把扫到的 http/socks 端口自动填进「规则端口」（只在还没填的时候填）。"""
+        found = scan_local_proxies()
+        settings = norm_proxy_settings(self.proxy_settings)
+        filled: list[str] = []
+        if found and not settings["urls"].get("rule"):
+            pick = next((f for f in found if f["kind"] == "socks5"),
+                        found[0])
+            settings["urls"]["rule"] = pick["url"]
+            filled.append(f"规则端口 = {pick['url']}（本机端口 {pick['port']} 实测是代理）")
+        if settings["urls"].get("rule") and not settings["enabled"]:
+            settings["enabled"] = True
+            filled.append("已顺带打开出口控制")
+        if filled:
+            self.proxy_settings = settings
+            self._save_state()
+        return {"ok": True, "filled": filled, "found": found,
+                "proxy": self.proxy_view()}
+
+    def clash_hint(self) -> dict:
+        """按当前设置生成一份可以直接粘进 mihomo / Clash Verge 的片段。
+
+        为什么要这个：TUN 模式下「直连」进程自己做不到 —— TUN 在网络层把 TCP
+        全接走了。唯一干净的办法是让 Clash 开一个**强制 DIRECT 的本地端口**，
+        进程连这个端口，出口就由 Clash 按监听器写死的出站决定，规则再也插不上手。
+        """
+        urls = norm_proxy_settings(self.proxy_settings)["urls"]
+
+        def port_of(raw: Optional[str], fallback: int) -> int:
+            try:
+                spec = ProxySpec.parse(raw or "")
+            except ValueError:
+                return fallback
+            return spec.port if spec is not None else fallback
+
+        ports = {"rule": port_of(urls.get("rule"), 7897),
+                 "proxy": port_of(urls.get("proxy"), 7898),
+                 "direct": port_of(urls.get("direct"), 7899)}
+
+        # listeners 里 proxy 写死的出站优先级最高：规则、TUN、全局模式都不参与。
+        # 所以「某个上游必须直连」最稳的落法就是给它一个 proxy: DIRECT 的端口。
+        listeners_yaml = "\n".join([
+            "# 粘到 mihomo / Clash Verge 的配置里（Clash Verge 用「配置 → 编辑」），",
+            "# 然后重载配置。端口号要和本页「三个出口」里填的一致。",
+            "listeners:",
+            "  - name: llm-router-direct      # 出口写死 DIRECT",
+            "    type: mixed",
+            f"    port: {ports['direct']}",
+            "    listen: 127.0.0.1",
+            "    proxy: DIRECT",
+            "  - name: llm-router-proxy       # 出口写死一个策略组",
+            "    type: mixed",
+            f"    port: {ports['proxy']}",
+            "    listen: 127.0.0.1",
+            "    proxy: 节点选择            # ← 改成你自己那个策略组的名字",
+        ])
+
+        rule_lines: list[str] = []
+        for up in self.upstreams:
+            if not up.enabled:
+                continue
+            host, _port, _scheme = self._upstream_endpoint(up)
+            # 本机地址 / IP 直写不进规则（TUN 本来就不接管回环和内网）
+            if not host or host in ("localhost",) or re.fullmatch(r"[\d.]+|\[?[0-9a-fA-F:]+\]?", host):
+                continue
+            if up.net_mode == "direct":
+                rule_lines.append(f"  - DOMAIN-SUFFIX,{host},DIRECT")
+            elif up.net_mode == "proxy":
+                rule_lines.append(f"  - DOMAIN-SUFFIX,{host},节点选择")
+        rules_yaml = "\n".join(
+            ["# 不想开 listener 的话，也可以只加规则（缺点是全局模式一开就失效）：",
+             "rules:"]
+            + (rule_lines or ["  # 目前没有把上游钉死在某个出口上，不需要额外规则"]))
+
+        return {
+            "ports": ports,
+            "listeners_yaml": listeners_yaml,
+            "rules_yaml": rules_yaml,
+            "pinned": [{"id": u.id, "name": u.name, "net_mode": u.net_mode,
+                        "host": self._upstream_endpoint(u)[0]}
+                       for u in self.upstreams if u.net_mode in ("direct", "proxy")],
+            "notes": [
+                "TUN 模式下进程自己不设代理 ≠ 直连：TUN 在网络层把 TCP 接走了，"
+                "走哪儿由 Clash 的规则决定。所以「直连」要真正生效，"
+                "要么用 proxy: DIRECT 的端口，要么加 DOMAIN-SUFFIX,…,DIRECT 规则。",
+                f"三个端口填好后，本页也就知道该连哪儿："
+                f"规则 {ports['rule']} / 强制代理 {ports['proxy']} / 直连 {ports['direct']}。",
+                ("直连端口还空着 —— 现在的「直连」只是不用代理，TUN 下仍会被规则接管；"
+                 "把上面 listeners 里那个 proxy: DIRECT 的端口填进来才算真直连。"
+                 if not urls.get("direct") else
+                 "直连端口已填：标记为「直连」的上游会经它出去，规则和 TUN 都插不上手。"),
+                # 实测：TUN + fake-ip 下，系统 DNS 对所有域名都回 198.18.x.x，
+                # 进程连真 IP 都拿不到，绑定网卡也绕不出去（会直接超时）——
+                # 所以「直连」这条路只能由 Clash 侧给口子，或者干脆不用 TUN。
+                ("检测到这台机器的 DNS 回的是 fake-ip（198.18.x.x），说明 TUN 正在接管全部连接。"
+                 "这种状态下进程自己绕不出去，「直连」必须由 Clash 侧开口子"
+                 "（proxy: DIRECT 的 listener，或 DOMAIN-SUFFIX 直连规则）；"
+                 "另一种完全不改 Clash 配置的做法是把 Verge 从 TUN 切成系统代理模式。"
+                 if self._any_fake_ip() else
+                 "没检测到 fake-ip：TUN 可能没开，或没接管 DNS —— 这时不配直连端口也是真直连。"),
+                "填完点「测所有上游的三条路」，再用「按最快的自动选」把每个上游"
+                "各自钉到它最快的那条路上。",
+            ],
+        }
+
+    def _any_fake_ip(self) -> bool:
+        """随便挑几个上游域名看看是不是 fake-ip（命中缓存优先，不额外压 DNS）。"""
+        for up in self.upstreams:
+            if not up.enabled:
+                continue
+            host = self._upstream_endpoint(up)[0]
+            if not host:
+                continue
+            fake = host_is_fake_ip(host)
+            if fake is not None:
+                return fake
+        return False
 
     @staticmethod
     def _pos_int(value: Any) -> Optional[int]:
@@ -4721,6 +5643,8 @@ class Router:
             # 「设置」页的全局默认参数
             "defaults": {"first_timeout_seconds": self.default_first_timeout,
                          "connect_timeout_seconds": self.default_connect_timeout},
+            # 全局出口设置 + 每个上游实际从哪儿出去
+            "proxy": self.proxy_view(),
             "state_path": os.path.abspath(self._state_path()),
             "journal": self.stats.journal_info(),
             "uptime_seconds": round(time.time() - self.started_at, 1),
@@ -5644,6 +6568,10 @@ class Handler(BaseHTTPRequestHandler):
                 "/admin/upstream/update": self._h_upstream_update,
                 "/admin/upstream/delete": self._h_upstream_delete,
                 "/admin/defaults": self._h_defaults,
+                "/admin/proxy/save": self._h_proxy_save,
+                "/admin/proxy/detect": self._h_proxy_detect,
+                "/admin/net/bench": self._h_net_bench,
+                "/admin/net/auto": self._h_net_auto,
                 "/admin/fetch-models": self._h_fetch_models,
                 "/admin/balance": self._h_balance,
                 "/admin/checkin/run": self._h_checkin_run,
@@ -5702,7 +6630,8 @@ class Handler(BaseHTTPRequestHandler):
 
     # 哪些管理接口前后会改变状态，值得记一笔审计
     AUDIT_DETAIL_KEYS = ("id", "name", "upstream", "model", "models", "from", "to",
-                         "enabled", "mapping", "entries", "label", "strategy")
+                         "enabled", "mapping", "entries", "label", "strategy",
+                         "net_mode", "proxy_url", "urls", "default_mode")
 
     def _audit(self, path: str) -> None:
         """把这次管理调用记进审计日志（读 body 前先缓存，免得流被消费掉）。"""
@@ -5879,6 +6808,63 @@ class Handler(BaseHTTPRequestHandler):
             payload = self._read_json_body()
             out = self.router.delete_upstream(str(payload.get("id") or ""))
             return out
+        status, out = self._result(go)
+        self._send_json(status, out)
+
+    # ---- 网络出口 / 测路 ----
+    def _h_proxy_save(self) -> None:
+        def go():
+            return self.router.set_proxy_settings(self._read_json_body())
+        status, out = self._result(go)
+        self._send_json(status, out)
+
+    def _net_ids(self, payload: dict) -> Optional[list[str]]:
+        ids = payload.get("ids")
+        if ids is not None and not isinstance(ids, list):
+            raise ValueError("ids 必须是数组")
+        return [str(i) for i in ids] if ids else None
+
+    def _h_net_bench(self) -> None:
+        def go():
+            payload = self._read_json_body()
+            try:
+                timeout = float(payload.get("timeout_seconds") or 5.0)
+            except (TypeError, ValueError):
+                timeout = 5.0
+            try:
+                samples = int(payload.get("samples") or 5)
+            except (TypeError, ValueError):
+                samples = 5
+            return {"ok": True, "results": self.router.bench_net(
+                self._net_ids(payload), timeout=max(1.0, min(timeout, 30.0)),
+                custom_url=str(payload.get("proxy_url") or "").strip(),
+                samples=samples)}
+        status, out = self._result(go)
+        self._send_json(status, out)
+
+    def _h_net_auto(self) -> None:
+        def go():
+            payload = self._read_json_body()
+            try:
+                timeout = float(payload.get("timeout_seconds") or 5.0)
+            except (TypeError, ValueError):
+                timeout = 5.0
+            try:
+                samples = int(payload.get("samples") or 5)
+            except (TypeError, ValueError):
+                samples = 5
+            return self.router.auto_net(
+                self._net_ids(payload), timeout=max(1.0, min(timeout, 30.0)),
+                samples=samples)
+        status, out = self._result(go)
+        self._send_json(status, out)
+
+    def _h_proxy_detect(self) -> None:
+        def go():
+            payload = self._read_json_body()
+            if payload.get("fill"):
+                return self.router.auto_detect_fill()
+            return self.router.detect_proxies()
         status, out = self._result(go)
         self._send_json(status, out)
 

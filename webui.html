@@ -583,6 +583,64 @@
           <span class="hint" id="setStatus"></span>
         </div>
       </div>
+
+      <div class="card" style="margin-top:14px">
+        <h2>上游网络出口</h2>
+        <div class="hint" style="margin:-6px 0 12px">
+          有的上游直连更快，有的必须走代理才快。这里配好本地端口，再到每个上游的「编辑」里选它走哪条。
+          <br><b>关键：Clash 开 TUN 时，程序「不设代理」并不等于直连</b> —— TUN 在网络层把 TCP 全接走了，
+          走哪儿由 Clash 规则决定，所以规则模式一开，全部上游都过代理。
+          要让「直连」真直连，就得让 Clash 开一个 <code>proxy: DIRECT</code> 的端口（下面片段直接抄）。
+          <br><b>不想改 Clash 配置</b>：把 Verge 的 TUN 关掉、只用它的端口（系统代理开不开都行）——
+          本程序是显式连端口出网的，规则模式照旧生效，<b>直连模式也就成了真直连</b>，两边都不用改配置。
+        </div>
+        <label class="row" style="gap:7px;cursor:pointer;margin-bottom:12px">
+          <input type="checkbox" id="pxEnabled">
+          <span style="font-size:13px">启用出口控制（关掉 = 谁都不显式用代理，回到以前的行为）</span>
+        </label>
+        <div class="row" style="gap:12px;flex-wrap:wrap">
+          <label class="cap-cell" style="max-width:280px"
+            title="上游选了「跟随全局默认」时，按这个模式走">
+            <span class="cap-k">默认模式</span>
+            <select id="pxDefaultMode" style="font-size:13px">
+              <option value="rule">规则（走代理端口，由规则决定）</option>
+              <option value="direct">直连（不走代理）</option>
+              <option value="proxy">强制代理（忽略规则）</option>
+            </select>
+          </label>
+        </div>
+        <div class="grid" style="gap:9px;margin-top:12px">
+          <label class="grid" style="gap:4px">
+            <span class="hint">规则端口 —— Clash 混合端口，去处由规则决定（通常 <code>http://127.0.0.1:7897</code>）</span>
+            <input id="pxRule" class="mono" placeholder="http://127.0.0.1:7897">
+          </label>
+          <label class="grid" style="gap:4px">
+            <span class="hint">强制代理端口 —— 绑死一个策略组，不管规则怎么写都走它</span>
+            <input id="pxProxy" class="mono" placeholder="http://127.0.0.1:7898">
+          </label>
+          <label class="grid" style="gap:4px">
+            <span class="hint">直连端口 —— Clash 里 <code>proxy: DIRECT</code> 的监听器；留空 = 真的自己直连（TUN 下会被规则接管）</span>
+            <input id="pxDirect" class="mono" placeholder="http://127.0.0.1:7899">
+          </label>
+        </div>
+        <div class="row" style="margin-top:14px;gap:10px;flex-wrap:wrap">
+          <button class="primary" id="pxSave">保存</button>
+          <button class="mini" id="pxDetect">扫描本机代理端口</button>
+          <button class="mini" id="pxBench">测所有上游的几条路</button>
+          <button class="mini" id="pxAuto">按最快的自动选</button>
+          <span class="hint" id="pxStatus"></span>
+        </div>
+        <div id="pxTable" style="margin-top:12px"></div>
+        <div class="row" style="margin-top:16px;gap:8px;align-items:baseline">
+          <h3 style="font-size:13px;font-family:inherit;flex:1">Clash 配置片段</h3>
+          <button class="mini" id="pxCopyListeners">复制 listeners</button>
+          <button class="mini" id="pxCopyRules">复制 rules</button>
+        </div>
+        <pre id="pxClash" class="mono" style="white-space:pre-wrap;font-size:11.5px;line-height:1.65;
+          background:var(--bg);border:1px solid var(--line);border-radius:8px;padding:10px;
+          margin-top:6px;max-height:280px;overflow:auto"></pre>
+        <div id="pxNotes" class="hint" style="margin-top:8px"></div>
+      </div>
     </section>
 
     <!-- ============ 日志 ============ -->
@@ -740,6 +798,21 @@
         <span class="hint">User-Agent（留空用默认 llm-router；有些上游按 UA 放行，如 agentrouter 需填 <code>claude-cli/2.0.30 (external, cli)</code>）</span>
         <input id="eUA" class="mono" placeholder="默认">
       </label>
+      <div class="grid" style="gap:5px">
+        <span class="hint">网络出口（这个上游从哪儿出去。<b>Clash 开 TUN 时「不设代理」不等于直连</b> ——
+          要让直连真的直连，需要「设置 → 上游网络出口」里那个 <code>proxy: DIRECT</code> 端口）</span>
+        <select id="eNetMode" style="font-size:13px">
+          <option value="inherit">跟随全局默认</option>
+          <option value="direct">直连（不走代理）</option>
+          <option value="rule">规则（走代理端口，由规则决定）</option>
+          <option value="proxy">强制代理（忽略规则）</option>
+        </select>
+        <input id="eProxyUrl" class="mono" placeholder="单独指定代理，留空 = 用全局那套端口（如 http://127.0.0.1:7897）">
+        <div class="row" style="gap:8px;margin-top:2px">
+          <button class="mini" id="eNetBench" type="button">测一下这家的几条路</button>
+          <span class="hint" id="eNetResult" style="flex:1;min-width:0"></span>
+        </div>
+      </div>
       <div class="grid" style="gap:5px">
         <span class="hint">API Keys <span id="eKeyHint" class="muted"></span></span>
         <div id="eKeyList" style="display:grid;gap:6px"></div>
@@ -1026,6 +1099,35 @@ function keyBadge(u) {
   return `<span class="badge" title="${esc(names[0] ? u.key_hint : "")}">${esc(label)}</span>`;
 }
 
+// 卡片上的出口徽标：这个上游实际从哪儿出去（直连 / 规则 / 强制代理）。
+// 悬停能看到具体端口和来源（跟随全局 / 单独指定）。
+// 出口控制整体关着时显示「未控制」—— 那是实话：它确实不显式用代理，
+// 但 TUN 下走哪儿由 Clash 规则决定，标成「直连」会误导人。
+function netExitBadge(u) {
+  const mode = u.net_mode_effective || "rule";
+  const src = u.proxy_source || "none";
+  const on = !!(state && state.proxy && state.proxy.enabled);
+  const label = (src === "none" && !on)
+    ? "未控制"
+    : ({ direct: "直连", rule: "规则", proxy: "强制代理" }[mode] || mode);
+  let tip = `出口：${label}`;
+  if (src === "none" && !on) {
+    tip += "（出口控制关着，去处由系统 / Clash 决定）";
+  } else {
+    tip += u.proxy_effective ? ` → ${u.proxy_effective}` : "（不显式用代理）";
+    if (mode === "direct" && !u.proxy_effective) {
+      tip += " · 没有配「直连端口」时，TUN 模式下仍会被 Clash 规则接管";
+    }
+    if (src === "upstream") tip += " · 这个上游单独指定的";
+    else if (src === "global") tip += " · 用「设置」页里的全局端口";
+  }
+  if (u.proxy_error) tip += ` · 配置有误：${u.proxy_error}`;
+  const cls = u.proxy_error ? "bad"
+    : (label === "未控制" ? "" : (mode === "direct" ? "ok" : (mode === "proxy" ? "warn" : "")));
+  return `<span class="badge ${cls}" title="${esc(tip)}" style="cursor:help">` +
+         `${esc(label)}${src === "none" ? "" : " ⇄"}</span>`;
+}
+
 function renderUpstreams() {
   const ups = state.upstreams || [];
   // 用户正在分组输入框里操作（或下拉开着）时不要重建 DOM，
@@ -1125,6 +1227,7 @@ function renderUpstreams() {
                      : `<span class="badge ok">启用</span>`)
           : `<span class="badge bad">已停用</span>`}
         ${keyBadge(u)}
+        ${netExitBadge(u)}
         ${nAvail
           ? `<span class="badge ${nSel ? "blue" : "warn"}">已选用 ${nSel} / ${nAvail} 个模型</span>`
           : `<span class="badge warn">还没拉取模型</span>`}
@@ -2545,6 +2648,10 @@ function editUpstream(id) {
     : [u.base_url].filter(Boolean);
   $("#eMirrors").value = mirs.join("\n");
   $("#eUA").value = u.user_agent || "";
+  // 出口：跟随全局就是 inherit；单独指定过的会回显自己的模式与代理地址
+  $("#eNetMode").value = u.net_mode || "inherit";
+  $("#eProxyUrl").value = u.proxy_url || "";
+  $("#eNetResult").textContent = "";
   const hints = u.key_hints || (u.has_key ? [u.key_hint] : []);
   const names = u.key_names || [];
   const dis = u.key_disabled || [];
@@ -2571,6 +2678,52 @@ $("#eAddKey").onclick = () => {
   if (inputs.length) inputs[inputs.length - 1].focus();
 };
 
+// 编辑弹窗里「测一下这家的几条路」：对这个上游的主机，把每条路各握手一次。
+// 弹窗里刚输入的代理地址也一起测（不用先保存）。
+$("#eNetBench").onclick = async () => {
+  const out = $("#eNetResult");
+  const btn = $("#eNetBench");
+  btn.disabled = true;
+  out.textContent = "测路中…";
+  try {
+    const r = await api("/admin/net/bench", {
+      ids: [editId],
+      proxy_url: ($("#eProxyUrl").value || "").trim(),
+    });
+    const row = (r.results || [])[0];
+    if (!row || !(row.routes || []).length) {
+      out.textContent = "没有可测的路径";
+    } else {
+      out.innerHTML = (row.routes || []).map(x => {
+        const text = netModeText(x.mode) + " " +
+          (x.ok ? Math.round(x.ms) + "ms" : "失败");
+        const best = row.fastest && x.mode === row.fastest;
+        const col = x.ok ? (best ? "var(--ok)" : "var(--dim)") : "var(--bad)";
+        const title = x.ok
+          ? `${x.label}｜典型 ${Math.round(x.ms)}ms，最好 ${Math.round(x.min_ms)}ms，最慢 ${Math.round(x.max_ms)}ms`
+          : (x.error || x.label);
+        return `<span style="margin-right:9px;color:${col}" title="${esc(title)}">` +
+          `${best ? "★ " : ""}${esc(text)}</span>`;
+      }).join("");
+      if (row.fastest) {
+        const use = document.createElement("button");
+        use.className = "mini";
+        use.type = "button";
+        use.textContent = `用最快的（${netModeText(row.fastest)}）`;
+        use.onclick = () => {
+          if (row.fastest === "custom") { toast("你自己的代理最快，模式保持当前即可", "ok"); return; }
+          $("#eNetMode").value = row.fastest;
+          toast(`已选「${netModeText(row.fastest)}」，记得点保存`, "ok");
+        };
+        out.appendChild(use);
+      }
+    }
+  } catch (e) {
+    out.textContent = "测路失败：" + e.message;
+  }
+  btn.disabled = false;
+};
+
 async function saveUpstreamEdit() {
   if (!editId) return;
   const capNum = el => {
@@ -2595,6 +2748,9 @@ async function saveUpstreamEdit() {
     user_agent: $("#eUA").value.trim(),
     api_keys: keys,
     key_strategy: $("#eKeyStrategy").value || "failover",
+    // 出口：直连 / 规则 / 强制代理 / 跟随全局；proxy_url 留空 = 用全局端口
+    net_mode: $("#eNetMode").value || "inherit",
+    proxy_url: ($("#eProxyUrl").value || "").trim(),
     // 仅流式模型：逗号/空格/换行分隔都认，去重后提交（留空 = 清空，全部按原样发）
     stream_only_models: String($("#eStreamOnly").value || "")
       .split(/[\s,;]+/).map(s => s.trim()).filter(Boolean)
@@ -3391,6 +3547,8 @@ function renderSettings() {
   if (document.activeElement !== c) {
     c.value = d.connect_timeout_seconds != null ? d.connect_timeout_seconds : "";
   }
+  // 同一页上的「上游网络出口」：端口、每个上游的实际出口、Clash 片段
+  renderProxySettings();
 }
 
 async function saveSettings() {
@@ -3420,6 +3578,227 @@ async function saveSettings() {
   btn.disabled = false;
 }
 $("#setSave").onclick = saveSettings;
+
+/* ================= 设置页：上游网络出口 ================= */
+// 三个本地端口 + 每个上游实际走哪条。测路结果只存在这个浏览器里（lastNetBench），
+// 刷新卡片时不会丢，但重新打开页面就没了 —— 它是一次性的测量，不是配置。
+
+let lastNetBench = {};        // 上游 id -> {routes:[{mode,label,ok,ms}], fastest}
+let lastNetHtml = null;       // 千篇一律的防抖：内容没变就不碰 DOM
+
+function netModeText(mode) {
+  return { direct: "直连", rule: "规则", proxy: "强制代理", custom: "你指定的代理" }[mode] || mode;
+}
+
+function renderProxyTable(p) {
+  const rows = (p.upstreams || []);
+  const html = rows.length ? rows.map(u => {
+    const bench = lastNetBench[u.id];
+    const fast = bench && bench.fastest ? netModeText(bench.fastest) : "—";
+    const benchMs = bench && bench.fastest_ms != null ? Math.round(bench.fastest_ms) + " ms" : "";
+    const eff = u.proxy_effective
+      ? `<span class="mono" style="font-size:11.5px">${esc(u.proxy_effective)}</span>`
+      : `<span class="hint">不显式用代理</span>`;
+    const bad = u.proxy_error
+      ? `<div class="hint" style="color:var(--bad)">${esc(u.proxy_error)}</div>` : "";
+    // 每条路的明细：只在测过之后才有。★ = 最快那条
+    const detail = bench
+      ? `<div style="padding:2px 0 6px;font-size:11.5px;color:var(--dim)">` +
+        (bench.routes || []).map(x => {
+          const best = bench.fastest && x.mode === bench.fastest;
+          const label = netModeText(x.mode);
+          if (!x.ok) {
+            return `<span style="margin-right:11px;color:var(--bad)" title="${esc(x.error || "")}">` +
+                   `${esc(label)} 失败</span>`;
+          }
+          if (x.tun_intercepted) {
+            // 这条「直连」其实被 TUN 接走了 —— 数字是真的，但它不是另一条路
+            return `<span style="margin-right:11px;color:var(--warn)"` +
+                   ` title="没配「直连端口」时，这条流量仍被 Clash 的 TUN 接走、按规则出网；` +
+                   `这个数字不代表一条独立的直连路径">` +
+                   `${esc(label)} ${Math.round(x.ms)}ms（被 TUN 接管）</span>`;
+          }
+          const spread = (x.min_ms != null && x.max_ms != null &&
+                          Math.round(x.max_ms) !== Math.round(x.ms))
+            ? `［${Math.round(x.min_ms)}–${Math.round(x.max_ms)}］` : "";
+          return `<span style="margin-right:11px;color:${best ? "var(--ok)" : "var(--dim)"}"` +
+                 ` title="典型值（中位数）${Math.round(x.ms)}ms，波动 ${spread || "无"}">` +
+                 `${best ? "★ " : ""}${esc(label)} ${Math.round(x.ms)}ms${esc(spread)}</span>`;
+        }).join("") + `</div>`
+      : "";
+    // 有上游的「直连」被 TUN 接管时，整行给一句明确的补救说明
+    const tunWarn = (bench && bench.blocked_direct)
+      ? `<div class="hint" style="color:var(--warn);padding-bottom:6px">` +
+        `这个上游的 DNS 是 fake-ip（${esc(bench.host)} → 198.18.x.x），` +
+        `「直连」还在被 TUN 接管。配了 Clash 的 <code>proxy: DIRECT</code> 端口并填进「直连端口」后，` +
+        `这条才是真的直连。</div>`
+      : "";
+    return `<div style="padding:6px 0;border-bottom:1px dashed var(--line)">
+      <div style="display:flex;gap:10px;align-items:baseline;flex-wrap:wrap">
+        <b style="font-size:12.5px;min-width:150px;flex:1 1 150px;overflow:hidden;
+          text-overflow:ellipsis;white-space:nowrap">${esc(u.name)}</b>
+        <span style="min-width:74px;font-size:12px">${esc(netModeText(u.net_mode_effective))}</span>
+        <span style="flex:1 1 160px;min-width:0">${eff}</span>
+        <span class="hint" style="min-width:120px;text-align:right">最快 ${esc(fast)}${benchMs ? " · " + benchMs : ""}</span>
+      </div>${tunWarn}${detail}${bad}</div>`;
+  }).join("") : `<div class="hint">还没有上游。</div>`;
+
+  const table = $("#pxTable");
+  if (table && lastNetHtml !== html) { lastNetHtml = html; table.innerHTML = html; }
+
+  const clash = (p.clash || {});
+  const pre = $("#pxClash");
+  const text = [clash.listeners_yaml || "", "", clash.rules_yaml || ""].join("\n");
+  if (pre && document.activeElement !== pre) pre.textContent = text;
+  const notes = $("#pxNotes");
+  if (notes) notes.innerHTML = (clash.notes || []).map(n => `· ${esc(n)}`).join("<br>");
+}
+
+function renderProxySettings() {
+  const p = (state && state.proxy) || {};
+  const en = $("#pxEnabled");
+  if (!en) return;
+  if (document.activeElement !== en) en.checked = !!p.enabled;
+  const dm = $("#pxDefaultMode");
+  if (dm && document.activeElement !== dm) dm.value = p.default_mode || "rule";
+  const urls = p.urls || {};
+  [["#pxRule", "rule"], ["#pxProxy", "proxy"], ["#pxDirect", "direct"]].forEach(([sel, k]) => {
+    const el = $(sel);
+    if (el && document.activeElement !== el) el.value = urls[k] || "";
+  });
+  renderProxyTable(p);
+}
+
+async function saveProxySettings() {
+  const btn = $("#pxSave");
+  btn.disabled = true;
+  $("#pxStatus").textContent = "保存中…";
+  try {
+    const r = await api("/admin/proxy/save", {
+      enabled: $("#pxEnabled").checked,
+      default_mode: $("#pxDefaultMode").value || "rule",
+      urls: {
+        rule: ($("#pxRule").value || "").trim(),
+        proxy: ($("#pxProxy").value || "").trim(),
+        direct: ($("#pxDirect").value || "").trim(),
+      },
+    });
+    const ups = (r.proxy && r.proxy.upstreams || []).length;
+    $("#pxStatus").textContent = `已保存，影响 ${ups} 个上游`;
+    toast("出口设置已保存", "ok");
+    await refresh();
+  } catch (e) {
+    $("#pxStatus").textContent = "";
+    toast("保存失败：" + e.message, "bad");
+  }
+  btn.disabled = false;
+}
+$("#pxSave").onclick = saveProxySettings;
+
+// 扫本机端口：把「哪个端口是代理」直接摆出来，还顺手填进规则端口。
+// 用户不用去 Clash 里翻端口号 —— 这一步是纯本地探测，不发任何上游请求。
+async function detectProxies(fill) {
+  const btn = fill ? null : $("#pxDetect");
+  if (btn) btn.disabled = true;
+  $("#pxStatus").textContent = fill ? "正在扫描并自动填…" : "正在扫描本机端口…";
+  try {
+    const r = await api("/admin/proxy/detect", fill ? { fill: true } : {});
+    if (fill) {
+      $("#pxStatus").textContent = (r.filled || []).length
+        ? "已填好：" + r.filled.join("；")
+        : "规则端口已经有值了，没有改动";
+      toast((r.filled || []).length ? "已按实测填好规则端口" : "没有需要填的", "ok");
+      await refresh();
+      return;
+    }
+    const found = r.found || [];
+    $("#pxStatus").innerHTML = found.length
+      ? "发现：" + found.map(f =>
+          `<span class="mono" style="margin-right:10px">${esc(f.url)}（${esc(f.kind)}）</span>`).join("") +
+        `<button class="mini" id="pxFillNow" type="button" style="margin-left:6px">用这个填规则端口</button>`
+      : esc(r.hint || "没发现代理端口");
+    const use = document.querySelector("#pxFillNow");
+    if (use) use.onclick = () => detectProxies(true);
+    if (found.length) toast(`发现 ${found.length} 个本地代理端口`, "ok");
+  } catch (e) {
+    $("#pxStatus").textContent = "";
+    toast("扫描失败：" + e.message, "bad");
+  }
+  if (btn) btn.disabled = false;
+}
+$("#pxDetect").onclick = () => detectProxies(false);
+
+async function benchAllRoutes() {
+  const btn = $("#pxBench");
+  btn.disabled = true;
+  $("#pxStatus").textContent = "正在测每条路（握手耗时）…";
+  try {
+    const r = await api("/admin/net/bench", {});
+    (r.results || []).forEach(row => {
+      lastNetBench[row.id] = { fastest: row.fastest, fastest_ms: row.fastest_ms,
+                               routes: row.routes };
+    });
+    const n = (r.results || []).length;
+    $("#pxStatus").textContent = n
+      ? `测完 ${n} 个上游（每条路各测 5 次取中位数，方括号里是最快~最慢）`
+      : "没有可测的上游";
+    renderProxySettings();
+    toast(`测完 ${n} 个上游`, "ok");
+  } catch (e) {
+    $("#pxStatus").textContent = "";
+    toast("测路失败：" + e.message, "bad");
+  }
+  btn.disabled = false;
+}
+$("#pxBench").onclick = benchAllRoutes;
+
+async function autoPickRoutes() {
+  if (!confirm("按刚才/现在测出的最快路径，把每个上游各自钉到它最快的那条？\n\n" +
+               "会真的改写每个上游的出口设置。")) return;
+  const btn = $("#pxAuto");
+  btn.disabled = true;
+  $("#pxStatus").textContent = "正在测路并自动选择…";
+  try {
+    const r = await api("/admin/net/auto", {});
+    (r.results || []).forEach(row => {
+      lastNetBench[row.id] = { fastest: row.fastest, fastest_ms: row.fastest_ms,
+                               routes: row.routes };
+    });
+    const changed = r.changed || [];
+    const kept = r.kept || [];
+    let msg = changed.length
+      ? `已改 ${changed.length} 个：` + changed.map(c =>
+          `${c.name} ${netModeText(c.from)}→${netModeText(c.to)}`).join("，")
+      : "没有需要改的";
+    if (kept.length) {
+      msg += `；${kept.length} 个保持不动（差距太小，免得抖动来回甩）：` +
+        kept.map(k => `${k.name} ${k.reason}`).join("，");
+    }
+    $("#pxStatus").textContent = msg;
+    toast(changed.length ? `按最快路径切换了 ${changed.length} 个上游`
+                         : "没有需要改的（差距不到切换门槛）", "ok");
+    await refresh();
+  } catch (e) {
+    $("#pxStatus").textContent = "";
+    toast("自动选路失败：" + e.message, "bad");
+  }
+  btn.disabled = false;
+}
+$("#pxAuto").onclick = autoPickRoutes;
+
+async function copyClashPart(which) {
+  const p = (state && state.proxy) || {};
+  const clash = p.clash || {};
+  const text = which === "rules" ? (clash.rules_yaml || "") : (clash.listeners_yaml || "");
+  try {
+    await navigator.clipboard.writeText(text);
+    toast(which === "rules" ? "rules 片段已复制" : "listeners 片段已复制", "ok");
+  } catch (e) {
+    toast("复制失败，手动选一下下面的框：" + e.message, "bad");
+  }
+}
+$("#pxCopyListeners").onclick = () => copyClashPart("listeners");
+$("#pxCopyRules").onclick = () => copyClashPart("rules");
 
 $("#logCopy").onclick = async () => {
   const text = logEntries.map(e => {

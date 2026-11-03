@@ -35,6 +35,46 @@ queue_timeout_seconds = 15
 
 
 # ---------------------------------------------------------------------------
+# 上游出口：直连 / 规则 / 强制代理
+#
+# 为什么要这个：Clash Verge 一开 TUN 模式，进程「自己不设代理」并不等于直连 ——
+# TUN 在网络层把所有 TCP 都接走了，最后走直连还是走节点，由 Clash 的规则决定。
+# 于是「规则模式一开，所有上游都过代理」，本来就该直连的那几家会慢到没法用。
+#
+# 这里给三个本地端口，每个上游（[[upstreams]] 里的 net_mode）各自选走哪条：
+#   net_mode = "direct"  直连 —— 用下面的 direct 端口（Clash 里 proxy: DIRECT 的监听器）
+#   net_mode = "rule"    规则 —— 用 rule 端口，去处交给 Clash 规则
+#   net_mode = "proxy"   强制代理 —— 用 proxy 端口，绑死一个策略组，绕开规则
+#   net_mode = "inherit" 跟随 default_mode（默认）
+# 不写这段 = 完全不加干预，行为和以前一样。
+#
+# 三个端口填好之后，网页「设置 → 上游网络出口」可以一键测出每个上游走哪条最快，
+# 再按结果分别钉死；那一页也有现成的 listeners 片段可以直接粘进 Clash。
+#
+# [proxy]
+# enabled = true
+# default_mode = "rule"                      # rule | direct | proxy
+# rule = "http://127.0.0.1:7897"             # Clash 混合端口（规则决定去处）
+# proxy = "http://127.0.0.1:7898"            # 绑死策略组的端口
+# direct = "http://127.0.0.1:7899"           # Clash 里 proxy: DIRECT 的端口
+#
+# 对应的 Clash 侧配置（粘到 mihomo / Clash Verge 的配置里再重载）：
+#
+# listeners:
+#   - name: llm-router-direct
+#     type: mixed
+#     port: 7899
+#     listen: 127.0.0.1
+#     proxy: DIRECT          # 出口写死 DIRECT，规则和 TUN 都插不上手
+#   - name: llm-router-proxy
+#     type: mixed
+#     port: 7898
+#     listen: 127.0.0.1
+#     proxy: 节点选择         # 改成你自己的策略组名
+# ---------------------------------------------------------------------------
+
+
+# ---------------------------------------------------------------------------
 # 上游来源：有几个写几个，[[upstreams]] 可以重复很多组
 #
 # 这里不用写模型清单。启动后点「拉取全部模型」，
@@ -51,6 +91,10 @@ name = "DeepSeek 官方"
 id = "u1"
 base_url = "https://api.deepseek.com"
 api_key = "sk-你的官方key"
+# 出口：direct 直连 / rule 规则 / proxy 强制代理 / inherit 跟随全局（默认）
+# net_mode = "direct"
+# 也可以只给这一家指定一个代理地址（留空 = 用 [proxy] 里那三个端口）
+# proxy_url = "http://127.0.0.1:7898"
 
 # --- 硅基流动 ---
 [[upstreams]]

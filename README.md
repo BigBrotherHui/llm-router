@@ -215,6 +215,95 @@ model 名和状态文件位置。
 上游卡片按网格排成多列（窗口越宽一屏看到越多），点「选模型」展开的卡片会自动占满一行。
 列表上方有 **全部启用 / 全部停用** 一键切换所有上游的启用状态。
 
+卡片上的小徽标会显示这个上游**实际从哪儿出去**（直连 / 规则 / 强制代理），
+悬停能看到具体端口和来源。见下面「上游出口」。
+
+### 上游出口：直连 / 规则 / 强制代理
+
+**要解决的问题**：Clash Verge 一开 TUN 模式，进程「自己不设代理」**并不等于直连**。
+TUN 在网络层把 TCP 全接走了，最后走直连还是走节点由 Clash 的**规则**决定 ——
+所以规则模式一开，所有上游都过代理，本来就该直连的那几家（国内 API、本地中转、
+同一城市的中转站）会慢到没法用。反过来有的上游直连根本不通，必须走节点。
+
+做法：给每个上游一个**显式**的出口，靠主动连本地代理端口来施加控制，而不是靠规则。
+
+**先说清楚哪部分不用碰 Clash**：
+
+| 你要的 | 要改 Clash 吗 | 为什么 |
+| --- | --- | --- |
+| 规则模式、强制代理模式 | **不用**。填上端口就生效 | 混合端口（7897）本来就开着，显式连它就走规则/策略组 |
+| 真直连 | **要**，一次性 | 「直连」= 让 Clash 别管这条流量，而 Clash 是唯一知道真实出路的那个 |
+
+最后一行不是我偷懒。实测这台机器：DNS 对所有域名都回 `198.18.x.x`（fake-ip），
+连接一建立本地源地址就是 `198.18.0.1`（TUN 的地址）；即使把 socket 绑定到物理网卡的
+`192.168.1.209` 再连，也直接超时。也就是说 **TUN + fake-ip 下，进程自己拿不到真 IP、
+也绕不出 TUN**，直连只能由 Clash 侧给口子。
+
+三种做法，按省事程度排：
+
+1. **完全不改 Clash 配置**（推荐先试）：把 Verge 的 **TUN 关掉**，只用它的端口
+   （系统代理开不开都行，本程序是显式连端口的）。规则模式照旧生效，
+   「直连」就变成真直连 —— 因为没有任何东西在截流量了。
+   代价：不认系统代理的程序（部分 CLI/游戏）不再被自动代理。
+2. **加一条规则**（最简单的一次性配置）：Clash 里加
+   `- DOMAIN-SUFFIX,api.deepseek.com,DIRECT`。缺点：切「全局模式」时规则不生效。
+3. **加一个 `proxy: DIRECT` 的监听器**（最稳）：规则、TUN、全局模式一律不参与。
+   Verge Rev 里右键订阅卡片 →「编辑扩展配置」，把片段写进去，订阅更新不会冲掉它
+   （注意 `listeners` 是列表，写进去会整体替换订阅里原有的 `listeners`，一般订阅没有）。
+   文档：[扩展配置](https://www.clashverge.dev/guide/extend.html)、
+   [mihomo listeners](https://wiki.metacubex.one/config/inbound/listeners/)。
+
+**设置页 → 上游网络出口**，填三个本地端口：
+
+| 出口 | 填什么 | 说明 |
+| --- | --- | --- |
+| 规则 | Clash 混合端口，通常 `http://127.0.0.1:7897` | 去处由 Clash 规则决定 |
+| 强制代理 | 绑死了策略组的端口 | 不管规则怎么写都走那个节点/组 |
+| 直连 | Clash 里 `proxy: DIRECT` 的监听器 | **只有这个能让「直连」在 TUN 下真直连** |
+
+`http://` 和 `socks5://` 都支持（混合端口两种都吃；socks5 还会把域名交给代理解析，
+DNS 一起走代理）。留空 + 关闭开关 = 完全不加干预，行为和以前一模一样。
+
+「**扫描本机代理端口**」会并发试探常见的本地端口（7890/7897/1080/10808…），
+报出哪个端口是代理、是 http 还是 socks5，并可一键填进「规则端口」。
+
+那页还直接给出**可以粘进 Clash 的片段**：
+
+```yaml
+listeners:
+  - name: llm-router-direct      # 出口写死 DIRECT
+    type: mixed
+    port: 7899
+    listen: 127.0.0.1
+    proxy: DIRECT
+  - name: llm-router-proxy       # 出口写死一个策略组
+    type: mixed
+    port: 7898
+    listen: 127.0.0.1
+    proxy: 节点选择              # 改成你自己的策略组名
+```
+
+`listeners` 里的 `proxy` 优先级最高，规则、TUN、全局模式都不参与 —— 它就是
+「这条入站的出口，别再问规则」。
+
+**每个上游怎么选**：上游卡片 → 编辑 → 网络出口，选 直连 / 规则 / 强制代理 / 跟随全局；
+也可以只给这一家填一个专属的 `proxy_url`（比如某个节点专用端口）。
+
+**别猜，测**：
+
+- 「测所有上游的几条路」：对每个上游的域名，把每条路各测 5 次，报**中位数**和
+  [最快–最慢] 区间。测的是「连上它要多久」（TCP + 代理隧道 + TLS + 一次最小往返），
+  不含模型生成 —— 模型生成时间跟线路无关，会淹没线路差别。
+- 如果某条「直连」其实还被 TUN 接着（DNS 是 fake-ip 且没配直连端口），
+  它会被标成「被 TUN 接管」，并且**不参与「最快」评选** ——
+  这条的数字是真的，但它不是一条独立的路，拿它去比较会得出错误结论。
+- 「按最快的自动选」：按测量结果把每个上游钉到它最快的那条路。
+  只有**明显更快**才切（默认要求快 20% 且省 25ms 以上），免得抖动把上游来回甩；
+  没切的会在提示里说明原因。
+- 编辑弹窗里也有「测一下这家的几条路」，测完可以直接点「用最快的」。
+
+签到请求也走同一个出口（http 与 socks5 都能过），不会出现「推理能通、签到连不上」。
+
 ### 模型路由
 
 这里列出**你勾选并分好组的模型**，点任意一个打开配置弹窗：
@@ -391,6 +480,20 @@ curl -X POST http://127.0.0.1:8010/v1/messages \
 | `models` | 否 | 想预先声明可用模型时才写；平时让它拉取就行。写了会被视为「已勾选」 |
 | `connect_timeout_seconds` | 否 | 连上游的超时，默认 10 |
 | `read_timeout_seconds` | 否 | 读上游响应的超时，默认 300 |
+| `net_mode` | 否 | 出口：`direct` / `rule` / `proxy` / `inherit`（默认，跟随全局） |
+| `proxy_url` | 否 | 只给这一家指定代理（`http://` 或 `socks5://`）；不写就用 `[proxy]` 那三个端口 |
+
+### `[proxy]`（上游出口，可选）
+
+不写这段 = 谁都不显式用代理，行为与以前一致。
+
+| 字段 | 默认 | 说明 |
+|---|---|---|
+| `enabled` | `false` | 出口控制的开关 |
+| `default_mode` | `rule` | 「跟随全局」的上游按这个模式走 |
+| `rule` | 空 | 规则端口，通常 Clash 混合端口 `http://127.0.0.1:7897` |
+| `proxy` | 空 | 强制代理端口（绑死策略组） |
+| `direct` | 空 | 直连端口：Clash 里 `proxy: DIRECT` 的监听器。留空 = 自己直连（TUN 下会被规则接管） |
 
 > 平时不用手写。网页上的勾选、分组、排序都会存进 `.llmrouter/` 子目录（见下）。
 
@@ -435,6 +538,17 @@ curl -X POST http://127.0.0.1:8010/v1/messages \
 **Q：Claude Code / Anthropic SDK 能直接用吗？**
 能，见上面「接入 Anthropic 客户端」。请求和响应两个方向都会转换，
 `/v1/messages` 和 `/v1/messages/count_tokens` 都提供。
+
+**Q：开了 Clash 的 TUN / 规则模式，所有上游都走代理变慢，怎么办？**
+每个上游单独选出口，见上面「上游出口」。要点：
+TUN 下「程序不设代理」≠ 直连，必须让 Clash 给一个 `proxy: DIRECT` 的端口来当直连出口，
+再在「设置 → 上游网络出口」里把它填进「直连端口」，然后给该直连的上游选「直连」。
+哪家该走哪条别猜，点「测所有上游的几条路」实测，再「按最快的自动选」。
+
+**Q：走代理和直连哪条更快，能自动判断吗？**
+能，但只能靠实测。「测所有上游的几条路」对每条路各测 5 次取中位数（单次测量抖动很大，
+同一家两次测出 15ms 和 63ms 很常见）。点「按最快的自动选」会按结果分别钉死，
+差距太小（不到 20% 或省不到 25ms）时不动，避免抖动把上游来回甩。
 
 **Q：A 家叫 ds1、B 家叫 ds2，怎么让它们变成一个模型？**
 勾选之后在各自右边的「分组名」框里都填同一个名字（比如 `deepseek`），就会自动合并成一条路由。客户端只请求 `deepseek`，路由器按你的顺序发给各家，实际发送的是各家的真实名（`ds1`/`ds2`），响应里的 model 会改回 `deepseek`。详见上面「工作方式」。
@@ -539,12 +653,33 @@ curl -X POST -H "Content-Type: application/json" \
   -d '{"from":"deepseek","to":"llm"}' \
   http://127.0.0.1:8010/admin/rename-group
 
+# ---- 上游出口（直连 / 规则 / 强制代理）----
+# 保存三个本地端口（Clash 混合端口 / 绑死策略组的端口 / proxy: DIRECT 的端口）
+curl -X POST -H "Content-Type: application/json" -d '{
+  "enabled":true,"default_mode":"rule",
+  "urls":{"rule":"http://127.0.0.1:7897","proxy":"http://127.0.0.1:7898",
+          "direct":"http://127.0.0.1:7899"}}' \
+  http://127.0.0.1:8010/admin/proxy/save
+# 扫本机常见端口，报出哪个是代理（http / socks5）；body 加 "fill":true 顺手填规则端口
+curl -X POST -H "Content-Type: application/json" -d '{}' \
+  http://127.0.0.1:8010/admin/proxy/detect
+# 实测每个上游几条路各要多久（每条测 5 次取中位数；可传 "ids":["u1"], "samples":5）
+curl -X POST -H "Content-Type: application/json" -d '{}' \
+  http://127.0.0.1:8010/admin/net/bench
+# 按实测结果把每个上游切到它最快的那条（差距不到 20%/25ms 时不切，原因在 kept 里）
+curl -X POST -H "Content-Type: application/json" -d '{}' \
+  http://127.0.0.1:8010/admin/net/auto
+
 # 添加 / 修改 / 删除上游
 curl -X POST -H "Content-Type: application/json" \
   -d '{"name":"新上游","base_url":"https://api.example.com","api_key":"sk-x"}' \
   http://127.0.0.1:8010/admin/upstream/add
 curl -X POST -H "Content-Type: application/json" \
   -d '{"id":"u1","name":"改个名","enabled":false}' \
+  http://127.0.0.1:8010/admin/upstream/update
+# 单独给某个上游指定出口（net_mode: direct/rule/proxy/inherit；proxy_url 留空回用全局端口）
+curl -X POST -H "Content-Type: application/json" \
+  -d '{"id":"u1","net_mode":"direct"}' \
   http://127.0.0.1:8010/admin/upstream/update
 curl -X POST -H "Content-Type: application/json" -d '{"id":"u1"}' \
   http://127.0.0.1:8010/admin/upstream/delete

@@ -103,8 +103,14 @@ def site_root(base_url: str) -> str:
 # ---------------------------------------------------------------- HTTP
 
 def _request(url: str, token: str, user_id: str = "",
-             method: str = "GET", timeout: float = DEFAULT_TIMEOUT) -> tuple[int, dict, str]:
-    """发一个请求，返回 (状态码, 响应头, 正文)。HTTP 错误码不抛异常。"""
+             method: str = "GET", timeout: float = DEFAULT_TIMEOUT,
+             proxy: str = "") -> tuple[int, dict, str]:
+    """发一个请求，返回 (状态码, 响应头, 正文)。HTTP 错误码不抛异常。
+
+    proxy = 这个上游的出口，跟推理请求走同一条路（http 和 socks5 都支持）。
+    这样「这个站点走代理才通 / 走代理反而被人机验证拦」的差别不会让签到
+    和推理打架。
+    """
     headers = {
         "Accept": "application/json",
         "Accept-Encoding": "identity",
@@ -114,6 +120,10 @@ def _request(url: str, token: str, user_id: str = "",
     if user_id:
         # 老版本 New API 认这个头；新版本带不带都一样
         headers["New-Api-User"] = str(user_id)
+    proxy = str(proxy or "").strip()
+    if proxy:
+        return _request_via_proxy(url, method, headers, timeout, proxy)
+
     req = urllib.request.Request(url, method=method, headers=headers)
     try:
         with urllib.request.urlopen(req, timeout=timeout) as resp:
@@ -126,6 +136,39 @@ def _request(url: str, token: str, user_id: str = "",
         except Exception:  # noqa: BLE001 — 读不到正文就算了
             body = ""
         return int(exc.code), dict(exc.headers or {}), body
+
+
+def _request_via_proxy(url: str, method: str, headers: dict, timeout: float,
+                       proxy: str) -> tuple[int, dict, str]:
+    """经代理（http CONNECT 或 socks5）发一个请求。
+
+    借 router.py 里那套已经完全一样的连接代码 —— 签到和推理走同一个出口、
+    同一套隧道实现，不会出现「推理能通、签到连不上」的假故障。
+    """
+    import router as router_mod          # 延迟导入：router 在模块级 import 了本文件
+    spec = router_mod.ProxySpec.parse(proxy)
+    if spec is None:
+        raise ValueError(f"代理地址看不懂: {proxy!r}")
+    parts = urllib.parse.urlsplit(url)
+    scheme = (parts.scheme or "https").lower()
+    if scheme not in ("http", "https") or not parts.hostname:
+        raise ValueError(f"签到地址不合法: {url!r}")
+    port = parts.port or (443 if scheme == "https" else 80)
+    target = parts.path or "/"
+    if parts.query:
+        target += "?" + parts.query
+    conn = router_mod.make_upstream_connection(scheme, parts.hostname, port,
+                                              timeout, spec)
+    try:
+        conn.request(method, target, headers=headers)
+        resp = conn.getresponse()
+        body = resp.read(262144).decode("utf-8", "replace")
+        return int(resp.status), dict(resp.getheaders() or {}), body
+    finally:
+        try:
+            conn.close()
+        except Exception:  # noqa: BLE001
+            pass
 
 
 def challenge_kind(status: int, headers: dict, text: str) -> str:
@@ -216,10 +259,12 @@ def _parse_press(payload: dict) -> tuple[bool, str, float, str]:
 
 # ---------------------------------------------------------------- 额度单位
 
-def fetch_quota_per_unit(root: str, timeout: float = 8.0) -> Optional[dict]:
+def fetch_quota_per_unit(root: str, timeout: float = 8.0,
+                         proxy: str = "") -> Optional[dict]:
     """读 /api/status 的额度换算。失败返回 None（不影响签到本身）。"""
     try:
-        status, _headers, text = _request(f"{root}/api/status", "", timeout=timeout)
+        status, _headers, text = _request(f"{root}/api/status", "",
+                                          timeout=timeout, proxy=proxy)
     except Exception:  # noqa: BLE001
         return None
     if status >= 400:
@@ -255,7 +300,9 @@ def _config_of(item: Any) -> dict:
     if isinstance(item, dict):
         return item
     out = {"base_url": getattr(item, "base_url", ""), "name": getattr(item, "name", ""),
-           "id": getattr(item, "id", ""), "checkin": {}}
+           "id": getattr(item, "id", ""), "checkin": {},
+           # 出口（Upstream 对象直接进来时也带上，dict 进来的话用上面那个键）
+           "proxy_url": str(getattr(item, "proxy_url", "") or "")}
     ck = {}
     token = getattr(item, "checkin_token", "")
     if token:
@@ -288,7 +335,7 @@ def _result(kind: str, ok: bool, message: str, **extra) -> dict:
 
 
 def _walk(root: str, ck: dict, press_checkin: bool,
-          timeout: float) -> dict:
+          timeout: float, proxy: str = "") -> dict:
     """依次试候选路径，返回第一条能用的路径的结果。"""
     token = str(ck.get("token") or "").strip()
     user_id = str(ck.get("user_id") or "").strip()
@@ -300,7 +347,8 @@ def _walk(root: str, ck: dict, press_checkin: bool,
         try:
             status, headers, text = _request(
                 url, token, user_id,
-                method="POST" if press_checkin else "GET", timeout=timeout)
+                method="POST" if press_checkin else "GET", timeout=timeout,
+                proxy=proxy)
         except (urllib.error.URLError, socket.timeout, TimeoutError, OSError) as exc:
             last_error = _result("error", False, f"连不上 {root}：{describe(exc)}")
             continue
@@ -390,6 +438,8 @@ def run_one(item: Any, press_checkin: bool = True,
     name = str(cfg.get("name") or cfg.get("id") or "?")
     ck = cfg.get("checkin") or {}
     token = str(ck.get("token") or "").strip()
+    # 出口跟推理请求一条路（router 那边算好传进来，这里只负责用）
+    proxy = str(cfg.get("proxy_url") or "").strip()
 
     if not token:
         return _result("nocfg", False, "还没配置访问令牌")
@@ -409,7 +459,7 @@ def run_one(item: Any, press_checkin: bool = True,
             # 先读状态：今天签过就不必再按，也顺便验证路径。
             # 读状态这一步顺带把「根本不该按」的几种情况挡掉：
             # 没有签到接口、站点关着签到、令牌不行、连不上 —— 都不发 POST。
-            state_result = _walk(root, ck, False, timeout)
+            state_result = _walk(root, ck, False, timeout, proxy)
             state_kind = state_result.get("kind")
             if state_kind == "blocked":
                 return state_result
@@ -426,9 +476,9 @@ def run_one(item: Any, press_checkin: bool = True,
             # 走到这里：接口在、今天还没签。顺着刚学到的路径按下去
             if state_result.get("path"):
                 ck = {**ck, "path": state_result["path"]}
-            base_result = _walk(root, ck, True, timeout)
+            base_result = _walk(root, ck, True, timeout, proxy)
         else:
-            base_result = _walk(root, ck, False, timeout)
+            base_result = _walk(root, ck, False, timeout, proxy)
     except Exception as exc:  # noqa: BLE001 — 签到线程绝不能因为一个站点崩掉
         return _result("error", False, f"签到出错：{describe(exc)}")
 
@@ -436,7 +486,8 @@ def run_one(item: Any, press_checkin: bool = True,
     per_unit = _num(ck.get("quota_per_unit")) or None
     symbol = ""
     if base_result.get("ok") and per_unit is None:
-        status_info = fetch_quota_per_unit(root, timeout=min(timeout, 8.0))
+        status_info = fetch_quota_per_unit(root, timeout=min(timeout, 8.0),
+                                           proxy=proxy)
         if status_info:
             per_unit = status_info.get("quota_per_unit")
             symbol = status_info.get("symbol", "") if status_info.get("currency") else ""
