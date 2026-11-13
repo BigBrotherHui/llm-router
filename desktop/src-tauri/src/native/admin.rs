@@ -6,6 +6,7 @@ use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::Json;
 use serde_json::{json, Value};
+use tauri::Manager;
 
 use super::journal;
 use super::proxy;
@@ -408,7 +409,49 @@ pub async fn window_behavior(State(state): State<Arc<AppState>>) -> Response {
         .window_behavior
         .clone()
         .unwrap_or_else(|| "minimize".to_string());
-    ok(json!({"ok": true, "behavior": behavior}))
+    ok(json!({"ok": true, "behavior": behavior, "native": true,
+        "found": main_window(&state).is_some()}))
+}
+
+fn main_window(state: &AppState) -> Option<tauri::WebviewWindow> {
+    state
+        .app
+        .lock()
+        .ok()
+        .and_then(|app| app.as_ref().and_then(|a| a.get_webview_window("main")))
+}
+
+pub async fn window_minimize(State(state): State<Arc<AppState>>) -> Response {
+    let found = main_window(&state).is_some();
+    if let Some(w) = main_window(&state) {
+        let _ = w.minimize();
+    }
+    ok(json!({"ok": true, "found": found}))
+}
+
+pub async fn window_toggle_maximize(State(state): State<Arc<AppState>>) -> Response {
+    if let Some(w) = main_window(&state) {
+        if w.is_maximized().unwrap_or(false) {
+            let _ = w.unmaximize();
+        } else {
+            let _ = w.maximize();
+        }
+    }
+    ok(json!({"ok": true}))
+}
+
+pub async fn window_drag(State(state): State<Arc<AppState>>) -> Response {
+    if let Some(w) = main_window(&state) {
+        let _ = w.start_dragging();
+    }
+    ok(json!({"ok": true}))
+}
+
+pub async fn window_close(State(state): State<Arc<AppState>>) -> Response {
+    if let Some(w) = main_window(&state) {
+        let _ = w.close();
+    }
+    ok(json!({"ok": true}))
 }
 
 pub async fn set_window_behavior(

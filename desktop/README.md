@@ -3,6 +3,9 @@
 单进程桌面应用：Tauri 窗口 + 内嵌 Rust HTTP 服务，**不需要 Python，也没有单独的 backend exe**。
 `router.py` 的 Python 版仍保留在仓库根目录，作为过渡/对照。
 
+窗口是无边框的，顶部标题栏由 webui 自己绘制（只在使用桌面壳传 `?native=1` 时显示），
+支持拖动、最小化、最大化/还原、关闭；关闭按钮默认最小化，可在设置页切换为退出。
+
 当前原生核心已实现：
 
 - 读取 `.llmrouter/config.state.json`（上游 / 模型路由 / 分组）

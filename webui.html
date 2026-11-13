@@ -164,7 +164,8 @@
 
   /* ============ 布局：左侧 tab 栏 + 内容区 ============ */
   /* tab 栏贴住窗口左缘，只有内容区在剩余空间里居中 */
-  #layout{display:flex;gap:18px;align-items:flex-start;padding:16px 20px 24px 12px}
+  #layout{display:flex;gap:18px;align-items:flex-start;padding:16px 20px 24px 12px;
+    width:100%;max-width:100%;box-sizing:border-box}
   /* sticky 的 top 值由 JS 按 header 实际高度设置（header 会换行，写死会趴到它底下） */
   #tabs{position:sticky;top:76px;z-index:10;flex:none;width:178px;
     display:flex;flex-direction:column;gap:5px;background:var(--panel);
@@ -172,6 +173,7 @@
   #tabs .tab{display:flex;align-items:center;gap:8px;width:100%;text-align:left;
     background:transparent;border:1px solid transparent;border-radius:8px;
     padding:9px 11px;font-size:13.5px;color:var(--dim)}
+  main{flex:1 1 0;min-width:0;max-width:none;width:0}
   #tabs .tab:hover{background:var(--panel2);color:#fff;border-color:transparent}
   #tabs .tab.active{background:var(--panel2);border-color:var(--accent);
     color:var(--fg);font-weight:600}
@@ -354,9 +356,107 @@
     padding:4px 0;border-bottom:1px dashed var(--line)}
   .ck-hist-row:last-child{border-bottom:none}
   .ck-hist-row .t{color:var(--dim);white-space:nowrap;font-variant-numeric:tabular-nums}
+
+  /* ================= 视觉升级：深色玻璃 + 渐变高光 ================= */
+  :root{
+    --bg:#090d14; --panel:rgba(18,26,38,.78); --panel2:rgba(25,35,50,.82);
+    --panel3:rgba(32,45,64,.86); --line:rgba(148,177,215,.14);
+    --fg:#eaf1fb; --dim:#94a6bd; --accent:#5aa2ff; --ok:#46d17a;
+    --warn:#f0b84b; --bad:#ff6b6b; --radius:14px;
+  }
+  body{
+    background:
+      radial-gradient(900px 620px at 8% -12%,rgba(79,156,249,.20),transparent 62%),
+      radial-gradient(760px 520px at 102% -6%,rgba(124,108,255,.16),transparent 60%),
+      linear-gradient(180deg,#0b1018 0%,#090d14 55%,#080b11 100%);
+    background-attachment:fixed;
+  }
+  header{
+    background:rgba(13,20,30,.72);backdrop-filter:blur(18px);-webkit-backdrop-filter:blur(18px);
+    border-bottom:1px solid rgba(255,255,255,.07);
+  }
+  header h1{letter-spacing:.2px}
+  .card{
+    background:linear-gradient(180deg,rgba(25,35,50,.88),rgba(15,22,33,.92));
+    border:1px solid rgba(255,255,255,.075);border-radius:16px;
+    box-shadow:0 16px 44px rgba(0,0,0,.22),inset 0 1px 0 rgba(255,255,255,.035);
+  }
+  .card>h2{color:#a8b9d0;letter-spacing:1.1px}
+  button{border-radius:9px;border-color:rgba(255,255,255,.10);background:rgba(31,43,61,.72)}
+  button:hover:not(:disabled){border-color:rgba(90,162,255,.7);background:rgba(42,58,82,.82);transform:translateY(-1px)}
+  button.primary{
+    background:linear-gradient(135deg,#4f9cf9 0%,#7c6cff 100%);
+    border:0;color:#fff;box-shadow:0 5px 18px rgba(79,156,249,.28);
+  }
+  button.primary:hover:not(:disabled){filter:brightness(1.08);transform:translateY(-1px)}
+  input,select{background:rgba(8,13,21,.72);border-color:rgba(255,255,255,.10)}
+  input:focus,select:focus{box-shadow:0 0 0 3px rgba(90,162,255,.14)}
+  #tabs{
+    background:rgba(17,25,37,.72);backdrop-filter:blur(16px);-webkit-backdrop-filter:blur(16px);
+    border:1px solid rgba(255,255,255,.075);border-radius:16px;
+    box-shadow:0 14px 38px rgba(0,0,0,.18);
+  }
+  #tabs .tab{border-radius:10px}
+  #tabs .tab.active{
+    background:linear-gradient(135deg,rgba(79,156,249,.24),rgba(124,108,255,.18));
+    border-color:rgba(90,162,255,.5);box-shadow:0 4px 16px rgba(79,156,249,.12);
+  }
+  .up,.mcard,.gstat,.ovc,.ck-row{
+    background:linear-gradient(180deg,rgba(27,39,56,.82),rgba(18,27,41,.9));
+    border-color:rgba(255,255,255,.075);box-shadow:inset 0 1px 0 rgba(255,255,255,.03);
+  }
+  .up:hover,.mcard:hover{border-color:rgba(90,162,255,.5)}
+  .badge{background:rgba(9,14,22,.62);border-color:rgba(255,255,255,.10)}
+  .toast div{background:rgba(25,36,52,.94);backdrop-filter:blur(14px);border-radius:10px}
+  ::-webkit-scrollbar{width:10px;height:10px}
+  ::-webkit-scrollbar-track{background:transparent}
+  ::-webkit-scrollbar-thumb{background:rgba(148,177,215,.18);border-radius:8px;border:2px solid transparent;background-clip:content-box}
+  ::-webkit-scrollbar-thumb:hover{background:rgba(148,177,215,.32);background-clip:content-box}
+
+  /* ================= 无边框窗口的自定义标题栏 ================= */
+  #nativeTitlebar{
+    display:flex;align-items:center;height:38px;padding:0 8px 0 12px;
+    width:100vw;max-width:100vw;box-sizing:border-box;
+    background:linear-gradient(180deg,rgba(16,24,37,.96),rgba(12,19,29,.94));
+    border-bottom:1px solid rgba(255,255,255,.075);
+    position:sticky;top:0;z-index:120;user-select:none;
+    -webkit-app-region:drag;
+  }
+  #nativeTitlebar .tb-brand{display:flex;align-items:center;gap:9px;min-width:0}
+  #nativeTitlebar .tb-logo{
+    width:20px;height:20px;border-radius:6px;display:flex;align-items:center;justify-content:center;
+    background:linear-gradient(135deg,#4f9cff,#7c6cff);color:#fff;font-size:10px;font-weight:800;
+  }
+  #nativeTitlebar .tb-title{font-size:12.5px;font-weight:650;letter-spacing:.2px;color:#e6eefb}
+  #nativeTitlebar .tb-ver{font-size:10.5px;color:#7d8da3}
+  #nativeTitlebar .tb-drag{flex:1;height:100%}
+  #nativeTitlebar .tb-actions{display:flex;align-items:center;gap:2px;-webkit-app-region:no-drag;
+    position:fixed;right:8px;top:5px;z-index:130}
+  #nativeTitlebar .tb-btn{
+    width:38px;height:28px;padding:0;border:0;border-radius:7px;background:transparent;
+    color:#a9b8cb;font-size:15px;line-height:1;display:flex;align-items:center;justify-content:center;
+  }
+  #nativeTitlebar .tb-btn:hover{background:rgba(255,255,255,.09);color:#fff;transform:none}
+  #nativeTitlebar .tb-close:hover{background:#e5484d;color:#fff}
+  body.native-frame header{top:38px}
+  body.native-frame #nativeTitlebar{display:flex}
 </style>
 </head>
 <body>
+
+<div id="nativeTitlebar" hidden>
+  <div class="tb-brand">
+    <span class="tb-logo">LR</span>
+    <span class="tb-title">llm-router</span>
+    <span class="tb-ver" id="tbVer"></span>
+  </div>
+  <div class="tb-drag"></div>
+  <div class="tb-actions">
+    <button class="tb-btn" id="tbMin" title="最小化" aria-label="最小化">—</button>
+    <button class="tb-btn" id="tbMax" title="最大化 / 还原" aria-label="最大化">□</button>
+    <button class="tb-btn tb-close" id="tbClose" title="关闭" aria-label="关闭">×</button>
+  </div>
+</div>
 
 <header>
   <span class="dot" id="health"></span>
@@ -3513,8 +3613,42 @@ function setTab(name) {
 // tab 栏要粘在 header 底下，而 header 窄屏会换行，高度得实测
 function syncTabsTop() {
   const h = document.querySelector("header");
-  if (h) $("#tabs").style.top = (h.offsetHeight + 12) + "px";
+  if (h) $("#tabs").style.top = (h.offsetHeight + 12 + (document.body.classList.contains("native-frame") ? 38 : 0)) + "px";
 }
+
+/* ================= 无边框窗口：自定义标题栏 ================= */
+async function loadWindowChrome() {
+  const bar = $("#nativeTitlebar");
+  if (!bar) return;
+  // 只有 Tauri 桌面壳跳转过来时带 ?native=1；普通浏览器/手机访问不显示伪标题栏
+  if (new URLSearchParams(location.search).get("native") !== "1") {
+    bar.hidden = true;
+    return;
+  }
+  try {
+    const r = await api("/admin/window", undefined, "GET");
+    if (!r.native) return;
+    document.body.classList.add("native-frame");
+    bar.hidden = false;
+    const v = $("#tbVer");
+    if (v && state && state.version) v.textContent = "v" + state.version;
+    syncTabsTop();
+  } catch (e) { /* Python 版/普通浏览器：不显示自定义标题栏 */ }
+}
+
+function windowCommand(path) {
+  api(path, {}, "POST").catch(() => {});
+}
+
+$("#tbMin").onclick = () => windowCommand("/admin/window/minimize");
+$("#tbMax").onclick = () => windowCommand("/admin/window/toggle-maximize");
+$("#tbClose").onclick = () => windowCommand("/admin/window/close");
+$("#nativeTitlebar").addEventListener("mousedown", e => {
+  if (e.button === 0 && !e.target.closest("button")) windowCommand("/admin/window/drag");
+});
+$("#nativeTitlebar").addEventListener("dblclick", e => {
+  if (!e.target.closest("button")) windowCommand("/admin/window/toggle-maximize");
+});
 
 // tab 上的小数字：请求条数 / 上游个数 / 已配置路由数
 function setTabNum(tab, n, bad, title) {
@@ -3894,6 +4028,8 @@ async function refresh() {
       return;
     }
     pageVersion = state.version;
+    const tbVer = $("#tbVer");
+    if (tbVer) tbVer.textContent = "v" + state.version;
     $("#health").className = "dot on";
     $("#ver").textContent = "v" + state.version;
     $("#baseUrl").textContent = serverUrl + "/v1";
@@ -4495,6 +4631,7 @@ $("#ckAutoSave").onclick = saveCkSettings;
   let saved = null;
   try { saved = localStorage.getItem("llm-router-tab"); } catch (e) {}
   setTab(saved || "req");
+  await loadWindowChrome();
   syncTabsTop();
   await refresh();
   setInterval(refresh, 2500);

@@ -159,10 +159,11 @@ pub struct AppState {
     pub rr: Mutex<HashMap<String, usize>>,
     pub checkin_plan: Mutex<Option<(String, i64)>>,
     pub checkin_last_day: Mutex<String>,
+    pub app: Mutex<Option<tauri::AppHandle>>,
 }
 
 impl AppState {
-    pub fn new(state_path: PathBuf) -> Self {
+    pub fn new(state_path: PathBuf, app: Option<tauri::AppHandle>) -> Self {
         let mut file = StateFile::default();
         if let Ok(text) = std::fs::read_to_string(&state_path) {
             if let Ok(parsed) = serde_json::from_str::<StateFile>(&text) {
@@ -182,6 +183,7 @@ impl AppState {
             rr: Mutex::new(HashMap::new()),
             checkin_plan: Mutex::new(None),
             checkin_last_day: Mutex::new(String::new()),
+            app: Mutex::new(app),
         }
     }
 

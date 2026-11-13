@@ -95,7 +95,7 @@
     try {
       await api.invoke('start_backend');
       setStatus('就绪，正在打开控制台…');
-      setTimeout(() => location.replace(info.server_url + '/'), 150);
+      setTimeout(() => location.replace(info.server_url + '/?native=1'), 150);
     } catch (e) {
       setStatus('本地服务启动失败', true);
       sub.textContent = '可以重试，或手动填写一个已运行的服务地址';

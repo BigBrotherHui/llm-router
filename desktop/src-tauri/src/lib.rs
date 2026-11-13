@@ -81,9 +81,16 @@ pub fn run() {
                             .join(".llmrouter")
                             .join("config.state.json")
                     });
-                let state = Arc::new(native::state::AppState::new(state_path));
+                let state = Arc::new(native::state::AppState::new(state_path, Some(app.handle().clone())));
                 app.manage(state.clone());
                 native::scheduler::spawn(state.clone());
+                // 端口上已有 Python 版/另一个实例时，窗口没有自有标题栏可依赖，
+                // 退回系统标题栏，保证还能拖动/关闭。
+                if port_open(port) {
+                    if let Some(window) = app.get_webview_window("main") {
+                        let _ = window.set_decorations(true);
+                    }
+                }
                 tauri::async_runtime::spawn(async move {
                     if let Err(e) = native::serve(state, port).await {
                         eprintln!("[native] {e}");
