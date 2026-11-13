@@ -1329,3 +1329,87 @@ Key 47 / 模型路由 23 条 / 勾选 64 个模型；`migrate.py list` 读 zip �
 `router.py --check` 全过，导入后核对 state 与源机器逐项一致（41/40/47/23、Key 前缀对得上）。
 `import --dry-run` 只打印不动文件；`export --no-secrets` 的包直接 import 会被拦下并提示
 `--allow-masked`。细节写在 `DEPLOY.md`。
+
+
+## 2026-11-04 v2.10.0：上游可选接口类型（chat / responses）
+
+起因：一个上游只开了 Responses API，给 gpt-6.1-sol 发 `/v1/chat/completions` 回
+
+    模型 gpt-6.1-sol 不支持 /v1/chat/completions 接口，请改用 /v1/responses（OpenAI Responses API）
+
+在这之前这类拒绝只能靠 `UPSTREAM_CAPABILITY_MARKERS`（"requires responses for tool calls"）
+当上游故障换下一家绕开 —— 只有这一家时就是死路。用户问的正是「能不能给上游配 chat 还是
+response」，答案原来是不能，现在能了。
+
+**改动**
+
+- `Upstream.api_mode`：`chat`（默认）/ `responses`。认 `api_mode` / `api` / `protocol` /
+  `wire_api` 四个字段名（`API_MODE_ALIASES` 里还有 chat_completions / openai_responses 这类
+  写法）。默认 chat 时 `state()` 一个字节都不写，老状态文件不受影响。
+- 编辑弹窗加「接口类型」下拉；卡片在 responses 时挂一个 `Responses 接口` 徽标；
+  `snapshot()` 带 `api_mode` + `api_mode_label`。
+- 转换层（模块级，放在 Anthropic 适配段之前）：
+  - `chat_to_responses(payload)`：`system/developer` → `instructions`；其余消息 → `input`
+    项（`message` / `function_call` / `function_call_output`，tool 的 call_id 必须原样带，
+    否则上游回「No tool call found for function call output」）；`tools` 从 `function.*`
+    提到顶层；`tool_choice` → `{type,name}`；`max_tokens|max_completion_tokens` →
+    `max_output_tokens`；`response_format` → `text.format`。**不认识的 chat 参数直接丢**
+    （n / stop / stream_options / presence_penalty…），Responses 对未知参数是硬 400。
+    纯文字的 content 退回字符串，只有真带图才用 `input_image` parts。
+  - `responses_to_chat_response()`：`output[]` 里 `message` / `function_call` / `reasoning`
+    → `choices[0].message`（含 `tool_calls` 与 `reasoning_content`），`usage.input_tokens`
+    折算回 `prompt_tokens`。
+  - `ResponsesStreamConverter`：`response.output_text.delta` → `content`；
+    `response.function_call_arguments.delta` → `delta.tool_calls[index].function.arguments`；
+    `response.reasoning_summary_text.delta` → `reasoning_content`（两种 reasoning 事件
+    只认先出现的那个，免得重复）；`response.completed` 收 usage + finish_reason；
+    收尾补 usage 空 choices 块 + `data: [DONE]`。同一个类还能 `completion()` 拼回非流式
+    响应，给「仅流式模型 + 客户端要非流式」那条路用。
+- 转发：`_try_upstream` 里 `to_responses = up.uses_responses() and not client_responses`：
+  路径换 `/responses`、请求体整体转一次；响应侧流式走新的 `_relay_responses()`
+  （`aggregate=True` 时先收完再拼 JSON），非流式先 `responses_to_chat_response()` 再做
+  「模型名改写 / Anthropic 转换」。客户端自己打 `/v1/responses` 时是纯透传。
+- `ping()` / `detailed_test()` 在 responses 上游也走新接口：测速把流式结果先转成 chat
+  chunk 再复用原来的判定；详细测试把 responses 流整条收完转成 chat SSE 后用 `io.BytesIO`
+  喂给原来那套解析循环（`conn.sock` 改成 getattr，假 reader 没有 sock）。
+- 400 能力限制那条路多打一行日志：提示「把这个上游的接口类型改成 responses 就能直接用」，
+  而不是只报上游 400。
+
+**测试**：假上游加 `_responses_reply()`（收到 `messages` / `max_tokens` / `stream_options`
+就按真实上游的规矩 400），selftest 新增第 37 节 20 项：请求体形状、system→instructions、
+usage 折算、流式 chunk + [DONE] + usage、tools/tool_choice 转换、tool_calls 回转、
+`/v1/responses` 透传、改回 chat 后行为复原。**561/561 全过**。
+
+
+
+**后续修复（同日）**：第一版跑真实上游立刻踩到 —— agentrouter 的 gpt-6.1-sol 回
+
+    Invalid 'max_output_tokens': integer below minimum value.
+    Expected a value >= 16, but got 1 instead.
+
+原因是**测速探针**用的是 `max_tokens: 1`（chat 完全合法），转成 `max_output_tokens`
+就低于 Responses 的下限 16。加 `RESPONSES_MIN_OUTPUT_TOKENS = 16` +
+`_responses_max_output()`，两处（chat→responses、以及客户端本来就是 responses 形状那条透传路）
+都统一抬到下限。假上游同步加了这道校验（`_responses_reply` 收到 <16 直接 400），
+selftest 补两项「responses 上游测速通过 / 探针 max_output_tokens ≥ 16」。**565/565 全过**。
+
+**第二个坑（同日）**：正式请求（长上下文 + 中文 + 流式）回
+
+    上游流式返回错误: 上游返回非 SSE 的二进制数据（疑似网关错误页/压缩内容）
+
+但测速是通的。原因是 `looks_like_binary_stream()` 的误判：分片边界切在汉字中间时
+`chunk.decode("utf-8")` 抛 `UnicodeDecodeError`，而那块恰好是某行 JSON 的中段、
+不含 `data:` 前缀 —— 旧逻辑「解不开 + 没有 data:」就判成二进制，把一条 27 秒的
+正常输出整条掐掉（`agentrouter` 的 gpt-6.1-sol 实测）。
+
+改法：判二进制只认**确凿证据**——
+1. `1f 8b`（gzip magic）；
+2. 或「有 SSE/JSON 结构痕迹（引号 / `{` / `data:` / `event:`）」**且** `_utf8_splittable()`
+   也救不回来。`_utf8_splittable()` 只承认两种切断形状：尾部少 1–3 字节且缺的正好是
+   一个多字节字符的前缀（`_is_utf8_prefix`），或开头是 1–3 个 `0x80–0xBF` 续字节。
+
+对照 12 种输入（切断的两种形状 / gzip / GBK 错误页 / 随机高位字节 / PNG 头 /
+HTML 错误页 / 裸 JSON 错误 / heartbeat）：**只有那两种切断形状的判定从 True 变 False，
+其余一字不改** —— 不是放宽，是纠错。另把判二进制时的错误文案带上「首 32 字节(hex)」，
+下次再遇到能直接看出是 gzip 还是别的。selftest 加 `utf8_split` 假上游行为 +
+两项回归（responses 流 / chat 流各一），**567/567 全过**。

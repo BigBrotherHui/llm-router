@@ -110,6 +110,33 @@ id = "u3"
 base_url = "https://ark.cn-beijing.volces.com/api/v3"
 api_key = "你的火山key"
 
+# ---------------------------------------------------------------------------
+# 接口类型（api_mode）：这个上游认哪一套 OpenAI 接口
+#
+#   chat        → /v1/chat/completions（默认，不写就是这个）
+#   responses   → /v1/responses（OpenAI Responses API）
+#
+# 有的上游/中转只开了一套。典型报错：
+#   「模型 gpt-6.1-sol 不支持 /v1/chat/completions 接口，
+#     请改用 /v1/responses（OpenAI Responses API）」
+# 遇到这种就把那个上游的 api_mode 改成 responses：
+#   · 客户端**不用改**，照旧调 /v1/chat/completions
+#   · 代理负责三个方向的转换：请求体（messages→input、
+#     tools/tool_choice/max_tokens 换名）、非流式响应（output[]→choices）、
+#     流式事件（response.output_text.delta→chat.completion.chunk）
+#   · 测速、详细测试也跟着走 /v1/responses，卡片不会因此变红
+#
+# 客户端自己就在用 /v1/responses 时是纯透传，不做转换。
+# ---------------------------------------------------------------------------
+
+# [[upstreams]]
+# name = "只开 Responses 的中转"
+# id = "u7"
+# base_url = "https://api.example.com/v1"
+# api_key = "sk-..."
+# api_mode = "responses"
+
+
 # --- 本地 Ollama（不需要 Key，随便填一个占位）---
 # [[upstreams]]
 # name = "本地 Ollama"

@@ -834,6 +834,15 @@
         <input type="number" min="0" step="1" id="eTimeout" placeholder="默认15" style="max-width:140px">
       </div>
       <div class="grid" style="gap:5px">
+        <span class="hint">接口类型（这个上游认哪一套 OpenAI 接口。<b>只支持 /v1/responses 的上游</b>选 Responses ——
+          比如给 gpt-6.1-sol 发 /v1/chat/completions 会被拒、提示「请改用 /v1/responses」；
+          选好之后客户端照旧说 chat/completions，请求体 / 响应体 / 流式事件都由代理转换）</span>
+        <select id="eApiMode" style="font-size:13px;max-width:420px">
+          <option value="chat">Chat Completions（/v1/chat/completions，默认）</option>
+          <option value="responses">Responses（/v1/responses）</option>
+        </select>
+      </div>
+      <div class="grid" style="gap:5px">
         <span class="hint">仅流式模型（逗号分隔；这些模型只认 stream=true，非流式请求会被上游网关直接 502。
           填了之后代理会自动改发流式、收完再拼成普通 JSON 返回，测速和详细测试也一并走流式。留空 = 全部按原样发）</span>
         <input type="text" id="eStreamOnly" placeholder="例如：deepseek-v4.1-flash, some-model" style="max-width:420px">
@@ -1228,6 +1237,9 @@ function renderUpstreams() {
           : `<span class="badge bad">已停用</span>`}
         ${keyBadge(u)}
         ${netExitBadge(u)}
+        ${u.api_mode === "responses"
+          ? `<span class="badge blue" title="这个上游走 /v1/responses：请求体、响应体、流式事件都由代理转换">Responses 接口</span>`
+          : ""}
         ${nAvail
           ? `<span class="badge ${nSel ? "blue" : "warn"}">已选用 ${nSel} / ${nAvail} 个模型</span>`
           : `<span class="badge warn">还没拉取模型</span>`}
@@ -2663,6 +2675,8 @@ function editUpstream(id) {
   $("#eKeyStrategy").value = u.key_strategy || "failover";
   $("#eEnabled").checked = u.enabled;
   $("#eTimeout").value = u.first_timeout_seconds || "";
+  // 接口类型：默认 chat（老上游没有这个字段）
+  $("#eApiMode").value = u.api_mode || "chat";
   // 仅流式模型：有就按逗号铺开显示，没有就是空（留空 = 全按原样发）
   $("#eStreamOnly").value = (u.stream_only_models || []).join(", ");
   $("#eStatus").textContent = "";
@@ -2746,6 +2760,8 @@ async function saveUpstreamEdit() {
     enabled: $("#eEnabled").checked,
     first_timeout_seconds: capNum($("#eTimeout")),
     user_agent: $("#eUA").value.trim(),
+    // 接口类型：chat = /v1/chat/completions，responses = /v1/responses
+    api_mode: $("#eApiMode").value || "chat",
     api_keys: keys,
     key_strategy: $("#eKeyStrategy").value || "failover",
     // 出口：直连 / 规则 / 强制代理 / 跟随全局；proxy_url 留空 = 用全局端口

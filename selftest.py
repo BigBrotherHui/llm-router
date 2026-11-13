@@ -139,6 +139,110 @@ class UpstreamServer(BaseHTTPRequestHandler):
                 {"id": m, "object": "model"} for m in UP_MODELS[self.tag]]})
         return self._json(404, {"error": {"message": "unknown"}})
 
+    def _responses_reply(self, body: dict) -> None:
+        """模拟「只认 /v1/responses 的上游」。
+
+        真实上游对 chat 参数是直接 400 的（Unrecognized request argument），
+        所以这里也照那个规矩来 —— 请求体没转干净就立刻红，光看文本会漏。
+        """
+        banned = [k for k in ("messages", "max_tokens", "stream_options", "stop", "n")
+                  if k in body]
+        if banned:
+            return self._json(400, {"error": {
+                "message": f"Unrecognized request argument supplied: {banned[0]}",
+                "type": "invalid_request_error"}})
+        if not body.get("model"):
+            return self._json(400, {"error": {
+                "message": "Missing required parameter: 'model'",
+                "type": "invalid_request_error"}})
+        # 真实上游实测：max_output_tokens < 16 会被拒
+        # （agentrouter 的 gpt-6.1-sol：Expected a value >= 16, but got 1 instead）
+        # 测速探针写的是 max_tokens=1，转换时必须抬到下限，这里就是那道关。
+        mot = body.get("max_output_tokens")
+        if isinstance(mot, int) and mot < 16:
+            return self._json(400, {"error": {
+                "message": (f"Invalid 'max_output_tokens': integer below minimum value. "
+                            f"Expected a value >= 16, but got {mot} instead."),
+                "type": "invalid_request_error"}})
+        model = body["model"]
+        rid = "resp_selftest"
+        usage = {"input_tokens": 100, "output_tokens": 20, "total_tokens": 120,
+                 "input_tokens_details": {"cached_tokens": 64}}
+        tool_choice = body.get("tool_choice")
+        call_name = ""
+        if isinstance(tool_choice, dict) and tool_choice.get("name"):
+            call_name = str(tool_choice.get("name"))
+        elif isinstance(tool_choice, dict) and isinstance(tool_choice.get("function"), dict):
+            call_name = str((tool_choice.get("function") or {}).get("name") or "")
+
+        def ev(obj: dict) -> None:
+            data = json.dumps(obj, ensure_ascii=False)
+            self._write_chunk(f"event: {obj.get('type')}\ndata: {data}\n\n".encode())
+
+        if body.get("stream"):
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream")
+            self.send_header("Transfer-Encoding", "chunked")
+            self.end_headers()
+            with lock:
+                split = behavior[self.tag] == "utf8_split"
+            ev({"type": "response.created",
+                "response": {"id": rid, "model": model, "created_at": int(time.time())}})
+            if split:
+                # 分片边界正好切在一个汉字中间，且后一块不含 data:/event: 前缀
+                # —— agentrouter 的 gpt-6.1-sol 输出中文时的真实形状，
+                # 旧判定会把它误当成「网关错误页 / 压缩内容」把整条流掐掉。
+                raw = (b"event: response.output_text.delta\ndata: " +
+                       json.dumps({"type": "response.output_text.delta",
+                                   "delta": "中文内容"},
+                                  ensure_ascii=False).encode("utf-8") + b"\n\n")
+                cut = raw.find("中".encode("utf-8")) + 1
+                self._write_chunk(raw[:cut])
+                time.sleep(0.2)
+                self._write_chunk(raw[cut:])
+                time.sleep(0.2)
+                ev({"type": "response.completed", "response": {
+                    "id": rid, "status": "completed", "usage": usage,
+                    "output": [{"type": "message", "role": "assistant",
+                                "content": [{"type": "output_text",
+                                             "text": "中文内容"}]}]}})
+                self.wfile.write(b"0\r\n\r\n")
+                self.wfile.flush()
+                return
+            if call_name:
+                ev({"type": "response.output_item.added", "output_index": 0,
+                    "item": {"type": "function_call", "id": "fc_1",
+                             "call_id": "call_resp", "name": call_name, "arguments": ""}})
+                ev({"type": "response.function_call_arguments.delta", "item_id": "fc_1",
+                    "delta": '{"value":"OK"}'})
+                ev({"type": "response.completed", "response": {
+                    "id": rid, "status": "completed", "usage": usage,
+                    "output": [{"type": "function_call", "id": "fc_1",
+                                "call_id": "call_resp", "name": call_name,
+                                "arguments": '{"value":"OK"}'}]}})
+            else:
+                for i in range(3):
+                    ev({"type": "response.output_text.delta", "delta": f"{self.tag}{i}"})
+                ev({"type": "response.completed", "response": {
+                    "id": rid, "status": "completed", "usage": usage,
+                    "output": [{"type": "message", "role": "assistant",
+                                "content": [{"type": "output_text",
+                                             "text": f"{self.tag}0{self.tag}1{self.tag}2"}]}]}})
+            self.wfile.write(b"0\r\n\r\n")
+            self.wfile.flush()
+            return
+
+        if call_name:
+            output = [{"type": "function_call", "id": "fc_1", "call_id": "call_resp",
+                       "name": call_name, "arguments": '{"value":"OK"}'}]
+        else:
+            output = [{"type": "message", "role": "assistant",
+                       "content": [{"type": "output_text",
+                                    "text": f"hi from {self.tag} (responses)"}]}]
+        self._json(200, {"id": rid, "object": "response",
+                         "created_at": int(time.time()), "model": model,
+                         "status": "completed", "output": output, "usage": usage})
+
     def do_POST(self):
         if not self._path_ok():
             return self._json(404, {"error": {"message": "404 page not found"}})
@@ -248,6 +352,11 @@ class UpstreamServer(BaseHTTPRequestHandler):
             self.wfile.write(payload)
             return
 
+        # 这条上游只认 Responses API（有的中转给 gpt-6.1-sol 只开这一套）。
+        # 请求/响应/流式三样都得转，缺一样客户端就解析失败。
+        if urllib.parse.urlsplit(self.path).path.endswith("/responses"):
+            return self._responses_reply(body)
+
         # 流式有两条触发路径：
         #   1) 路径以 /stream 结尾（老测试用，模拟 OpenAI 的流式端点）
         #   2) 请求体里 stream=true（真实厂商的行为，也是 Anthropic 适配那条路 ——
@@ -266,6 +375,21 @@ class UpstreamServer(BaseHTTPRequestHandler):
                                            "this account only supports Chat Completions",
                                 "type": "invalid_request_error"}}
                 self._write_chunk((json.dumps(ev) + "\n\n").encode())
+                self.wfile.write(b"0\r\n\r\n")
+                self.wfile.flush()
+                return
+            if behave == "utf8_split":
+                # 分片边界切在汉字中间、后一块没有 data: 前缀（中文输出的真实形状）
+                ev = json.dumps({"model": model,
+                                 "choices": [{"delta": {"content": "中文内容"}}]},
+                                ensure_ascii=False).encode("utf-8")
+                line = b"data: " + ev + b"\n\n"
+                cut = line.find("中".encode("utf-8")) + 1
+                self._write_chunk(line[:cut])
+                time.sleep(0.2)
+                self._write_chunk(line[cut:])
+                time.sleep(0.2)
+                self._write_chunk(b"data: [DONE]\n\n")
                 self.wfile.write(b"0\r\n\r\n")
                 self.wfile.flush()
                 return
@@ -3459,6 +3583,150 @@ def main():
               (snap.get("defaults") or {}).get("first_timeout_seconds") == 2
               and (snap.get("defaults") or {}).get("connect_timeout_seconds") == 5,
               str(snap.get("defaults")))
+    finally:
+        stop_router(p)
+
+    # ================= 37. 上游只认 /v1/responses（Responses API）=================
+    # 有的上游/中转只开了一套接口：给 gpt-6.1-sol 发 /v1/chat/completions 会被
+    # 400 拒掉（「请改用 /v1/responses」）。配成 api_mode=responses 后，
+    # 客户端照旧说 chat/completions —— 请求体、响应体、流式事件三样都由代理转。
+    print("\n[37] 上游只认 /v1/responses（请求/响应/流式三样都转）")
+    cleanup()
+    cfg = write_config(with_routes=True)      # b1 提供 qwen-max（只有它有）
+    p = start_router(cfg)
+    try:
+        st, r = admin("/admin/select-models",
+                      {"id": "b1", "models": ["qwen-max", "deepseek-chat"]})
+        check("给 b1 勾上模型", st == 200, f"{st} {str(r)[:120]}")
+        st, r = admin("/admin/model/save", {"name": "qwen-max", "strategy": "priority",
+                                            "entries": [{"upstream": "b1",
+                                                         "model": "qwen-max"}]})
+        check("qwen-max 路由指到 b1", st == 200, f"{st} {str(r)[:150]}")
+
+        st, r = admin("/admin/upstream/update", {"id": "b1", "api_mode": "responses"})
+        check("接口类型能存成 responses", st == 200, f"{st} {str(r)[:150]}")
+        _, snap = get("/stats")
+        b1 = next(u for u in snap["upstreams"] if u["id"] == "b1")
+        check("stats 里能看到 api_mode",
+              b1.get("api_mode") == "responses" and "Responses" in str(b1.get("api_mode_label")),
+              f'{b1.get("api_mode")} / {b1.get("api_mode_label")}')
+
+        reset_hits()
+        st, body, hdr = post(body={"model": "qwen-max",
+                                   "messages": [{"role": "system", "content": "be brief"},
+                                                {"role": "user", "content": "hi"}],
+                                   "max_tokens": 64})
+        check("chat 请求打到 responses 上游也成功", st == 200, f"{st} {body[:150]}")
+        check("客户端拿到的还是 chat.completion",
+              json.loads(body)["choices"][0]["message"]["content"]
+              == "hi from b (responses)", str(body[:200]))
+        sent = bodies["b"][-1] if bodies["b"] else {}
+        check("请求体已转成 Responses 形状",
+              "input" in sent and "messages" not in sent
+              and "max_output_tokens" in sent and "max_tokens" not in sent, str(sent)[:260])
+        check("system 转成 instructions", sent.get("instructions") == "be brief", str(sent)[:200])
+        check("响应里的 usage 折算回 chat 字段",
+              json.loads(body)["usage"]["prompt_tokens"] == 100, str(body)[-200:])
+
+        # 流式：Responses 事件 → chat.completion.chunk
+        reset_hits()
+        st, body, hdr = post(body={"model": "qwen-max", "stream": True,
+                                   "messages": [{"role": "user", "content": "hi"}]})
+        text = body.decode("utf-8", "replace")
+        check("流式请求成功", st == 200, str(st))
+        check("客户端收到的是 chat 的 chunk",
+              "chat.completion.chunk" in text and '"content":"b0"' in text, text[:200])
+        check("流以 [DONE] 收尾", text.rstrip().endswith("[DONE]"), text[-80:])
+        check("流式 usage 也带回来了", '"prompt_tokens":100' in text, text[-300:])
+
+        # 工具调用：chat 的 tools/tool_choice → Responses，function_call → tool_calls
+        reset_hits()
+        st, body, hdr = post(body={
+            "model": "qwen-max", "stream": True,
+            "messages": [{"role": "user", "content": "call it"}],
+            "tools": [{"type": "function", "function": {
+                "name": "diagnostic_echo", "description": "d",
+                "parameters": {"type": "object", "properties": {"value": {"type": "string"}}}}}],
+            "tool_choice": {"type": "function", "function": {"name": "diagnostic_echo"}}})
+        text = body.decode("utf-8", "replace")
+        sent = bodies["b"][-1] if bodies["b"] else {}
+        check("tools 提到顶层并保留 parameters",
+              isinstance(sent.get("tools"), list) and sent["tools"][0].get("name")
+              == "diagnostic_echo" and "parameters" in sent["tools"][0], str(sent.get("tools"))[:200])
+        check("tool_choice 转成 {type,name}",
+              sent.get("tool_choice") == {"type": "function", "name": "diagnostic_echo"},
+              str(sent.get("tool_choice")))
+        check("function_call 转回 chat 的 tool_calls",
+              '"tool_calls"' in text and "diagnostic_echo" in text
+              and '"arguments":"{\\"value\\":\\"OK\\"}"' in text, text[:400])
+
+        # 测速探针用的是 max_tokens=1，Responses 的下限是 16 —— 不抬上去，
+# 一次测速就会把这家标成「不可用」（agentrouter 的 gpt-6.1-sol 实测）。
+        st, r = admin("/admin/speedtest", {"tests": [{"id": "b1", "model": "qwen-max"}]})
+        one = (r.get("results") or [{}])[0]
+        check("responses 上游测速通过（探针参数合法）", one.get("ok") is True, str(one)[:240])
+        sent = bodies["b"][-1] if bodies["b"] else {}
+        check("探针的 max_output_tokens 不低于 16",
+              sent.get("max_output_tokens") is None or sent["max_output_tokens"] >= 16,
+              str(sent.get("max_output_tokens")))
+
+        # 仅流式模型 + responses 上游 + 客户端要非流式：先收完整条流再拼回 JSON
+        admin("/admin/upstream/update", {"id": "b1", "api_mode": "responses",
+                                         "stream_only_models": ["qwen-max"]})
+        reset_hits()
+        st, body, hdr = post(body={"model": "qwen-max",
+                                   "messages": [{"role": "user", "content": "hi"}]})
+        check("仅流式 + responses 也能拼回非流式 JSON",
+              st == 200 and b'"chat.completion"' in body and b"b0b1b2" in body,
+              f"{st} {body[:220]}")
+        sent = bodies["b"][-1] if bodies["b"] else {}
+        check("改发流式时发的是 responses 形状",
+              sent.get("stream") is True and "input" in sent, str(sent)[:200])
+        admin("/admin/upstream/update", {"id": "b1", "api_mode": "responses",
+                                        "stream_only_models": []})
+
+        # 分片边界切在汉字中间：不能误判成「二进制（网关错误页/压缩内容）」。
+        # agentrouter 的 gpt-6.1-sol 就是这么把一条 27 秒的正常流整条废掉的。
+        behavior["b"] = "utf8_split"
+        reset_hits()
+        st, body, hdr = post(body={"model": "qwen-max", "stream": True,
+                                   "messages": [{"role": "user", "content": "中文"}]})
+        text = body.decode("utf-8", "replace")
+        check("responses 流里 UTF-8 被切断不算二进制",
+              st == 200 and "中文内容" in text and "二进制" not in text,
+              f"{st} {text[:240]}")
+        behavior["b"] = "ok"
+
+        # 客户端本来就用 /v1/responses：原样透传，不做转换
+        reset_hits()
+        st, body, hdr = post("/v1/responses", body={
+            "model": "qwen-max", "input": "hi",
+            "instructions": "be brief"})
+        check("客户端直接用 /v1/responses 也通", st == 200, f"{st} {body[:150]}")
+        check("透传模式下响应保持 Responses 形状",
+              json.loads(body).get("object") == "response", str(body)[:200])
+
+        # 换回 chat 之后行为回到原样（api_mode 可逆）
+        st, r = admin("/admin/upstream/update", {"id": "b1", "api_mode": "chat"})
+        _, snap = get("/stats")
+        b1 = next(u for u in snap["upstreams"] if u["id"] == "b1")
+        check("接口类型能改回 chat", b1.get("api_mode") == "chat", str(b1.get("api_mode")))
+        reset_hits()
+        st, body, hdr = post(body={"model": "qwen-max",
+                                   "messages": [{"role": "user", "content": "hi"}]})
+        sent = bodies["b"][-1] if bodies["b"] else {}
+        check("改回 chat 后发的是 chat 请求体",
+              st == 200 and "messages" in sent and "input" not in sent, str(sent)[:200])
+
+        # 同一条误判也会掐 chat 的流（共用 looks_like_binary_stream）
+        behavior["b"] = "utf8_split"
+        reset_hits()
+        st, body, hdr = post(body={"model": "qwen-max", "stream": True,
+                                   "messages": [{"role": "user", "content": "中文"}]})
+        text = body.decode("utf-8", "replace")
+        check("chat 流里 UTF-8 被切断也不算二进制",
+              st == 200 and "中文内容" in text and "二进制" not in text, f"{st} {text[:240]}")
+        behavior["b"] = "ok"
     finally:
         stop_router(p)
 

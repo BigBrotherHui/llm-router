@@ -10,10 +10,13 @@ llm-router 的可选模块。刻意不 import router.py（避免循环依赖）�
     「个人设置 → 访问令牌」那个 token。两者不是一回事，所以签到页给每个上游
     单独存一个 access token，与上游卡片里的 API Key 各存各的。
 
-站点布局有两种（实测）
+站点布局有三种（实测）
     新版本：GET/POST /api/user/self/checkin
     老版本：GET/POST /api/user/checkin          （v1.0.0-rc.46 只有这个）
-    先试新的，404/405 就换老的，并把能用的那个记进配置，下次先问它。
+    sub2api 系（loxo.cc 这类中转）：GET/POST /api/v1/user/check-in
+        信封是 {code, message, data}，字段直接铺在 data 上（没有 stats 层）；
+        奖励本身就是美元（不按 quota_per_unit 换算）；重复签到回 409。
+    依次试，404/405 就换下一个，并把能用的那个记进配置，下次先问它。
 
 Cloudflare / Turnstile
     有些站点给签到挂了人机验证，访问令牌过不去，必须由浏览器完成。
@@ -40,8 +43,12 @@ __all__ = [
     "site_root", "probe", "press", "run_one", "describe",
 ]
 
-# 签到接口的两个候选路径：新的在前
-CHECKIN_PATHS = ("/api/user/self/checkin", "/api/user/checkin")
+# 签到接口的候选路径：新的在前。
+# 前两个是 New API / One API；第三个是 sub2api 系（loxo.cc 这类中转，挂在 /api/v1 下）。
+CHECKIN_PATHS = ("/api/user/self/checkin", "/api/user/checkin", "/api/v1/user/check-in")
+
+# 这些路径的站点签到奖励直接就是金额（美元），不再按 quota_per_unit 换算。
+CURRENCY_REWARD_PATHS = ("/api/v1/user/check-in",)
 
 DEFAULT_TIMEOUT = 15.0
 
@@ -228,14 +235,31 @@ def _parse_state(payload: dict) -> dict:
     records = stats.get("records")
     if not isinstance(records, list):
         records = data.get("records") if isinstance(data.get("records"), list) else []
+    if not records and isinstance(data.get("recent_records"), list):
+        records = data["recent_records"]        # sub2api 系（loxo）用这个名字
+
+    # sub2api 系没有 stats 这一层，字段直接铺在 data 上；两种布局都认。
+    checked = stats.get("checked_in_today")
+    if checked is None:
+        checked = data.get("checked_in_today")
+    min_quota = data.get("min_quota")
+    if min_quota is None:
+        min_quota = data.get("reward_min")
+    max_quota = data.get("max_quota")
+    if max_quota is None:
+        max_quota = data.get("reward_max")
+
     return {
         # 站点是否开启签到功能
         "enabled": data.get("enabled") is True,
-        "min_quota": _num(data.get("min_quota")),
-        "max_quota": _num(data.get("max_quota")),
-        "checked_in_today": stats.get("checked_in_today") is True,
-        "total_checkins": int(_num(stats.get("total_checkins") or stats.get("checkin_count"))),
+        "min_quota": _num(min_quota),
+        "max_quota": _num(max_quota),
+        "checked_in_today": checked is True,
+        "total_checkins": int(_num(stats.get("total_checkins")
+                                   or stats.get("checkin_count")
+                                   or data.get("total_checkins"))),
         "total_quota": _num(stats.get("total_quota")),
+        "streak_days": int(_num(data.get("streak_days"))),
         "records": records[:30],
     }
 
@@ -248,6 +272,7 @@ def _parse_press(payload: dict) -> tuple[bool, str, float, str]:
     success = (
         payload.get("success") is True
         or data.get("success") is True
+        or payload.get("code") == 0          # sub2api 系：code=0 即成功
         or str(payload.get("message") or "") == "success"
     )
     message = str(payload.get("message") or data.get("message") or "").strip()
@@ -382,6 +407,13 @@ def _walk(root: str, ck: dict, press_checkin: bool,
 
         if status >= 400:
             msg = str(payload.get("message") or "")[:200]
+            code = str(payload.get("code") or "")
+            # sub2api 系今天已经签过会回 409 + CHECK_IN_ALREADY_DONE；
+            # 这不算失败，按「已签到」处理。
+            if status == 409 or code == "CHECK_IN_ALREADY_DONE" \
+                    or "already" in msg.lower() or "已签到" in msg:
+                return _result("already", True, msg or "今天已经签过了",
+                               path=path, checked_in_today=True, status=status)
             last_error = _result("error", False,
                                  f"HTTP {status}：{msg or '站点拒绝请求'}", status=status)
             continue
@@ -485,7 +517,13 @@ def run_one(item: Any, press_checkin: bool = True,
     # 额度换算：只成功时才问，问不到就退回原始额度
     per_unit = _num(ck.get("quota_per_unit")) or None
     symbol = ""
-    if base_result.get("ok") and per_unit is None:
+    path_used = str(base_result.get("path") or ck.get("path") or "")
+    if path_used in CURRENCY_REWARD_PATHS:
+        # 这类站点（loxo/sub2api）奖励本身就是美元，不用除以 quota_per_unit
+        per_unit = 1.0
+        symbol = "$"
+        base_result["quota_per_unit"] = per_unit
+    elif base_result.get("ok") and per_unit is None:
         status_info = fetch_quota_per_unit(root, timeout=min(timeout, 8.0),
                                            proxy=proxy)
         if status_info:

@@ -23,6 +23,7 @@ import base64
 import collections
 import concurrent.futures
 import http.client
+import io
 import ipaddress
 import json
 import os
@@ -43,7 +44,7 @@ from typing import Any, Optional
 
 import checkin as checkin_mod
 
-__version__ = "2.9.1"
+__version__ = "2.10.0"
 
 WEBUI_FILENAME = "webui.html"
 
@@ -102,6 +103,13 @@ BODY_READ_TIMEOUT = 300.0
 UPSTREAM_CAPABILITY_MARKERS = (
     "requires responses for tool calls",
     "only supports chat completions",
+    # 「模型 gpt-6.1-sol 不支持 /v1/chat/completions 接口，请改用 /v1/responses」
+    # 这类是「接口类型选错了」，不是请求写错了 —— 把上游的 api_mode 改成
+    # responses 就通；没改之前当上游故障换下一家，别打死客户端。
+    "/v1/responses",
+    "responses api",
+    "不支持 /v1/chat/completions",
+    "不支持/v1/chat/completions",
     # sensenova 中转的 kimi-k3（2026-10-16 实见）：同一请求先被 429
     # 「inference exceeds tpm/rpm limit」拒，客户端自动重试立刻又收到 400
     # 「inference request is invalid / InvalidParameter」；同样大的请求随后实测正常，
@@ -493,10 +501,61 @@ def _parse_sse_lines(text: str, acc: dict) -> None:
                     acc["finish"] = fr
 
 
+def _utf8_splittable(chunk: bytes) -> bool:
+    """这段字节是不是「UTF-8 文本，只是首/尾被分片边界切断了」。
+
+    SSE 的一行可能被 TCP/read1 切成两半，而中文一个字占 3 字节 ——
+    切点落在字符中间时 `chunk.decode("utf-8")` 必然失败。
+    这里只接受两种「切断」形状，别的一律不算：
+      · 尾部少 1–3 个字节，缺的正好是一个多字节字符的前缀
+      · 开头是 1–3 个 0x80–0xBF 的续字节（上一块留下的半截）
+    """
+    if len(chunk) > 4:
+        for tail in range(1, 4):
+            body = chunk[: len(chunk) - tail]
+            if not body:
+                continue
+            try:
+                body.decode("utf-8")
+            except UnicodeDecodeError:
+                continue
+            if _is_utf8_prefix(chunk[len(body):]):
+                return True
+    for lead in range(1, 4):
+        if any(not (0x80 <= b <= 0xBF) for b in chunk[:lead]):
+            break
+        if lead >= len(chunk):
+            break
+        try:
+            chunk[lead:].decode("utf-8")
+            return True
+        except UnicodeDecodeError:
+            continue
+    return False
+
+
+def _is_utf8_prefix(rest: bytes) -> bool:
+    """这几个字节是不是一个多字节字符的**未完成**前缀（被切断的那种）。"""
+    if not rest:
+        return False
+    first = rest[0]
+    if 0xC2 <= first <= 0xDF:
+        need = 2
+    elif 0xE0 <= first <= 0xEF:
+        need = 3
+    elif 0xF0 <= first <= 0xF4:
+        need = 4
+    else:
+        return False
+    return len(rest) < need
+
+
 def looks_like_binary_stream(chunk: bytes) -> bool:
     """200 的流里出现「不是 SSE 文本」的二进制（网关错误页 / 压缩内容）。
 
-    分片边界可能切断多字节字符，所以只有在完全看不到 SSE 结构时才判为垃圾。
+    只有**确认是垃圾**时才判二进制。这条判定的误伤代价很高：一次误判会把一条
+    正常的流整条掐掉（实测：agentrouter 的 gpt-6.1-sol 输出中文，某个分片的边界
+    正好切在一个汉字中间、那块里又没有 `data:` 前缀 —— 27 秒的正常输出全废了）。
     """
     if chunk[:2] == b"\x1f\x8b":          # gzip magic：不可能是合法 SSE
         return True
@@ -507,8 +566,13 @@ def looks_like_binary_stream(chunk: bytes) -> bool:
         return False
     except UnicodeDecodeError:
         pass
-    head = chunk.lstrip()
-    return not (b"data:" in chunk or b"event:" in chunk or head.startswith(b":"))
+    # 解不开有两种可能：切断了多字节字符，或者真是二进制。两个条件同时满足才当文本：
+    #   ① 掐掉首/尾几个字节后能按 UTF-8 解开（见 _utf8_splittable）
+    #   ② 里面还留着 SSE/JSON 的结构痕迹
+    # 真二进制（gzip / PNG / GBK 错误页）即使偶然凑出一次成功解码，也不会带这些结构。
+    if not (b'"' in chunk or b"{" in chunk or b"data:" in chunk or b"event:" in chunk):
+        return True
+    return not _utf8_splittable(chunk)
 
 
 def stream_has_payload(chunk: bytes) -> bool:
@@ -878,6 +942,38 @@ def dial(host: str, port: int, timeout: float,
         except Exception:  # noqa: BLE001
             pass
         raise
+
+
+# 出口端口是否还在听。缓存 30 秒：端口状态不会秒级变化，但也不能永久缓存 ——
+# 用户可能刚在 Clash 里把监听器打开。
+_PROXY_ALIVE: dict[str, tuple[float, bool]] = {}
+_PROXY_ALIVE_TTL = 30.0
+
+
+def proxy_alive(spec: Optional[ProxySpec], timeout: float = 1.0) -> bool:
+    """这个出口端口现在能不能连上。
+
+    为什么要这个：出口端口是**外部**（Clash）提供的，用户在 Clash 里换订阅、
+    删监听器、关 TUN，这些端口就没了。如果代码死认配置里的端口，那 20 个
+    钉在它上面的上游会全部报错 —— 而它们在端口还在时本来是好的。
+    所以端口一死就退回「不显式用代理」，宁可走系统默认路径，也不要整片失败。
+    """
+    if spec is None:
+        return True
+    key = spec.label
+    now = time.monotonic()
+    hit = _PROXY_ALIVE.get(key)
+    if hit and now - hit[0] < _PROXY_ALIVE_TTL:
+        return hit[1]
+    alive = False
+    try:
+        sock = socket.create_connection((spec.host, spec.port), timeout=timeout)
+        sock.close()
+        alive = True
+    except OSError:
+        alive = False
+    _PROXY_ALIVE[key] = (now, alive)
+    return alive
 
 
 def make_upstream_connection(scheme: str, host: str, port: int, timeout: float,
@@ -1291,7 +1387,7 @@ class MirrorProber:
                 # 探测必须和真实请求走**同一个出口**，否则测出来的「哪条线路最快」
                 # 是另一条路的延迟，选面逻辑会跟着选错。
                 conn = make_upstream_connection(
-                    scheme, parts.hostname, port, self.timeout, up.proxy_spec())
+                    scheme, parts.hostname, port, self.timeout, up.effective_proxy())
                 hdrs = {"Accept": "application/json", "User-Agent": "llm-router-probe"}
                 if up.api_keys:
                     hdrs["Authorization"] = f"Bearer {up.api_keys[0]}"
@@ -1397,6 +1493,17 @@ class Upstream:
         # UA 不在它的白名单里直接 401（"unauthorized client detected"）。
         # 留空用默认 llm-router/<版本>。
         self.user_agent: str = str(cfg.get("user_agent") or "").strip()
+
+        # ---- 上游认哪套接口 -------------------------------------------------
+        # chat      → /v1/chat/completions（默认，老行为，一个字节都不变）
+        # responses → /v1/responses（OpenAI Responses API）
+        # 有的上游/中转只开了一套：给 gpt-6.1-sol 发 /chat/completions 会被
+        # 400 拒掉（"请改用 /v1/responses"），以前只能靠「换下一家」绕过去。
+        # 配成 responses 之后，客户端照旧说 Chat Completions，代理负责两个
+        # 方向的转换（请求体 + 响应体 + SSE 事件流）。
+        self.api_mode: str = norm_api_mode(
+            cfg.get("api_mode") or cfg.get("api") or cfg.get("protocol")
+            or cfg.get("wire_api"))
 
         # ---- 网络出口 ------------------------------------------------------
         # 每个上游自己选直连 / 规则 / 强制代理：有的上游直连延迟更低，
@@ -1519,6 +1626,16 @@ class Upstream:
         except (TypeError, ValueError):
             return None
         return n if n > 0 else None
+
+    # ---- 上游接口类型 ----
+    def uses_responses(self) -> bool:
+        """这个上游是不是只认 OpenAI 的 /v1/responses（Responses API）。"""
+        return self.api_mode == "responses"
+
+    def set_api_mode(self, value: Any) -> str:
+        """改上游接口类型（chat / responses），认不出的写回 chat。"""
+        self.api_mode = norm_api_mode(value)
+        return self.api_mode
 
     # ---- 仅流式模型 ----
     def stream_only(self, model: Optional[str]) -> bool:
@@ -1749,6 +1866,9 @@ class Upstream:
                 # 最近一次余额查询结果（没查过就是 None）
                 "balance": self.balance,
                 "user_agent": self.user_agent,
+                # 这个上游认哪套接口：chat（/v1/chat/completions）或 responses
+                "api_mode": self.api_mode,
+                "api_mode_label": API_MODE_LABELS.get(self.api_mode, self.api_mode),
                 # 这个上游实际从哪儿出去（直连 / 规则 / 强制代理 + 具体端口）
                 **self.net_view(),
                 # 只认流式的模型（前端编辑框用来回显；空 = 没配）
@@ -1850,6 +1970,8 @@ class Upstream:
             **({"first_timeout_seconds": self.first_timeout}
                if self.first_timeout != DEFAULT_FIRST_TIMEOUT else {}),
             **({"user_agent": self.user_agent} if self.user_agent else {}),
+            # 接口类型：默认 chat（老状态文件一字不变），选了 responses 才写
+            **({"api_mode": self.api_mode} if self.api_mode != "chat" else {}),
             # 只有配了「仅流式」模型才写这一个字段，别的上游状态文件一字不变
             **({"stream_only_models": sorted(self.stream_only_models)}
                if self.stream_only_models else {}),
@@ -1965,6 +2087,14 @@ class Upstream:
         except ValueError:
             return None
 
+    def effective_proxy(self) -> Optional[ProxySpec]:
+        """真正要用的代理：配了端口但它已经不在听（Clash 换订阅/删监听器/关 TUN）
+        就退回直连，别让整片上游跟着这个死端口一起失败。"""
+        spec = self.proxy_spec()
+        if spec is not None and not proxy_alive(spec):
+            return None
+        return spec
+
     def net_view(self) -> dict:
         """给界面看的出口情况。"""
         try:
@@ -1972,14 +2102,19 @@ class Upstream:
             error = None
         except ValueError as exc:
             mode, spec, source, error = self.net_mode_effective(), None, "none", str(exc)
+        # 配了端口但端口没在听：说清楚「现在实际退回直连了」，
+        # 否则用户看到「直连」却不知道为什么它跟以前不一样。
+        dead = spec is not None and not proxy_alive(spec)
         return {
             "net_mode": self.net_mode,
             "net_mode_effective": mode,
             "net_mode_label": NET_MODE_LABELS.get(mode, mode),
             "proxy_url": self.proxy_url,
-            "proxy_effective": spec.label if spec is not None else "",
+            "proxy_effective": spec.label if (spec is not None and not dead) else "",
             "proxy_source": source,
             "proxy_error": error,
+            "proxy_dead": dead,
+            "proxy_configured": spec.label if spec is not None else "",
         }
 
     # ---- 请求上游 ----
@@ -2112,6 +2247,12 @@ class Upstream:
             net_mode, proxy, _source = self.resolve_net()
         except ValueError as exc:
             raise ValueError(f"上游「{self.name}」的出口配置有问题: {exc}") from exc
+        if proxy is not None and not proxy_alive(proxy):
+            # 端口没在听（Clash 换订阅 / 删监听器 / 关 TUN）→ 退回直连。
+            # 报错留给日志，不要让 20 个上游一起报「连不上代理」。
+            sys.stderr.write(
+                f"[warn] 上游「{self.name}」的出口 {proxy.label} 连不上，本次改走直连\n")
+            proxy = None
 
         candidates = api_paths(base_url, path)
         if hint[0]:
@@ -2348,6 +2489,11 @@ class Upstream:
             if stream and "stream_options" not in payload:
                 payload["stream"] = True
                 payload["stream_options"] = {"include_usage": True}
+            # 只认 /v1/responses 的上游：请求体和路径都换掉，别的字节不变
+            send_path = "/chat/completions"
+            if self.uses_responses():
+                send_path = "/responses"
+                payload = chat_to_responses(payload, model=model)
             raw = json.dumps(payload, ensure_ascii=False).encode("utf-8")
             result = {"key": key, "name": name, "ok": False, "request_bytes": len(raw)}
             if result_upgraded:
@@ -2356,7 +2502,7 @@ class Upstream:
             start = time.monotonic()
             calls = {}
             try:
-                conn, resp, path = self.open("POST", "/chat/completions", data=raw,
+                conn, resp, path = self.open("POST", send_path, data=raw,
                                               headers=self.headers(accept="text/event-stream" if stream else "application/json"), read_timeout=30)
                 result.update(status=resp.status, path=path,
                               headers_seconds=round(time.monotonic() - start, 3))
@@ -2369,6 +2515,24 @@ class Upstream:
                 if stream:
                     if "text/event-stream" not in ctype.lower():
                         raise ValueError("请求流式响应，但上游未返回 text/event-stream")
+                    reader = resp
+                    if self.uses_responses():
+                        # Responses 的事件流跟 chat 的 chunk 不是一套：先把整条读完
+                        # 转成 chat 的 SSE，再走下面同一套解析（诊断而已，不必真流式）。
+                        blob = b""
+                        while True:
+                            if time.monotonic() - start > 120:
+                                raise TimeoutError("详细测试超过 120 秒，流未正常结束")
+                            piece = resp.read1(262144)
+                            if not piece:
+                                break
+                            blob += piece
+                            if len(blob) > 2 * 1024 * 1024:
+                                raise ValueError("流式响应超过诊断大小上限")
+                        conv = ResponsesStreamConverter(model)
+                        reader = io.BytesIO(conv.feed(blob, final=True) + conv.close())
+                        if conv.error:
+                            raise ValueError("流中返回错误：" + str(conv.error))
                     done = False
                     finished = False
                     size = 0
@@ -2377,9 +2541,10 @@ class Upstream:
                     while True:
                         if time.monotonic() - start > 120:
                             raise TimeoutError("详细测试超过 120 秒，流未正常结束")
-                        if conn.sock:
-                            conn.sock.settimeout(min(30, max(0.1, 120 - (time.monotonic() - start))))
-                        line = resp.readline(65537)
+                        sock = getattr(conn, "sock", None)
+                        if sock is not None:
+                            sock.settimeout(min(30, max(0.1, 120 - (time.monotonic() - start))))
+                        line = reader.readline(65537)
                         if not line:
                             break
                         size += len(line)
@@ -2427,6 +2592,9 @@ class Upstream:
                     body = resp.read(2 * 1024 * 1024 + 1)
                     if len(body) > 2 * 1024 * 1024:
                         raise ValueError("响应超过诊断大小上限")
+                    if self.uses_responses():
+                        # Responses 的 output[] → chat 的 choices，下面按同一套读
+                        body = responses_to_chat_response(body, model)
                     parsed = json.loads(body)
                     if not isinstance(parsed, dict) or parsed.get("error"):
                         raise ValueError("返回无效响应或错误：" + str(parsed)[:500])
@@ -2494,11 +2662,17 @@ class Upstream:
         if stream_only:
             probe["stream"] = True
             probe["stream_options"] = {"include_usage": True}
+        # 只认 /v1/responses 的上游：测速也得走它，否则卡片上永远是红叉 ——
+        # 明明能用的模型被测成挂了。
+        probe_path = "/chat/completions"
+        if self.uses_responses():
+            probe_path = "/responses"
+            probe = chat_to_responses(probe, model=target)
         payload = json.dumps(probe, ensure_ascii=False).encode("utf-8")
         conn = None
         t0 = time.time()
         try:
-            conn, resp, _ = self.open("POST", "/chat/completions", data=payload,
+            conn, resp, _ = self.open("POST", probe_path, data=payload,
                                       headers=self.headers(
                                           accept="text/event-stream" if stream_only else "application/json",
                                           key=key))
@@ -2511,11 +2685,19 @@ class Upstream:
             if ok and stream_only:
                 # 流式测速：200 也可能是「流里夹着错误」，得把事件读一遍才算数
                 acc = make_sse_collector()
-                if looks_like_binary_stream(body):
+                blob = body
+                if self.uses_responses() and not looks_like_binary_stream(body):
+                    # Responses 的事件流先转成 chat 的 chunk，复用同一套判定
+                    conv = ResponsesStreamConverter(target)
+                    blob = conv.feed(body, final=True) + conv.close()
+                    if conv.error:
+                        ok = False
+                        error = f"上游流式返回错误: {conv.error}"
+                if looks_like_binary_stream(blob):
                     ok = False
                     error = "上游返回非 SSE 的二进制数据（疑似网关错误页）"
-                else:
-                    collect_sse(body, acc)
+                elif ok:
+                    collect_sse(blob, acc)
                     # 裸 JSON 错误常常不带换行，会一直躺在缓冲里 —— 先看再 flush
                     if not acc["error"]:
                         acc["error"] = buffered_sse_error(acc)
@@ -4120,6 +4302,9 @@ class Router:
             "connect_timeout_seconds": payload.get("connect_timeout_seconds")
                                        or self.default_connect_timeout,
             "user_agent": payload.get("user_agent") or "",
+            # 接口类型：不传 = chat（老行为）；上游只认 /v1/responses 时填 responses
+            "api_mode": norm_api_mode(payload.get("api_mode") or payload.get("api")
+                                      or payload.get("protocol")),
             # 只有传了才生效；不传 = 没有仅流式模型，老行为
             "stream_only_models": payload.get("stream_only_models") or [],
             # 出口：不传就跟随全局
@@ -4247,6 +4432,11 @@ class Router:
         # 空串 = 回到默认 UA（llm-router/<版本>）
         if "user_agent" in payload:
             up.user_agent = str(payload.get("user_agent") or "").strip()
+        # 接口类型：chat / responses（别名都认，认不出写回 chat）
+        mode_key = ("api_mode" if "api_mode" in payload else
+                    "api" if "api" in payload else "protocol" if "protocol" in payload else "")
+        if mode_key:
+            up.set_api_mode(payload.get(mode_key))
         # 出口模式：inherit / rule / direct / proxy，认不出就跟随全局
         if "net_mode" in payload:
             mode = str(payload.get("net_mode") or "inherit").strip().lower()
@@ -5747,6 +5937,734 @@ def rewrite_json_model(body: bytes, effective: str, requested: str) -> bytes:
         except Exception:
             return body
     return body
+
+
+# ---------------------------------------------------------------------------
+# OpenAI Responses API 适配（上游只认 /v1/responses）
+#
+# 背景：同一个 OpenAI 账号/中转，有的模型只开了一套接口。给 gpt-6.1-sol 发
+# /v1/chat/completions 会被直接拒掉：
+#     「模型 gpt-6.1-sol 不支持 /v1/chat/completions 接口，
+#       请改用 /v1/responses（OpenAI Responses API）」
+# 以前只能靠「换下一家」绕过去 —— 只有这一家时就是死路。
+#
+# 现在每个上游可以选接口类型（chat / responses）。选 responses 时，客户端
+# 照旧说 Chat Completions，代理负责三个方向的转换：
+#   请求：messages / tools / tool_choice / max_tokens → input / instructions / …
+#   响应：output[]（message / function_call / reasoning）→ choices[0].message
+#   流式：response.output_text.delta 等事件 → chat.completion.chunk
+# 三样都转才叫「支持」—— 只转请求的话客户端拿到 output 数组，直接解析失败。
+# ---------------------------------------------------------------------------
+
+API_MODES = ("chat", "responses")
+API_MODE_LABELS = {
+    "chat": "Chat Completions（/v1/chat/completions）",
+    "responses": "Responses（/v1/responses）",
+}
+# 认几种叫法，配置里写什么都行（老字段名也认，见 Upstream.__init__）
+API_MODE_ALIASES = {
+    "": "chat", "chat": "chat", "chatcompletions": "chat", "chat-completions": "chat",
+    "chat_completions": "chat", "completions": "chat", "openai": "chat", "default": "chat",
+    "response": "responses", "responses": "responses", "resp": "responses",
+    "openairesponses": "responses", "openai-responses": "responses",
+    "openai_responses": "responses",
+}
+
+
+def norm_api_mode(value: Any) -> str:
+    """把配置/接口传来的接口类型归一成 chat / responses（认不出 = chat）。"""
+    key = str(value or "").strip().lower().replace(" ", "")
+    return API_MODE_ALIASES.get(key, "chat")
+
+
+# Responses API 的 max_output_tokens 有下限（真实上游实测：<16 直接 400
+# 「integer below minimum value. Expected a value >= 16, but got 1 instead」）。
+# chat 那边的 max_tokens 可以写 1（测速就用 1 个 token），转过来必须抬到下限，
+# 否则一次测速就把整家标成不可用。
+RESPONSES_MIN_OUTPUT_TOKENS = 16
+
+
+def _responses_max_output(val: Any) -> Optional[int]:
+    """chat 的输出上限 → Responses 的 max_output_tokens（含下限修正）。"""
+    if isinstance(val, int) and not isinstance(val, bool) and val > 0:
+        return max(RESPONSES_MIN_OUTPUT_TOKENS, val)
+    return None
+
+
+def _chat_content_to_responses(content: Any, role: str = "user") -> Any:
+    """chat 的 content（字符串或 parts 数组）→ Responses 的 content。
+
+    纯文字尽量退回**字符串**：有些中转只认字符串，传 parts 数组会被 400。
+    只有真带图片时才用 parts（Responses 的 input_image / input_text）。
+    """
+    if isinstance(content, str):
+        return content
+    if not isinstance(content, list):
+        return ""
+    parts: list[dict] = []
+    for part in content:
+        if isinstance(part, str):
+            parts.append({"type": "input_text", "text": part})
+            continue
+        if not isinstance(part, dict):
+            continue
+        ptype = str(part.get("type") or "")
+        if ptype in ("text", "input_text", "output_text"):
+            parts.append({"type": "input_text", "text": str(part.get("text") or "")})
+        elif ptype == "image_url":
+            url = part.get("image_url")
+            if isinstance(url, dict):
+                url = url.get("url")
+            if url:
+                parts.append({"type": "input_image", "image_url": str(url)})
+        elif ptype == "input_image":
+            parts.append(part)
+        elif ptype == "input_file":
+            parts.append(part)
+    if not parts:
+        return ""
+    if all(p.get("type") == "input_text" for p in parts):
+        return "\n".join(str(p.get("text") or "") for p in parts)
+    return parts
+
+
+def _chat_tool_calls_to_responses(calls: Any) -> list[dict]:
+    """chat 历史里的 tool_calls → Responses 的 function_call 输入项。
+
+    call_id 必须原样带过去：后面 tool 消息的 function_call_output 要靠它配对，
+    丢了就会 400「No tool call found for function call output」。
+    """
+    out: list[dict] = []
+    if not isinstance(calls, list):
+        return out
+    for call in calls:
+        if not isinstance(call, dict):
+            continue
+        fn = call.get("function") if isinstance(call.get("function"), dict) else {}
+        name = str(fn.get("name") or call.get("name") or "")
+        if not name:
+            continue
+        out.append({
+            "type": "function_call",
+            "call_id": str(call.get("id") or call.get("call_id") or ""),
+            "name": name,
+            "arguments": str(fn.get("arguments") or call.get("arguments") or "{}"),
+        })
+    return out
+
+
+def chat_tools_to_responses(tools: Any) -> list[dict]:
+    """chat 的 tools → Responses 的 tools（字段从 function.* 提到顶层）。"""
+    out: list[dict] = []
+    if not isinstance(tools, list):
+        return out
+    for tool in tools:
+        if not isinstance(tool, dict):
+            continue
+        fn = tool.get("function") if isinstance(tool.get("function"), dict) else None
+        if fn is None:
+            # 已经是 Responses 形状（name 在顶层），或者内建工具（web_search 之类）
+            if tool.get("name") or str(tool.get("type") or "") != "function":
+                out.append(tool)
+            continue
+        name = str(fn.get("name") or "")
+        if not name:
+            continue
+        item: dict[str, Any] = {
+            "type": "function",
+            "name": name,
+            "description": str(fn.get("description") or ""),
+            "parameters": fn.get("parameters") or {"type": "object", "properties": {}},
+        }
+        if "strict" in fn:
+            item["strict"] = bool(fn["strict"])
+        out.append(item)
+    return out
+
+
+def chat_tool_choice_to_responses(choice: Any) -> Any:
+    """chat 的 tool_choice → Responses 的 tool_choice。"""
+    if isinstance(choice, str):
+        return choice if choice in ("auto", "none", "required") else None
+    if not isinstance(choice, dict):
+        return None
+    fn = choice.get("function") if isinstance(choice.get("function"), dict) else {}
+    name = str(fn.get("name") or choice.get("name") or "")
+    if name:
+        return {"type": "function", "name": name}
+    if choice.get("type") in ("auto", "none", "required"):
+        return choice["type"]
+    return None
+
+
+def chat_response_format_to_text(fmt: Any) -> Optional[dict]:
+    """chat 的 response_format → Responses 的 text.format。"""
+    if not isinstance(fmt, dict):
+        return None
+    kind = str(fmt.get("type") or "")
+    if kind == "json_object":
+        return {"format": {"type": "json_object"}}
+    if kind == "json_schema":
+        js = fmt.get("json_schema") if isinstance(fmt.get("json_schema"), dict) else {}
+        schema = js.get("schema")
+        item: dict[str, Any] = {
+            "type": "json_schema",
+            "name": str(js.get("name") or "response"),
+            "schema": schema if isinstance(schema, dict) else
+                      {"type": "object", "properties": {}},
+        }
+        if "strict" in js:
+            item["strict"] = bool(js["strict"])
+        return {"format": item}
+    return None
+
+
+# 这些 chat 参数 Responses 没有同名字段，传过去会 400（Unrecognized request
+# argument），只能丢掉：n / stop / presence_penalty / frequency_penalty /
+# logprobs / logit_bias / seed / stream_options …
+def chat_to_responses(payload: Any, model: Optional[str] = None) -> dict:
+    """OpenAI Chat Completions 请求体 → Responses API 请求体。
+
+    只做「能表达的都表达」：表达不了的参数宁可丢掉，也不原样透传 ——
+    Responses 对未知参数是直接 400 的，透传等于让整个上游不可用。
+    """
+    if not isinstance(payload, dict):
+        return {}
+    out: dict[str, Any] = {}
+    mdl = str(model or payload.get("model") or "")
+    if mdl:
+        out["model"] = mdl
+
+    # 客户端本来就是 Responses 形状（已经带 input、没有 messages）：原样带过，
+    # 只补齐/覆盖 model 与 stream。
+    if payload.get("input") is not None and not payload.get("messages"):
+        for key in ("input", "instructions", "tools", "tool_choice", "temperature",
+                    "top_p", "max_output_tokens", "reasoning", "parallel_tool_calls",
+                    "text", "metadata", "store", "prompt_cache_key"):
+            if key in payload:
+                out[key] = payload[key]
+        fixed = _responses_max_output(out.get("max_output_tokens"))
+        if fixed is not None:
+            out["max_output_tokens"] = fixed
+        if payload.get("stream") is not None:
+            out["stream"] = bool(payload.get("stream"))
+        return out
+
+    instructions: list[str] = []
+    items: list[dict] = []
+    messages = payload.get("messages")
+    if isinstance(messages, list):
+        for msg in messages:
+            if not isinstance(msg, dict):
+                continue
+            role = str(msg.get("role") or "user")
+            if role in ("system", "developer"):
+                text = _chat_content_to_responses(msg.get("content"), role)
+                if isinstance(text, list):
+                    text = " ".join(str(p.get("text") or "") for p in text)
+                if str(text or "").strip():
+                    instructions.append(str(text))
+                continue
+            if role in ("tool", "function"):
+                # 工具结果：必须是独立的一项，靠 call_id 与前面的 function_call 配对
+                call_id = str(msg.get("tool_call_id") or msg.get("call_id")
+                              or msg.get("name") or "")
+                content = _chat_content_to_responses(msg.get("content"), role)
+                if isinstance(content, list):
+                    content = " ".join(str(p.get("text") or "") for p in content)
+                items.append({"type": "function_call_output",
+                              "call_id": call_id,
+                              "output": str(content or "")})
+                continue
+
+            content = _chat_content_to_responses(msg.get("content"), role)
+            if role == "assistant" and isinstance(content, list):
+                content = " ".join(str(p.get("text") or "") for p in content
+                                   if isinstance(p, dict))
+            if content not in ("", [], None):
+                items.append({"type": "message", "role": role, "content": content})
+            # 助手的工具调用：文本项之后紧跟 function_call 项（顺序有意义）
+            if role == "assistant":
+                items.extend(_chat_tool_calls_to_responses(msg.get("tool_calls")))
+                legacy = msg.get("function_call")
+                if isinstance(legacy, dict) and legacy.get("name"):
+                    items.append({"type": "function_call",
+                                  "call_id": str(msg.get("tool_call_id") or ""),
+                                  "name": str(legacy.get("name")),
+                                  "arguments": str(legacy.get("arguments") or "{}")})
+
+    if instructions:
+        out["instructions"] = "\n\n".join(instructions)
+    out["input"] = items
+
+    # 输出上限：Responses 只认 max_output_tokens，而且有下限（见 RESPONSES_MIN_OUTPUT_TOKENS）
+    for key in ("max_completion_tokens", "max_tokens"):
+        fixed = _responses_max_output(payload.get(key))
+        if fixed is not None:
+            out["max_output_tokens"] = fixed
+            break
+    if payload.get("stream") is not None:
+        out["stream"] = bool(payload.get("stream"))
+    for key in ("temperature", "top_p"):
+        val = payload.get(key)
+        if isinstance(val, (int, float)) and not isinstance(val, bool):
+            out[key] = val
+    if isinstance(payload.get("reasoning"), dict):
+        out["reasoning"] = payload["reasoning"]
+    elif payload.get("reasoning_effort"):
+        out["reasoning"] = {"effort": str(payload["reasoning_effort"])}
+    if "parallel_tool_calls" in payload:
+        out["parallel_tool_calls"] = bool(payload.get("parallel_tool_calls"))
+    if isinstance(payload.get("metadata"), dict):
+        out["metadata"] = payload["metadata"]
+    if payload.get("store") is not None:
+        out["store"] = bool(payload.get("store"))
+    if payload.get("prompt_cache_key"):
+        out["prompt_cache_key"] = str(payload["prompt_cache_key"])
+
+    tools = chat_tools_to_responses(payload.get("tools"))
+    if tools:
+        out["tools"] = tools
+        choice = chat_tool_choice_to_responses(payload.get("tool_choice"))
+        if choice is not None:
+            out["tool_choice"] = choice
+    text_cfg = chat_response_format_to_text(payload.get("response_format"))
+    if text_cfg:
+        out["text"] = text_cfg
+    return out
+
+
+def _responses_usage(obj: Any) -> dict:
+    """Responses 的 usage → chat 的 usage（字段名不同）。"""
+    u = obj.get("usage") if isinstance(obj, dict) else None
+    if not isinstance(u, dict):
+        return {}
+
+    def num(source: dict, *keys) -> Optional[int]:
+        for k in keys:
+            v = source.get(k)
+            if isinstance(v, (int, float)) and not isinstance(v, bool):
+                return int(v)
+        return None
+
+    inp = num(u, "input_tokens", "prompt_tokens")
+    outp = num(u, "output_tokens", "completion_tokens")
+    total = num(u, "total_tokens")
+    if total is None and (inp is not None or outp is not None):
+        total = (inp or 0) + (outp or 0)
+    details = u.get("input_tokens_details") or u.get("prompt_tokens_details")
+    cached = num(details, "cached_tokens") if isinstance(details, dict) else None
+    out_usage: dict[str, Any] = {}
+    if inp is not None:
+        out_usage["prompt_tokens"] = inp
+    if outp is not None:
+        out_usage["completion_tokens"] = outp
+    if total is not None:
+        out_usage["total_tokens"] = total
+    if cached is not None:
+        out_usage["prompt_tokens_details"] = {"cached_tokens": cached}
+    return out_usage
+
+
+def responses_output_parts(obj: Any) -> tuple[str, str, list[dict]]:
+    """从 Responses 的 output[] 里取出 (正文, 思考过程, tool_calls)。
+
+    见过的 item 类型：
+        message        → content[] 里 type=output_text 的 text
+        function_call  → call_id / name / arguments
+        reasoning      → summary[].text（思考过程，客户端当 reasoning_content）
+    """
+    text_parts: list[str] = []
+    reasoning_parts: list[str] = []
+    calls: list[dict] = []
+    if not isinstance(obj, dict):
+        return "", "", calls
+    for item in (obj.get("output") or []):
+        if not isinstance(item, dict):
+            continue
+        kind = str(item.get("type") or "")
+        if kind == "message":
+            content = item.get("content")
+            if isinstance(content, str):
+                text_parts.append(content)
+            elif isinstance(content, list):
+                for part in content:
+                    if not isinstance(part, dict):
+                        continue
+                    if part.get("type") in ("output_text", "text", "input_text"):
+                        if part.get("text"):
+                            text_parts.append(str(part["text"]))
+        elif kind == "function_call":
+            name = str(item.get("name") or "")
+            if name:
+                calls.append({
+                    "id": str(item.get("call_id") or item.get("id") or ""),
+                    "type": "function",
+                    "function": {"name": name,
+                                 "arguments": str(item.get("arguments") or "{}")},
+                })
+        elif kind == "reasoning":
+            for part in (item.get("summary") or []):
+                if isinstance(part, dict) and part.get("text"):
+                    reasoning_parts.append(str(part["text"]))
+            for part in (item.get("content") or []):
+                if isinstance(part, dict) and part.get("text"):
+                    reasoning_parts.append(str(part["text"]))
+    return "".join(text_parts), "".join(reasoning_parts), calls
+
+
+def _responses_finish_reason(obj: Any, has_calls: bool) -> str:
+    status = str(obj.get("status") or "")
+    if status == "incomplete":
+        detail = obj.get("incomplete_details")
+        reason = str((detail or {}).get("reason") or "") if isinstance(detail, dict) else ""
+        if reason in ("max_output_tokens", "max_tokens"):
+            return "length"
+        if reason == "content_filter":
+            return "content_filter"
+    if has_calls:
+        return "tool_calls"
+    return "stop"
+
+
+def responses_to_chat_response(body: bytes, model: str = "",
+                               fallback_id: str = "") -> bytes:
+    """Responses 的非流式响应 → chat.completion（客户端那边认的形状）。"""
+    try:
+        obj = json.loads(body)
+    except Exception:  # noqa: BLE001
+        return body
+    if not isinstance(obj, dict):
+        return body
+    # 错误体（{"error": {...}}）原样透传：describe_http_error 认这个形状，
+    # 转成 choices 反而会把真正的错因藏起来。
+    if obj.get("error"):
+        return body
+    if obj.get("object") != "response" and not isinstance(obj.get("output"), list):
+        return body
+
+    text, reasoning, calls = responses_output_parts(obj)
+    message: dict[str, Any] = {"role": "assistant", "content": text}
+    if calls:
+        message["tool_calls"] = calls
+        if not text:
+            message["content"] = None
+    if reasoning:
+        message["reasoning_content"] = reasoning
+    rid = str(obj.get("id") or fallback_id or "")
+    try:
+        created = int(obj.get("created_at") or time.time())
+    except (TypeError, ValueError):
+        created = int(time.time())
+    out = {
+        "id": f"chatcmpl-{rid}" if rid else f"chatcmpl-{uuid.uuid4().hex[:24]}",
+        "object": "chat.completion",
+        "created": created,
+        "model": model or str(obj.get("model") or ""),
+        "choices": [{"index": 0, "message": message,
+                     "finish_reason": _responses_finish_reason(obj, bool(calls))}],
+    }
+    usage = _responses_usage(obj)
+    if usage:
+        out["usage"] = usage
+    try:
+        return json.dumps(out, ensure_ascii=False).encode("utf-8")
+    except Exception:  # noqa: BLE001
+        return body
+
+
+class ResponsesStreamConverter:
+    """Responses 的 SSE 事件 → OpenAI chat.completion.chunk。
+
+    上游长这样（每条 data 一个事件，事件名在 JSON 的 type 里）：
+        {"type":"response.output_text.delta","delta":"你"}
+        {"type":"response.function_call_arguments.delta","item_id":"fc_1","delta":"{\\"a\\""}
+        {"type":"response.completed","response":{"usage":{...}}}
+    客户端要的是：
+        {"choices":[{"delta":{"content":"你"}}]}  … 最后 data: [DONE]
+
+    边转边攒：文本、思考过程、工具调用、usage 都留在实例上，
+    非流式聚合（仅流式模型改发流式那条路）直接拿 completion() 拼 JSON。
+    """
+
+    def __init__(self, model: str, response_id: str = ""):
+        self.model = model
+        self.response_id = response_id
+        self.created = int(time.time())
+        self.buf = b""
+        self.started = False
+        self.finished = False
+        self.error: Optional[str] = None
+        self.finish_reason: Optional[str] = None
+        self.usage: dict = {}
+        # Responses 的输出项 id → chat 的 tool_calls 下标（客户端按 index 拼参数）
+        self.tool_index: dict[str, int] = {}
+        self.arguments: dict[int, list[str]] = {}
+        self.text: list[str] = []
+        self.reasoning: list[str] = []
+        self._reasoning_kind: Optional[str] = None
+        self.calls: dict[int, dict] = {}
+        self.saw_completed = False
+
+    # ---- 拼 chat chunk ----
+    def _id(self) -> str:
+        base = self.response_id or "resp"
+        return f"chatcmpl-{base}"
+
+    def _chunk(self, delta: dict, finish: Optional[str] = None) -> bytes:
+        obj = {
+            "id": self._id(),
+            "object": "chat.completion.chunk",
+            "created": self.created,
+            "model": self.model,
+            "choices": [{"index": 0, "delta": delta, "finish_reason": finish}],
+        }
+        return b"data: " + json.dumps(
+            obj, ensure_ascii=False, separators=(",", ":")).encode("utf-8") + b"\n\n"
+
+    def _role_chunk(self) -> bytes:
+        self.started = True
+        return self._chunk({"role": "assistant", "content": ""})
+
+    def _ensure_started(self) -> bytes:
+        return b"" if self.started else self._role_chunk()
+
+    def _tool_chunk(self, index: int, call_id: str, name: str, args: str) -> bytes:
+        fn: dict[str, Any] = {}
+        if name:
+            fn["name"] = name
+        if args:
+            fn["arguments"] = args
+        call: dict[str, Any] = {"index": index}
+        if call_id:
+            call["id"] = call_id
+            call["type"] = "function"
+        call["function"] = fn
+        return self._chunk({"tool_calls": [call]})
+
+    # ---- 事件处理 ----
+    def _handle(self, obj: dict) -> bytes:
+        kind = str(obj.get("type") or "")
+        out = b""
+
+        if kind in ("response.created", "response.in_progress"):
+            resp = obj.get("response") if isinstance(obj.get("response"), dict) else {}
+            if resp.get("id") and not self.response_id:
+                self.response_id = str(resp["id"])
+            if isinstance(resp.get("created_at"), (int, float)):
+                self.created = int(resp["created_at"])
+            if not self.model and resp.get("model"):
+                self.model = str(resp["model"])
+            if kind == "response.created":
+                out += self._ensure_started()
+            return out
+
+        if kind == "response.output_item.added":
+            item = obj.get("item") if isinstance(obj.get("item"), dict) else {}
+            if str(item.get("type") or "") == "function_call":
+                key = str(item.get("id") or item.get("call_id") or len(self.tool_index))
+                index = len(self.tool_index)
+                self.tool_index[key] = index
+                self.arguments[index] = []
+                self.calls[index] = {
+                    "id": str(item.get("call_id") or item.get("id") or ""),
+                    "type": "function",
+                    "function": {"name": str(item.get("name") or ""), "arguments": ""},
+                }
+                out += self._ensure_started()
+                out += self._tool_chunk(index, self.calls[index]["id"],
+                                        self.calls[index]["function"]["name"], "")
+            return out
+
+        if kind in ("response.output_text.delta",):
+            delta = obj.get("delta")
+            if isinstance(delta, str) and delta:
+                self.text.append(delta)
+                out += self._ensure_started()
+                out += self._chunk({"content": delta})
+            return out
+
+        if kind in ("response.refusal.delta",):
+            delta = obj.get("delta")
+            if isinstance(delta, str) and delta:
+                self.text.append(delta)
+                out += self._ensure_started()
+                out += self._chunk({"content": delta})
+            return out
+
+        if kind in ("response.reasoning_summary_text.delta",
+                    "response.reasoning_text.delta"):
+            # 两种事件可能同时来（不同实现），只认先出现的那个，别重复输出
+            if self._reasoning_kind and self._reasoning_kind != kind:
+                return b""
+            self._reasoning_kind = kind
+            delta = obj.get("delta")
+            if isinstance(delta, str) and delta:
+                self.reasoning.append(delta)
+                out += self._ensure_started()
+                out += self._chunk({"reasoning_content": delta})
+            return out
+
+        if kind == "response.function_call_arguments.delta":
+            key = str(obj.get("item_id") or obj.get("call_id") or "")
+            index = self.tool_index.get(key)
+            if index is None:
+                index = 0
+            slot = self.arguments.get(index)
+            if slot is None:
+                slot = self.arguments[index] = []
+            slot.append(str(obj.get("delta") or ""))
+            delta = obj.get("delta")
+            if isinstance(delta, str) and delta:
+                out += self._ensure_started()
+                out += self._tool_chunk(index, "", "", delta)
+            return out
+
+        if kind == "response.output_item.done":
+            item = obj.get("item") if isinstance(obj.get("item"), dict) else {}
+            if str(item.get("type") or "") == "function_call":
+                key = str(item.get("id") or item.get("call_id") or "")
+                index = self.tool_index.get(key)
+                if index is None:
+                    index = len(self.tool_index)
+                    self.tool_index[key] = index
+                    self.arguments[index] = []
+                    self.calls[index] = {
+                        "id": str(item.get("call_id") or item.get("id") or ""),
+                        "type": "function",
+                        "function": {"name": str(item.get("name") or ""),
+                                     "arguments": ""},
+                    }
+                    out += self._ensure_started()
+                    out += self._tool_chunk(index, self.calls[index]["id"],
+                                            self.calls[index]["function"]["name"], "")
+                # 有的实现只在 done 里给完整 arguments（没有 delta 事件）
+                full = str(item.get("arguments") or "")
+                already = "".join(self.arguments.get(index) or [])
+                if full and not already:
+                    self.arguments[index] = [full]
+                    out += self._tool_chunk(index, "", "", full)
+            return out
+
+        if kind in ("response.completed", "response.incomplete"):
+            resp = obj.get("response") if isinstance(obj.get("response"), dict) else {}
+            _, reasoning, calls = responses_output_parts(resp)
+            if reasoning and not self.reasoning:
+                self.reasoning.append(reasoning)
+            self.saw_completed = True
+            self.usage = _responses_usage(resp) or self.usage
+            self.finish_reason = _responses_finish_reason(
+                resp, bool(self.tool_index) or bool(calls))
+            if calls and not self.tool_index:
+                # 上游只给了最终 item（没给增量事件）：一次性补齐
+                for i, call in enumerate(calls):
+                    self.tool_index[str(i)] = i
+                    self.arguments[i] = [call["function"]["arguments"]]
+                    self.calls[i] = call
+                    out += self._ensure_started()
+                    out += self._tool_chunk(i, call.get("id") or "",
+                                            call["function"]["name"],
+                                            call["function"]["arguments"])
+            return out
+
+        if kind == "response.failed":
+            resp = obj.get("response") if isinstance(obj.get("response"), dict) else {}
+            err = resp.get("error") if isinstance(resp.get("error"), dict) else {}
+            self.error = str(err.get("message") or "上游返回 response.failed")
+            return b""
+
+        if kind == "error":
+            err = obj.get("error") if isinstance(obj.get("error"), dict) else {}
+            self.error = str(err.get("message") or json.dumps(obj, ensure_ascii=False))
+            return b""
+
+        return out
+
+    def feed(self, data: bytes, final: bool = False) -> bytes:
+        if self.finished:
+            return b""
+        self.buf += data
+        if final:
+            block, self.buf = self.buf, b""
+        else:
+            idx = self.buf.rfind(b"\n")
+            if idx < 0:
+                return b""
+            block, self.buf = self.buf[: idx + 1], self.buf[idx + 1:]
+        out = b""
+        for line in block.split(b"\n"):
+            stripped = line.strip()
+            if not stripped or stripped.startswith(b":") or stripped.startswith(b"event:"):
+                continue
+            if not stripped.startswith(b"data:"):
+                # 裸 JSON（没带 data: 前缀）：有些中转这么发错误体
+                payload = stripped
+            else:
+                payload = stripped[5:].strip()
+            if not payload or payload == b"[DONE]":
+                continue
+            try:
+                obj = json.loads(payload)
+            except Exception:  # noqa: BLE001
+                continue
+            if not isinstance(obj, dict):
+                continue
+            out += self._handle(obj)
+        return out
+
+    def error_event(self, message: str) -> bytes:
+        """流已经发出去之后才报错：按 chat 的约定发一个 error 事件收尾。"""
+        obj = {"error": {"message": message, "type": "upstream_error"}}
+        return b"data: " + json.dumps(obj, ensure_ascii=False).encode("utf-8") + b"\n\n"
+
+    def close(self) -> bytes:
+        """补收尾：finish_reason 块 + usage 块 + [DONE]。"""
+        if self.finished:
+            return b""
+        self.finished = True
+        out = self._ensure_started()
+        finish = self.finish_reason or ("tool_calls" if self.tool_index else "stop")
+        out += self._chunk({}, finish)
+        if self.usage:
+            tail = {
+                "id": self._id(),
+                "object": "chat.completion.chunk",
+                "created": self.created,
+                "model": self.model,
+                "choices": [],
+                "usage": self.usage,
+            }
+            out += b"data: " + json.dumps(
+                tail, ensure_ascii=False, separators=(",", ":")).encode("utf-8") + b"\n\n"
+        out += b"data: [DONE]\n\n"
+        return out
+
+    def completion(self) -> bytes:
+        """把攒下来的东西拼成一份普通的 chat.completion（聚合流式用）。"""
+        text = "".join(self.text)
+        message: dict[str, Any] = {"role": "assistant", "content": text}
+        calls = [self.calls[i] for i in sorted(self.calls)]
+        for i, call in enumerate(calls):
+            call["function"]["arguments"] = ("".join(self.arguments.get(i) or [])
+                                             or call["function"]["arguments"] or "{}")
+        if calls:
+            message["tool_calls"] = calls
+            if not text:
+                message["content"] = None
+        if self.reasoning:
+            message["reasoning_content"] = "".join(self.reasoning)
+        out = {
+            "id": self._id(),
+            "object": "chat.completion",
+            "created": self.created,
+            "model": self.model,
+            "choices": [{"index": 0, "message": message,
+                         "finish_reason": self.finish_reason
+                         or ("tool_calls" if calls else "stop")}],
+        }
+        if self.usage:
+            out["usage"] = self.usage
+        return json.dumps(out, ensure_ascii=False).encode("utf-8")
 
 
 # ---------------------------------------------------------------------------
@@ -7458,9 +8376,17 @@ class Handler(BaseHTTPRequestHandler):
                       adapt_notes: Optional[list[str]] = None) -> None:
         trail = trail if trail is not None else []
         data = raw_body or None
+        # 客户端是不是自己就在用 Responses 端点（/v1/responses 直接透传）
+        client_responses = path.rstrip("/").endswith("/responses")
+        # 这个上游只认 /v1/responses，而客户端说的是 Chat Completions：
+        # 请求体要转成 Responses 形状，响应（含 SSE 事件流）再转回来。
+        to_responses = up.uses_responses() and not client_responses
+
+        send_payload: Optional[dict] = payload
         if payload is not None and requested_model and eff_model != requested_model:
             new_payload = dict(payload)
             new_payload["model"] = eff_model
+            send_payload = new_payload
             data = json.dumps(new_payload, ensure_ascii=False).encode("utf-8")
 
         # 「仅流式」模型 ＋ 客户端要非流式 → 偷偷改成 stream=true 发出去，
@@ -7473,10 +8399,14 @@ class Handler(BaseHTTPRequestHandler):
         _client_streams = _raw_stream is True or (
             isinstance(_raw_stream, str) and _raw_stream.strip().lower() in ("1", "true", "yes"))
         stream_upgrade = bool(
-            payload is not None and not _client_streams and up.stream_only(eff_model))
+            payload is not None and not _client_streams and up.stream_only(eff_model)
+            # 客户端本来就用 /v1/responses 时不做「改发流式再拼回来」：那条路
+            # 拼回来的是 chat 的形状，跟客户端要的对不上。透传优先。
+            and not client_responses)
         upgrade_data: Optional[bytes] = None
+        upgrade_payload: Optional[dict] = None
         if stream_upgrade:
-            up_payload = dict(payload or {})
+            up_payload = dict(send_payload or payload or {})
             up_payload["model"] = eff_model or requested_model or up_payload.get("model")
             up_payload["stream"] = True
             # 要 usage 才能在拼回去的 JSON 里带上 token 用量（history 统计要用）
@@ -7484,7 +8414,23 @@ class Handler(BaseHTTPRequestHandler):
             up_payload["stream_options"] = (
                 {**_opts, "include_usage": True} if isinstance(_opts, dict)
                 else {"include_usage": True})
+            upgrade_payload = up_payload
             upgrade_data = json.dumps(up_payload, ensure_ascii=False).encode("utf-8")
+
+        # 只认 Responses 的上游：最终要发出去的那份请求体整体转换一次。
+        # （客户端本来就是 Responses 形状时，chat_to_responses 会原样带过。）
+        up_path = path
+        if up.uses_responses() and not client_responses:
+            up_path = "/responses"
+            final_payload = upgrade_payload if stream_upgrade else send_payload
+            if final_payload is not None:
+                converted = chat_to_responses(
+                    final_payload, model=eff_model or requested_model)
+                converted_bytes = json.dumps(converted, ensure_ascii=False).encode("utf-8")
+                if stream_upgrade:
+                    upgrade_data = converted_bytes
+                else:
+                    data = converted_bytes
 
         # 一次请求里，failover 策略把每个可用 Key 各试一次：
         # 首包超时（连接后多久没收到响应头，上「设置」页/单上游可配）、连不上、
@@ -7512,7 +8458,7 @@ class Handler(BaseHTTPRequestHandler):
             t0 = time.time()
             try:
                 conn, resp, _ = up.open(
-                    method, path,
+                    method, up_path,
                     data=(upgrade_data if stream_upgrade else data),
                     headers=headers)
             except Exception as exc:  # noqa: BLE001
@@ -7566,6 +8512,11 @@ class Handler(BaseHTTPRequestHandler):
                 # 别让一个干不动的上游把带工具的请求直接打死。
                 if status == 400 and looks_like_capability_error(body):
                     up.record_neutral(reason)
+                    if up.api_mode != "responses" and "responses" in reason.lower():
+                        # 接口类型选错了：告诉用户该改哪儿，而不是只报「上游 400」
+                        self.log_message(
+                            "上游 %s 要求 /v1/responses（Responses API）：把这个上游的"
+                            "接口类型改成 responses 就能直接用，不必再换一家", up.name)
                     if not last_key and up.rotate_key(_used_key):
                         _kt += 1
                         self.log_message("上游 %s 第 %d 个 Key 报 400（能力限制），换下一个 Key 重试",
@@ -7624,6 +8575,23 @@ class Handler(BaseHTTPRequestHandler):
 
             # 3) 流式
             if "text/event-stream" in ctype:
+                if to_responses:
+                    # 上游给的是 Responses 的事件流，客户端要的是 chat 的 chunk：
+                    # 逐事件转换（仅流式模型那条「收完再拼 JSON」的路也走这里）。
+                    try:
+                        self._relay_responses(conn, resp, up, requested_model, eff_model,
+                                              t0, route_source, attempts, payload, trail,
+                                              anthropic=anthropic, key_label=_used_label,
+                                              aggregate=stream_upgrade)
+                    except Retryable:
+                        up._close(conn)
+                        if not last_key and up.rotate_key(_used_key):
+                            _kt += 1
+                            self.log_message("上游 %s 第 %d 个 Key 转换流失败，换下一个 Key 重试",
+                                             up.name, _kt)
+                            continue
+                        raise
+                    return
                 if stream_upgrade:
                     # 是我们自己把非流式改成流式的（仅流式模型），得收完拼回 JSON。
                     # 这条路径**还没给客户端发任何东西**，所以失败照常换 Key / 换上游。
@@ -7683,6 +8651,13 @@ class Handler(BaseHTTPRequestHandler):
                 up.record_failure(reason, self.router.failure_threshold, up.cooldown)
                 raise Retryable(up, 502, b"", reason, key_label=_used_label)
 
+            if to_responses:
+                # 上游给的是 Responses 对象（output[]），先转成 chat.completion，
+                # 后面的「模型名改写 / Anthropic 转换 / 文本提取」照旧。
+                body = responses_to_chat_response(
+                    body, requested_model or eff_model or "",
+                    fallback_id=resp.getheader("x-request-id") or "")
+
             if anthropic:
                 # 客户端要的是 Anthropic 格式：模型名不用单独改了，
                 # 转换函数会把 model 一步写成客户端请求的那个名字。
@@ -7706,6 +8681,241 @@ class Handler(BaseHTTPRequestHandler):
                                  reasoning_text=reasoning,
                                  trail=trail, key_label=_used_label)
             return
+
+    def _relay_responses(self, conn, resp, up: Upstream, requested_model: Optional[str],
+                         eff_model: Optional[str], t0: float, route_source: str,
+                         attempts: int, payload: Optional[dict] = None,
+                         trail: Optional[list[dict]] = None,
+                         anthropic: bool = False,
+                         key_label: str = "",
+                         aggregate: bool = False) -> None:
+        """上游 Responses 的事件流 → 客户端要的形状。
+
+        aggregate=False：逐事件转成 chat.completion.chunk 边收边发（真流式）。
+        aggregate=True ：整条收完拼成普通 JSON（「仅流式」模型 + 客户端要非流式）。
+        客户端是 Anthropic 时，再把 chat 的 chunk/JSON 串给 Anthropic 转换器 ——
+        两级转换是串联的，不用为每种组合重写一遍。
+        """
+        trail = trail if trail is not None else []
+        model_name = requested_model or eff_model or ""
+        conv = ResponsesStreamConverter(model_name)
+        acc = make_sse_collector()
+        req_id = resp.getheader("x-request-id") or ""
+
+        if aggregate:
+            deadline = time.monotonic() + STREAM_UPGRADE_MAX_SECONDS
+            try:
+                while True:
+                    chunk = resp.read1(262144)
+                    if not chunk:
+                        break
+                    if looks_like_binary_stream(chunk):
+                        reason = "上游返回非 SSE 的二进制数据（疑似网关错误页/压缩内容）"
+                        up._close(conn)
+                        up.record_failure(reason, self.router.failure_threshold, up.cooldown)
+                        raise Retryable(up, 502, b"", reason, key_label=key_label)
+                    chat_bytes = conv.feed(chunk)
+                    if chat_bytes:
+                        collect_sse(chat_bytes, acc)
+                    if len(conv.text) and sum(len(x) for x in conv.text) > STREAM_UPGRADE_MAX_BYTES:
+                        reason = "上游流式响应超过大小上限，中止聚合"
+                        up._close(conn)
+                        up.record_failure(reason, self.router.failure_threshold, up.cooldown)
+                        raise Retryable(up, 502, b"", reason, key_label=key_label)
+                    if time.monotonic() >= deadline:
+                        reason = f"上游流式响应超过 {STREAM_UPGRADE_MAX_SECONDS:g} 秒，中止聚合"
+                        up._close(conn)
+                        up.record_failure(reason, self.router.failure_threshold, up.cooldown)
+                        raise Retryable(up, 502, b"", reason, key_label=key_label)
+                conv.feed(b"", final=True)
+            except Retryable:
+                raise
+            except Exception as exc:  # noqa: BLE001
+                up._close(conn)
+                reason = f"读取响应失败: {exc}"
+                up.record_failure(reason, self.router.failure_threshold, up.cooldown)
+                raise Retryable(up, 502, b"", reason, key_label=key_label) from exc
+            finally:
+                up._close(conn)
+
+            if conv.error:
+                reason = f"上游流式返回错误: {conv.error}"
+                up.record_failure(reason, self.router.failure_threshold, up.cooldown)
+                raise Retryable(up, 502, b"", reason, key_label=key_label)
+            if not conv.saw_completed and not conv.text and not conv.calls:
+                reason = "上游返回 200 但流为空"
+                up.record_failure(reason, self.router.failure_threshold, up.cooldown)
+                raise Retryable(up, 502, b"", reason, key_label=key_label)
+
+            latency = time.time() - t0
+            body = conv.completion()
+            if anthropic:
+                body = openai_to_anthropic_response(
+                    body, model_name, fallback_id=req_id)
+            chat_obj = json.loads(body) if not anthropic else None
+            usage = extract_usage(chat_obj) if isinstance(chat_obj, dict) else {}
+            resp_text = "".join(conv.text)
+            reasoning = "".join(conv.reasoning)
+            up.record_success(latency)
+            self._relay_json(resp.status, resp, body, up.name, latency=latency,
+                             effective=eff_model, content_type="application/json")
+            trail.append({"upstream": up.name, "upstream_id": up.id, "ok": True,
+                          "key": key_label or None, "model": eff_model,
+                          "status": resp.status, "reason": ""})
+            self._record_history(up, requested_model, eff_model or "-", resp.status, latency,
+                                 attempts=attempts, route_source=route_source,
+                                 usage=usage,
+                                 request_text=messages_to_text(payload),
+                                 response_text=resp_text, reasoning_text=reasoning,
+                                 trail=trail, key_label=key_label)
+            self.log_message("Responses 聚合→非流式：上游=%s 模型=%s 耗时=%.2fs",
+                             up.name, eff_model or requested_model, latency)
+            return
+
+        headers_sent = False
+        chain: Any = AnthropicStreamConverter(model_name, req_id) if anthropic else None
+        try:
+            # 偷看首块：200 之后立刻断流/直接报错的情况，得在发响应头之前判出来
+            first = b""
+            peek_deadline = time.monotonic() + 10.0
+            while True:
+                piece = resp.read1(65536)
+                if not piece:
+                    break
+                first += piece
+                if stream_has_payload(first) or looks_like_binary_stream(first):
+                    break
+                if len(first) >= 1024 * 1024 or time.monotonic() >= peek_deadline:
+                    break
+            if not first:
+                up._close(conn)
+                reason = "上游返回 200 但流为空"
+                up.record_failure(reason, self.router.failure_threshold, up.cooldown)
+                raise Retryable(up, 502, b"", reason, key_label=key_label)
+            if looks_like_binary_stream(first):
+                up._close(conn)
+                reason = "上游返回 200 但流内容不是 SSE（二进制数据）"
+                up.record_failure(reason, self.router.failure_threshold, up.cooldown)
+                raise Retryable(up, 502, b"", reason, key_label=key_label)
+            out = conv.feed(first)
+            if conv.error:
+                up._close(conn)
+                reason = f"上游流式返回错误: {conv.error}"
+                up.record_failure(reason, self.router.failure_threshold, up.cooldown)
+                raise Retryable(up, 502, b"", reason, key_label=key_label)
+
+            first_byte_at = time.time()
+            self.send_response(resp.status)
+            self.send_header("Content-Type", "text/event-stream")
+            self.send_header("Cache-Control", "no-cache")
+            self.send_header("Connection", "keep-alive")
+            self.send_header("X-Accel-Buffering", "no")
+            self.send_header("X-Upstream", up.name)
+            if eff_model:
+                self.send_header("X-Upstream-Model", eff_model)
+            self.send_header("Transfer-Encoding", "chunked")
+            self._cors_headers()
+            self.end_headers()
+            headers_sent = True
+
+            collect_sse(out, acc)
+            payload_out = chain.feed(out) if chain is not None else out
+            if payload_out:
+                self._write_chunk(payload_out)
+
+            while True:
+                piece = resp.read1(262144)
+                if not piece:
+                    break
+                if looks_like_binary_stream(piece):
+                    # 带上头部字节的十六进制：真是压缩内容/错误页时能一眼认出
+                    # （1f8b = gzip，3c68 = "<h"…），下次不用再猜。
+                    acc["error"] = ("上游返回非 SSE 的二进制数据（疑似网关错误页/压缩内容）；"
+                                    f"首 {min(len(piece), 32)} 字节(hex)={piece[:32].hex()}")
+                    break
+                out = conv.feed(piece)
+                if out:
+                    collect_sse(out, acc)
+                    payload_out = chain.feed(out) if chain is not None else out
+                    if payload_out:
+                        self._write_chunk(payload_out)
+                if conv.error:
+                    break
+
+            conv.feed(b"", final=True)
+            tail = conv.close()
+            # 流里报过错的话，别让客户端以为这次是正常结束的：
+            # 已经吐出去的字节收不回来，但至少补一个 error 事件（chat 那边
+            # 一直就是这么做的，客户端能看到真正原因）。
+            if conv.error and not acc["error"]:
+                acc["error"] = conv.error
+            if chain is not None:
+                tail_out = chain.feed(tail) if tail else b""
+                tail_out += (
+                    chain.error(f"上游流式返回错误: {acc['error']}", "upstream_error")
+                    if acc["error"] else chain.close())
+            elif acc["error"]:
+                tail_out = conv.error_event(f"上游流式返回错误: {acc['error']}") + tail
+            else:
+                tail_out = tail
+            if tail_out:
+                self._write_chunk(tail_out)
+            self.wfile.write(b"0\r\n\r\n")
+            self.wfile.flush()
+
+            latency = first_byte_at - t0
+            if acc["error"]:
+                reason = f"上游流式返回错误: {acc['error']}"
+                up.record_failure(reason, self.router.failure_threshold, up.cooldown)
+                trail.append({"upstream": up.name, "upstream_id": up.id, "ok": False,
+                              "key": key_label or None, "model": eff_model,
+                              "status": 502, "reason": reason})
+                self._record_history(up, requested_model, eff_model or "-", 502, latency,
+                                     reason, stream=True, attempts=attempts,
+                                     route_source=route_source, usage=acc["usage"],
+                                     request_text=messages_to_text(payload),
+                                     response_text="".join(acc["text"]),
+                                     reasoning_text="".join(acc["reasoning"]),
+                                     trail=trail, key_label=key_label)
+                self.log_message("Responses 流式错误：上游=%s 详情=%s", up.name, acc["error"])
+                return
+            up.record_success(latency)
+            trail.append({"upstream": up.name, "upstream_id": up.id, "ok": True,
+                          "key": key_label or None, "model": eff_model,
+                          "status": resp.status, "reason": ""})
+            self._record_history(up, requested_model, eff_model or "-", resp.status, latency,
+                                 stream=True, attempts=attempts, route_source=route_source,
+                                 usage=acc["usage"],
+                                 request_text=messages_to_text(payload),
+                                 response_text="".join(acc["text"]),
+                                 reasoning_text="".join(acc["reasoning"]),
+                                 trail=trail, key_label=key_label)
+            self.log_message("Responses 流式：上游=%s 首字节=%.2fs 模型=%s",
+                             up.name, latency, eff_model or requested_model)
+        except Retryable:
+            raise
+        except (BrokenPipeError, ConnectionResetError):
+            up.record_neutral("客户端提前断开")
+            self.close_connection = True
+        except Exception as exc:  # noqa: BLE001
+            reason = f"流中断: {type(exc).__name__}: {exc}"
+            up.record_failure(reason, self.router.failure_threshold, up.cooldown)
+            self.close_connection = True
+            if not headers_sent:
+                raise Retryable(up, 502, b"", f"流式响应失败: {exc}", key_label=key_label) from exc
+            trail.append({"upstream": up.name, "upstream_id": up.id, "ok": False,
+                          "key": key_label or None, "model": eff_model,
+                          "status": 502, "reason": reason})
+            self._record_history(up, requested_model, eff_model or "-", 502,
+                                 time.time() - t0, reason, stream=True,
+                                 attempts=attempts, route_source=route_source,
+                                 usage=acc["usage"],
+                                 request_text=messages_to_text(payload),
+                                 response_text="".join(acc["text"]),
+                                 reasoning_text="".join(acc["reasoning"]),
+                                 trail=trail, key_label=key_label)
+        finally:
+            up._close(conn)
 
     def _relay_aggregated(self, conn, resp, up: Upstream, requested_model: Optional[str],
                           eff_model: Optional[str], t0: float, route_source: str,
@@ -7909,7 +9119,9 @@ class Handler(BaseHTTPRequestHandler):
                     break
                 if looks_like_binary_stream(chunk):
                     # 头已经发出去了，换不了上游；记错误、别再把垃圾转发给客户端。
-                    acc["error"] = "上游返回非 SSE 的二进制数据（疑似网关错误页/压缩内容）"
+                    # 带上头部字节：下次再碰到能直接看出是 gzip 还是别的。
+                    acc["error"] = ("上游返回非 SSE 的二进制数据（疑似网关错误页/压缩内容）；"
+                                    f"首 {min(len(chunk), 32)} 字节(hex)={chunk[:32].hex()}")
                     break
                 collect_sse(chunk, acc)
                 if acc["error"] and b"data:" not in chunk:

@@ -218,6 +218,43 @@ model 名和状态文件位置。
 卡片上的小徽标会显示这个上游**实际从哪儿出去**（直连 / 规则 / 强制代理），
 悬停能看到具体端口和来源。见下面「上游出口」。
 
+### 接口类型：chat / responses（上游只开了一套怎么办）
+
+大多数上游只认 OpenAI 的 `/v1/chat/completions`。但有的一家中转**只开了 Responses API**，
+给它的模型发 chat 接口会被直接拒掉：
+
+```
+模型 gpt-6.1-sol 不支持 /v1/chat/completions 接口，请改用 /v1/responses（OpenAI Responses API）
+```
+
+以前这种只能靠「换下一家」绕过去 —— 只有这一家时就是死路。现在编辑上游的弹窗里有一个
+**接口类型**下拉：
+
+| 选项 | 上游实际请求的路径 | 什么时候选 |
+| --- | --- | --- |
+| Chat Completions（默认） | `/v1/chat/completions` | 绝大多数上游 |
+| Responses | `/v1/responses` | 上面那种报错的中转 / 只开 Responses 的模型 |
+
+选了 Responses 之后**客户端一个字都不用改**，照旧调 `/v1/chat/completions`，代理负责三样转换：
+
+- **请求体**：`messages` → `input`（`system` 变 `instructions`，历史 `tool_calls` 变
+  `function_call` 项、`tool` 结果变 `function_call_output`），`tools` / `tool_choice`
+  提到顶层，`max_tokens` → `max_output_tokens`。Responses 不认的参数（`n` / `stop` /
+  `stream_options` 等）会被丢掉 —— 原样透传会被上游以 `Unrecognized request argument` 400。
+- **非流式响应**：`output[]`（`message` / `function_call` / `reasoning`）→ `choices[0].message`，
+  `usage.input_tokens/output_tokens` → `prompt_tokens/completion_tokens`。
+- **参数下限**：Responses 的 `max_output_tokens` **最小 16**（小于它直接 400
+  `Expected a value >= 16, but got 1 instead`），而 chat 那边 `max_tokens: 1` 是合法的
+  （测速探针就用 1 个 token）。转换时统一抬到 16 —— 否则一次测速就会把这一家标成「不可用」。
+- **流式事件**：`response.output_text.delta` → `chat.completion.chunk`，
+  函数参数增量 → `delta.tool_calls`，最后补 `usage` 块和 `data: [DONE]`。
+
+测速、详细测试也一起走 `/v1/responses`，所以卡片不会因为接口类型选对而变红。
+客户端自己就在用 `/v1/responses` 时是**纯透传**（不转换）。
+
+命令行 / 配置文件里对应 `api_mode = "responses"`（认 `api` / `protocol` 这几个别名）。
+配置在网页上改就行，保存后立即生效，不用重启。
+
 ### 上游出口：直连 / 规则 / 强制代理
 
 **要解决的问题**：Clash Verge 一开 TUN 模式，进程「自己不设代理」**并不等于直连**。
@@ -482,6 +519,7 @@ curl -X POST http://127.0.0.1:8010/v1/messages \
 | `read_timeout_seconds` | 否 | 读上游响应的超时，默认 300 |
 | `net_mode` | 否 | 出口：`direct` / `rule` / `proxy` / `inherit`（默认，跟随全局） |
 | `proxy_url` | 否 | 只给这一家指定代理（`http://` 或 `socks5://`）；不写就用 `[proxy]` 那三个端口 |
+| `api_mode` | 否 | 这个上游认哪套接口：`chat`（默认，`/v1/chat/completions`）或 `responses`（`/v1/responses`）。见下面「接口类型」 |
 
 ### `[proxy]`（上游出口，可选）
 
