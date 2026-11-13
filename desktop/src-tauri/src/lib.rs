@@ -47,17 +47,14 @@ fn force_borderless(window: &tauri::WebviewWindow) {
     };
     use windows::Win32::UI::WindowsAndMessaging::{
         GetWindowLongW, SetWindowLongW, SetWindowPos, GWL_STYLE, SWP_FRAMECHANGED, SWP_NOMOVE,
-        SWP_NOSIZE, SWP_NOZORDER, WS_CAPTION, WS_MAXIMIZEBOX, WS_MINIMIZEBOX, WS_SYSMENU,
-        WS_THICKFRAME,
+        SWP_NOSIZE, SWP_NOZORDER, WS_CAPTION, WS_THICKFRAME,
     };
     if let Ok(hwnd) = window.hwnd() {
         unsafe {
             let style = GetWindowLongW(hwnd, GWL_STYLE);
-            let mask = (WS_CAPTION.0
-                | WS_THICKFRAME.0
-                | WS_SYSMENU.0
-                | WS_MINIMIZEBOX.0
-                | WS_MAXIMIZEBOX.0) as i32;
+            // 只去掉标题栏/粗边框；保留 MINIMIZEBOX/SYSMENU，
+            // 否则 Windows 任务栏按钮不会把「再次点击」识别成最小化。
+            let mask = (WS_CAPTION.0 | WS_THICKFRAME.0) as i32;
             let _ = SetWindowLongW(hwnd, GWL_STYLE, style & !mask);
             let _ = SetWindowPos(
                 hwnd,
