@@ -4463,6 +4463,8 @@ function renderCheckin() {
       : "";
     const hintBadge = r.configured
       ? `<span class="badge mono" title="访问令牌（打码）">${esc(r.token_hint)}</span>` : "";
+    const expiredBadge = r.token_expired
+      ? `<span class="badge bad" title="JWT 已过期，请到站点重新生成访问令牌后保存">令牌已过期</span>` : "";
     const partBox = r.configured
       ? `<label class="hint" style="display:flex;align-items:center;gap:5px"
            title="关掉后「一键签到」和自动签到都会跳过这个上游">
@@ -4477,7 +4479,7 @@ function renderCheckin() {
       <div class="ck-state">
         <span class="badge ${meta.cls}" title="${esc(title)}"
           ${meta.cls ? "" : 'style="color:var(--dim)"'}>${esc(meta.text)}</span>
-        ${reward}${wrong}${hintBadge}
+        ${reward}${wrong}${expiredBadge}${hintBadge}
       </div>
       <div class="ck-act">
         ${partBox}

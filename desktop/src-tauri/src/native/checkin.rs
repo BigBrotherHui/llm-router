@@ -1,5 +1,6 @@
 use std::sync::Arc;
 
+use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use serde_json::{json, Map, Value};
 
 use super::state::{AppState, Upstream};
@@ -43,6 +44,19 @@ fn token_of(up: &Upstream) -> String {
         .to_string()
 }
 
+fn jwt_exp(token: &str) -> Option<i64> {
+    let payload = token.split('.').nth(1)?;
+    let bytes = URL_SAFE_NO_PAD.decode(payload).ok()?;
+    let value: Value = serde_json::from_slice(&bytes).ok()?;
+    value.get("exp").and_then(|v| v.as_i64())
+}
+
+fn token_expired(token: &str) -> bool {
+    jwt_exp(token)
+        .map(|exp| exp < chrono::Utc::now().timestamp())
+        .unwrap_or(false)
+}
+
 fn state_of(up: &Upstream) -> Value {
     up.extra
         .get("checkin_state")
@@ -67,6 +81,8 @@ pub fn rows(state: &AppState) -> Vec<Value> {
                 "configured": !token.is_empty(),
                 "checkin_enabled": enabled,
                 "token_hint": if token.is_empty() { String::new() } else { super::state::mask_key(&token) },
+                "token_expires_at": jwt_exp(&token),
+                "token_expired": token_expired(&token),
                 "user_id": cfg.get("user_id").cloned().unwrap_or_else(|| json!("")),
                 "path": cfg.get("path").cloned().unwrap_or_else(|| json!("")),
                 "token_looks_wrong": token.to_ascii_lowercase().starts_with("sk-"),
@@ -229,6 +245,14 @@ async fn run_one(state: &AppState, up: &Upstream, press: bool) -> Value {
             "nocfg",
             false,
             "这里要填站点的「访问令牌」，不是 sk- 开头的推理 Key",
+            Value::Null,
+        );
+    }
+    if token_expired(&token) {
+        return result(
+            "auth",
+            false,
+            "访问令牌已过期（JWT exp 已过），请到站点重新生成访问令牌后保存",
             Value::Null,
         );
     }
