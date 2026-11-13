@@ -1,6 +1,7 @@
 use std::sync::Arc;
 
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
+use futures_util::StreamExt;
 use serde_json::{json, Map, Value};
 
 use super::state::{AppState, Upstream};
@@ -220,8 +221,19 @@ pub async fn run(state: Arc<AppState>, ids: Vec<String>, press_checkin: bool) ->
             .collect()
     };
     let mut out = Vec::new();
-    for up in targets {
-        let result = run_one(&state, &up, press_checkin).await;
+    let results: Vec<(Upstream, Value)> = futures_util::stream::iter(targets)
+        .map(|up| {
+            let state = state.clone();
+            let up2 = up.clone();
+            async move {
+                let result = run_one(&state, &up2, press_checkin).await;
+                (up, result)
+            }
+        })
+        .buffer_unordered(6)
+        .collect()
+        .await;
+    for (up, result) in results {
         set_state(&state, &up.id, &result);
         if press_checkin && result.get("ok").and_then(|v| v.as_bool()).unwrap_or(false) {
             let mut entry = result.clone();

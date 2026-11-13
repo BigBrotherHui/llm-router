@@ -172,7 +172,7 @@ pub async fn chat_completions(
         };
     }
     macro_rules! finish_journal {
-        ($final_up:expr, $final_model:expr, $final_status:expr, $final_ok:expr, $final_err:expr) => {{
+        ($final_up:expr, $final_model:expr, $final_status:expr, $final_ok:expr, $final_err:expr, $usage:expr) => {{
             super::state::append_journal(
                 &state,
                 json!({
@@ -190,7 +190,7 @@ pub async fn chat_completions(
                     "attempts": attempts.len(),
                     "route_source": "配置",
                     "error": $final_err,
-                    "usage": {},
+                    "usage": $usage,
                     "trail": attempts,
                 }),
             );
@@ -221,14 +221,37 @@ pub async fn chat_completions(
                         .unwrap_or("application/json")
                         .to_string();
                     if stream {
+                        // 先读到首包再决定是否提交：首包就失败/为空的，换下一个上游，
+                        // 而不是把一个半截的 200 流交给客户端。
+                        let mut source = resp.bytes_stream();
+                        let first = match source.next().await {
+                            Some(Ok(bytes)) => bytes,
+                            Some(Err(e)) => {
+                                super::state::record_upstream_result(&state, &up.id, false, &e.to_string());
+                                push_attempt!(up, real_model, false, status.as_u16(), started.elapsed().as_secs_f64(), e.to_string());
+                                last_message = format!("上游 {} 首包读取失败: {e}", up.name);
+                                continue;
+                            }
+                            None => {
+                                super::state::record_upstream_result(&state, &up.id, false, "首包为空");
+                                push_attempt!(up, real_model, false, status.as_u16(), started.elapsed().as_secs_f64(), "首包为空");
+                                last_message = format!("上游 {} 返回空响应", up.name);
+                                continue;
+                            }
+                        };
                         super::state::record_upstream_result(&state, &up.id, true, "");
                         push_attempt!(up, real_model, true, status.as_u16(), started.elapsed().as_secs_f64(), "");
-                        finish_journal!(up, real_model, 200, true, "");
+                        finish_journal!(up, real_model, 200, true, "", json!({}));
                         state.bump_total();
                         let requested_name = requested.clone();
-                        let mut source = resp.bytes_stream();
                         let body_stream = async_stream::stream! {
                             let mut buffer = String::new();
+                            buffer.push_str(&String::from_utf8_lossy(&first));
+                            while let Some(pos) = buffer.find('\n') {
+                                let line = buffer[..=pos].to_string();
+                                buffer.drain(..=pos);
+                                yield Ok::<_, std::io::Error>(Bytes::from(rewrite_sse_line(&line, &requested_name)));
+                            }
                             while let Some(chunk) = source.next().await {
                                 match chunk {
                                     Ok(bytes) => {
@@ -237,6 +260,11 @@ pub async fn chat_completions(
                                             let line = buffer[..=pos].to_string();
                                             buffer.drain(..=pos);
                                             yield Ok::<_, std::io::Error>(Bytes::from(rewrite_sse_line(&line, &requested_name)));
+                                        }
+                                        // 单行异常长（没有换行）时先吐出去，防止内存无限增长
+                                        if buffer.len() > 1024 * 1024 {
+                                            yield Ok::<_, std::io::Error>(Bytes::from(rewrite_sse_line(&buffer, &requested_name)));
+                                            buffer.clear();
                                         }
                                     }
                                     Err(e) => {
@@ -265,10 +293,14 @@ pub async fn chat_completions(
                             continue;
                         }
                     };
+                    let usage = serde_json::from_slice::<Value>(&bytes)
+                        .ok()
+                        .and_then(|v| v.get("usage").cloned())
+                        .unwrap_or_else(|| json!({}));
                     let body = rewrite_model(&bytes, &requested).unwrap_or(bytes);
                     super::state::record_upstream_result(&state, &up.id, true, "");
                     push_attempt!(up, real_model, true, status.as_u16(), started.elapsed().as_secs_f64(), "");
-                    finish_journal!(up, real_model, 200, true, "");
+                    finish_journal!(up, real_model, 200, true, "", usage);
                     state.bump_total();
                     return Response::builder()
                         .status(StatusCode::OK)
@@ -301,7 +333,7 @@ pub async fn chat_completions(
                 requested.clone(),
             )
         });
-    finish_journal!(final_up, final_model, last_status.as_u16(), false, last_message);
+    finish_journal!(final_up, final_model, last_status.as_u16(), false, last_message, json!({}));
     error_response(last_status, &last_message, &attempts)
 }
 

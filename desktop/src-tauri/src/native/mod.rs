@@ -6,23 +6,49 @@ pub mod scheduler;
 pub mod state;
 pub mod stats;
 
-use std::sync::Arc;
+use std::hash::{Hash, Hasher};
+use std::sync::{Arc, OnceLock};
 
-use axum::extract::DefaultBodyLimit;
-use axum::http::StatusCode;
+use axum::extract::{DefaultBodyLimit, State};
+use axum::http::header::{CACHE_CONTROL, CONTENT_TYPE, ETAG, IF_NONE_MATCH};
+use axum::http::{HeaderMap, StatusCode};
+use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::Router;
+use tower_http::compression::predicate::{DefaultPredicate, NotForContentType, Predicate};
 use tower_http::compression::CompressionLayer;
 
 use state::AppState;
 
 const WEBUI: &str = include_str!("../../../../webui.html");
 
-async fn index() -> Response {
+fn webui_etag() -> &'static str {
+    static ETAG_VALUE: OnceLock<String> = OnceLock::new();
+    ETAG_VALUE.get_or_init(|| {
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        WEBUI.hash(&mut hasher);
+        format!("\"{:x}\"", hasher.finish())
+    })
+}
+
+async fn index(headers: HeaderMap) -> Response {
+    let etag = webui_etag();
+    if headers
+        .get(IF_NONE_MATCH)
+        .and_then(|v| v.to_str().ok())
+        .map(|v| v == etag)
+        .unwrap_or(false)
+    {
+        return StatusCode::NOT_MODIFIED.into_response();
+    }
     (
         StatusCode::OK,
-        [("content-type", "text/html; charset=utf-8")],
+        [
+            (CONTENT_TYPE, "text/html; charset=utf-8"),
+            (ETAG, etag),
+            (CACHE_CONTROL, "no-cache"),
+        ],
         WEBUI,
     )
         .into_response()
@@ -34,6 +60,25 @@ async fn health() -> Response {
 
 async fn favicon() -> Response {
     StatusCode::NO_CONTENT.into_response()
+}
+
+/// SSE：请求完成 / 状态保存时推一个极小事件，前端收到立刻刷一次，轮询只做兜底。
+async fn events(State(state): State<Arc<AppState>>) -> Response {
+    let mut rx = state.events_tx.subscribe();
+    let stream = async_stream::stream! {
+        loop {
+            match rx.recv().await {
+                Ok(v) => {
+                    yield Ok::<_, std::convert::Infallible>(
+                        Event::default().event("change").data(v.to_string()),
+                    );
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                Err(_) => break,
+            }
+        }
+    };
+    Sse::new(stream).keep_alive(KeepAlive::default()).into_response()
 }
 
 pub async fn serve(state: Arc<AppState>, port: u16) -> Result<(), String> {
@@ -52,6 +97,7 @@ pub async fn serve(state: Arc<AppState>, port: u16) -> Result<(), String> {
         .route("/favicon.ico", get(favicon))
         .route("/health", get(health))
         .route("/healthz", get(health))
+        .route("/events", get(events))
         .route("/stats", get(admin::stats_handler))
         .route("/stats/catalog", get(admin::stats_catalog))
         .route("/admin/stats", get(admin::stats_handler))
@@ -92,11 +138,14 @@ pub async fn serve(state: Arc<AppState>, port: u16) -> Result<(), String> {
         .route("/admin/rename-group", post(admin::rename_group))
         .route("/admin/journal/index", get(admin::journal_index))
         .route("/admin/journal", get(admin::journal_query))
+        .route("/admin/journal/entry", get(admin::journal_entry))
         .route("/admin/history", get(admin::journal_query))
         .route("/v1/models", get(proxy::list_models))
         .route("/v1/chat/completions", post(proxy::chat_completions))
         .layer(DefaultBodyLimit::max(64 * 1024 * 1024))
-        .layer(CompressionLayer::new())
+        .layer(CompressionLayer::new().compress_when(
+            DefaultPredicate::new().and(NotForContentType::new("text/event-stream")),
+        ))
         .with_state(state.clone());
 
     // 请求的端口被占（比如别的程序或旧实例）时，从 +1 开始往后找空闲端口，
@@ -124,6 +173,19 @@ pub async fn serve(state: Arc<AppState>, port: u16) -> Result<(), String> {
     state
         .port
         .store(actual_port, std::sync::atomic::Ordering::Relaxed);
+
+    // 统计每 5 秒批量落盘一次，请求路径上不再同步写 stats.json。
+    {
+        let flush_state = state.clone();
+        tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(std::time::Duration::from_secs(5));
+            loop {
+                ticker.tick().await;
+                stats::flush(&flush_state);
+            }
+        });
+    }
+
     axum::serve(listener, app)
         .await
         .map_err(|e| format!("HTTP 服务退出: {e}"))

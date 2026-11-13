@@ -5,6 +5,7 @@ use axum::extract::{Query, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::Json;
+use futures_util::StreamExt;
 use serde_json::{json, Value};
 use tauri::Manager;
 
@@ -30,15 +31,37 @@ pub async fn stats_handler(
     Query(q): Query<HashMap<String, String>>,
 ) -> Response {
     let mut snap = super::state::snapshot_cached(&state);
-    let stats_data = stats::load(&state.stats_path());
-    let range = q.get("range").cloned().unwrap_or_default();
+    let stats_data = stats::load_runtime(&state);
     snap["total_requests"] = json!(stats_data
         .get("totals")
         .and_then(|v| v.get("calls"))
         .and_then(|v| v.as_i64())
         .unwrap_or(0));
     snap["stats"] = stats::meta(&stats_data);
-    snap["stats_range"] = stats::render(&stats::range_bucket(&stats_data, &range), &range);
+    // 上游大字段（可用模型列表 / 上次测速 / 余额）只在「上游来源」「模型路由」
+    // 这两个 tab 需要；其他 tab 用 light 版本，周期包能小一个数量级。
+    let full = q.get("full").map(|v| v == "1").unwrap_or(false);
+    if !full {
+        if let Some(arr) = snap.get_mut("upstreams").and_then(|v| v.as_array_mut()) {
+            for up in arr {
+                if let Some(obj) = up.as_object_mut() {
+                    for key in [
+                        "available_models",
+                        "last_checks",
+                        "balance",
+                        "models_fetched_at",
+                        "key_hints",
+                    ] {
+                        obj.remove(key);
+                    }
+                }
+            }
+        }
+    }
+    // 按天/按月统计只在请求记录页用，普通轮询不传 range 就不算这块。
+    if let Some(range) = q.get("range") {
+        snap["stats_range"] = stats::render(&stats::range_bucket(&stats_data, range), range);
+    }
     ok(snap)
 }
 
@@ -68,6 +91,7 @@ pub async fn upstream_add(State(state): State<Arc<AppState>>, Json(p): Json<Valu
         file.upstreams.push(up.clone());
     }
     let _ = state.save();
+    state.bump_catalog();
     ok(json!({"ok": true, "upstream": {"id": id}}))
 }
 
@@ -115,6 +139,7 @@ pub async fn upstream_update(State(state): State<Arc<AppState>>, Json(p): Json<V
         }
     }
     let _ = state.save();
+    state.bump_catalog();
     ok(json!({"ok": true}))
 }
 
@@ -129,6 +154,7 @@ pub async fn upstream_delete(State(state): State<Arc<AppState>>, Json(p): Json<V
         file.models.retain(|_, r| !r.entries.is_empty());
     }
     let _ = state.save();
+    state.bump_catalog();
     ok(json!({"ok": true}))
 }
 
@@ -146,59 +172,67 @@ pub async fn fetch_models(State(state): State<Arc<AppState>>, Json(p): Json<Valu
             .cloned()
             .collect()
     };
-    let mut results = Vec::new();
-    for up in targets {
-        let url = super::proxy::models_url(&up.base_url);
-        let timeout = up.first_timeout_seconds.unwrap_or(30.0).clamp(5.0, 60.0);
-        let mut req = state
-            .client
-            .get(&url)
-            .timeout(std::time::Duration::from_secs_f64(timeout))
-            .header("Accept", "application/json");
-        if let Some(k) = up.api_keys.first() {
-            req = req.header("authorization", format!("Bearer {k}"));
-        }
-        let result = match req.send().await {
-            Ok(resp) => {
-                let status = resp.status();
-                let text = resp.text().await.unwrap_or_default();
-                if status.is_success() {
-                    match serde_json::from_str::<Value>(&text) {
-                        Ok(v) => {
-                            let mut models: Vec<String> = Vec::new();
-                            if let Some(arr) = v.get("data").and_then(|x| x.as_array()) {
-                                for item in arr {
-                                    if let Some(id) = item.get("id").and_then(|x| x.as_str()) {
-                                        models.push(id.to_string());
+    // 51 个上游并发拉，最多 8 个同时在跑：总耗时从「累加」变成「最慢批次」。
+    let results: Vec<Value> = futures_util::stream::iter(targets)
+        .map(|up| {
+            let state = state.clone();
+            async move {
+                let url = super::proxy::models_url(&up.base_url);
+                let timeout = up.first_timeout_seconds.unwrap_or(30.0).clamp(5.0, 60.0);
+                let mut req = state
+                    .client
+                    .get(&url)
+                    .timeout(std::time::Duration::from_secs_f64(timeout))
+                    .header("Accept", "application/json");
+                if let Some(k) = up.api_keys.first() {
+                    req = req.header("authorization", format!("Bearer {k}"));
+                }
+                match req.send().await {
+                    Ok(resp) => {
+                        let status = resp.status();
+                        let text = resp.text().await.unwrap_or_default();
+                        if status.is_success() {
+                            match serde_json::from_str::<Value>(&text) {
+                                Ok(v) => {
+                                    let mut models: Vec<String> = Vec::new();
+                                    if let Some(arr) = v.get("data").and_then(|x| x.as_array()) {
+                                        for item in arr {
+                                            if let Some(id) = item.get("id").and_then(|x| x.as_str()) {
+                                                models.push(id.to_string());
+                                            }
+                                        }
                                     }
+                                    models.sort();
+                                    models.dedup();
+                                    {
+                                        let mut file = state.file.write().unwrap();
+                                        if let Some(u) = file.find_upstream_mut(&up.id) {
+                                            u.available_models = models.clone();
+                                            u.extra.insert("models_fetched_at".into(), json!(now_secs()));
+                                            u.extra.insert("models_error".into(), Value::Null);
+                                            let selected = u.selected();
+                                            let keep: Vec<String> =
+                                                selected.into_iter().filter(|m| models.contains(m)).collect();
+                                            u.selected_models = Some(keep);
+                                        }
+                                    }
+                                    let _ = state.save();
+                                    state.bump_catalog();
+                                    json!({"id": up.id, "name": up.name, "ok": true, "models": models, "count": models.len()})
                                 }
+                                Err(e) => json!({"id": up.id, "name": up.name, "ok": false, "error": format!("返回不是合法 JSON: {e}")}),
                             }
-                            models.sort();
-                            models.dedup();
-                            {
-                                let mut file = state.file.write().unwrap();
-                                if let Some(u) = file.find_upstream_mut(&up.id) {
-                                    u.available_models = models.clone();
-                                    u.extra.insert("models_fetched_at".into(), json!(now_secs()));
-                                    u.extra.insert("models_error".into(), Value::Null);
-                                    let selected = u.selected();
-                                    let keep: Vec<String> = selected.into_iter().filter(|m| models.contains(m)).collect();
-                                    u.selected_models = Some(keep);
-                                }
-                            }
-                            let _ = state.save();
-                            json!({"id": up.id, "name": up.name, "ok": true, "models": models, "count": models.len()})
+                        } else {
+                            json!({"id": up.id, "name": up.name, "ok": false, "status": status.as_u16(), "error": format!("HTTP {}: {}", status, truncate(&text, 300))})
                         }
-                        Err(e) => json!({"id": up.id, "name": up.name, "ok": false, "error": format!("返回不是合法 JSON: {e}")}),
                     }
-                } else {
-                    json!({"id": up.id, "name": up.name, "ok": false, "status": status.as_u16(), "error": format!("HTTP {}: {}", status, truncate(&text, 300))})
+                    Err(e) => json!({"id": up.id, "name": up.name, "ok": false, "error": e.to_string()}),
                 }
             }
-            Err(e) => json!({"id": up.id, "name": up.name, "ok": false, "error": e.to_string()}),
-        };
-        results.push(result);
-    }
+        })
+        .buffer_unordered(8)
+        .collect()
+        .await;
     ok(json!({"ok": true, "results": results}))
 }
 
@@ -233,6 +267,7 @@ pub async fn select_models(State(state): State<Arc<AppState>>, Json(p): Json<Val
         let _ = file.sync_routes(&default_strategy);
     }
     let _ = state.save();
+    state.bump_catalog();
     ok(json!({"ok": true}))
 }
 
@@ -265,6 +300,7 @@ pub async fn set_group(State(state): State<Arc<AppState>>, Json(p): Json<Value>)
         let _ = (created, removed);
     }
     let _ = state.save();
+    state.bump_catalog();
     ok(json!({"ok": true}))
 }
 
@@ -300,6 +336,7 @@ pub async fn model_save(State(state): State<Arc<AppState>>, Json(p): Json<Value>
         file.models.insert(name.clone(), ModelRoute { strategy, entries, orderings: Default::default(), extra: Default::default() });
     }
     let _ = state.save();
+    state.bump_catalog();
     ok(json!({"ok": true, "model": {"name": name}}))
 }
 
@@ -316,6 +353,7 @@ pub async fn model_delete(State(state): State<Arc<AppState>>, Json(p): Json<Valu
         }
     }
     let _ = state.save();
+    state.bump_catalog();
     ok(json!({"ok": true, "deleted": name}))
 }
 
@@ -576,17 +614,22 @@ pub async fn speedtest(State(state): State<Arc<AppState>>, Json(p): Json<Value>)
             })
             .collect()
     };
-    let mut results = Vec::new();
-    for (up, model) in targets {
-        let m = model
-            .or_else(|| up.selected().into_iter().next())
-            .unwrap_or_else(|| up.available_models.first().cloned().unwrap_or_default());
-        if m.is_empty() {
-            results.push(json!({"id": up.id, "name": up.name, "ok": false, "error": "没有可用模型"}));
-            continue;
-        }
-        results.push(proxy::ping_upstream(&state, &up, &m).await);
-    }
+    let results: Vec<Value> = futures_util::stream::iter(targets)
+        .map(|(up, model)| {
+            let state = state.clone();
+            async move {
+                let m = model
+                    .or_else(|| up.selected().into_iter().next())
+                    .unwrap_or_else(|| up.available_models.first().cloned().unwrap_or_default());
+                if m.is_empty() {
+                    return json!({"id": up.id, "name": up.name, "ok": false, "error": "没有可用模型"});
+                }
+                proxy::ping_upstream(&state, &up, &m).await
+            }
+        })
+        .buffer_unordered(8)
+        .collect()
+        .await;
     ok(json!({"ok": true, "results": results}))
 }
 
@@ -599,6 +642,13 @@ pub async fn journal_query(
     Query(q): Query<HashMap<String, String>>,
 ) -> Response {
     ok(journal::query(&state, &q))
+}
+
+pub async fn journal_entry(
+    State(state): State<Arc<AppState>>,
+    Query(q): Query<HashMap<String, String>>,
+) -> Response {
+    ok(journal::entry(&state, &q))
 }
 
 pub async fn proxy_save(State(state): State<Arc<AppState>>, Json(p): Json<Value>) -> Response {
@@ -793,6 +843,7 @@ pub async fn auto_configure(State(state): State<Arc<AppState>>, Json(_p): Json<V
         }
     }
     let _ = state.save();
+    state.bump_catalog();
     ok(json!({"ok": true, "created": created, "skipped": []}))
 }
 
@@ -827,6 +878,7 @@ pub async fn rename_group(State(state): State<Arc<AppState>>, Json(p): Json<Valu
         }
     }
     let _ = state.save();
+    state.bump_catalog();
     ok(json!({"ok": true, "from": from, "to": to}))
 }
 

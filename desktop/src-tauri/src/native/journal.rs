@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::io::{Read, Seek, SeekFrom};
+use std::sync::Arc;
 
 use serde_json::{json, Value};
 
@@ -29,6 +30,36 @@ fn read_tail(path: &std::path::Path, max_bytes: u64) -> Vec<Value> {
         .collect()
 }
 
+/// 8MB 尾巴只解析一次：index / query / entry 共用，按文件长度+mtime 失效。
+fn tail_cached(state: &AppState) -> Arc<Vec<Value>> {
+    let path = state.history_path();
+    let meta = std::fs::metadata(&path).ok();
+    let len = meta.as_ref().map(|m| m.len()).unwrap_or(0);
+    let modified = meta.and_then(|m| m.modified().ok());
+    if let Ok(cache) = state.journal_cache.lock() {
+        if let Some((cached_len, cached_mtime, entries)) = cache.as_ref() {
+            if *cached_len == len && *cached_mtime == modified {
+                return entries.clone();
+            }
+        }
+    }
+    let entries = Arc::new(read_tail(&path, 8 * 1024 * 1024));
+    if let Ok(mut cache) = state.journal_cache.lock() {
+        *cache = Some((len, modified, entries.clone()));
+    }
+    entries
+}
+
+/// 列表页不需要大文本；详情走 /admin/journal/entry。
+fn strip_heavy(mut entry: Value) -> Value {
+    if let Some(obj) = entry.as_object_mut() {
+        for key in ["request_text", "response_text", "reasoning_text"] {
+            obj.remove(key);
+        }
+    }
+    entry
+}
+
 fn date_of(entry: &Value) -> String {
     let at = entry.get("at").and_then(|v| v.as_f64()).unwrap_or(0.0);
     if let Some(dt) = chrono::DateTime::from_timestamp(at as i64, 0) {
@@ -45,11 +76,11 @@ fn count_map_to_list(map: HashMap<String, usize>) -> Vec<Value> {
 }
 
 pub fn index(state: &AppState) -> Value {
-    let entries = read_tail(&state.history_path(), 8 * 1024 * 1024);
+    let entries = tail_cached(state);
     let mut days: HashMap<String, usize> = HashMap::new();
     let mut months: HashMap<String, usize> = HashMap::new();
     let mut groups: HashMap<String, usize> = HashMap::new();
-    for e in &entries {
+    for e in entries.iter() {
         let d = date_of(e);
         if !d.is_empty() {
             *days.entry(d.clone()).or_default() += 1;
@@ -67,7 +98,7 @@ pub fn index(state: &AppState) -> Value {
 }
 
 pub fn query(state: &AppState, q: &HashMap<String, String>) -> Value {
-    let entries = read_tail(&state.history_path(), 8 * 1024 * 1024);
+    let entries = tail_cached(state);
     let day = q.get("day").cloned().unwrap_or_default();
     let month = q.get("month").cloned().unwrap_or_default();
     let group = q.get("group").cloned().unwrap_or_default();
@@ -75,7 +106,7 @@ pub fn query(state: &AppState, q: &HashMap<String, String>) -> Value {
     let model = q.get("model").cloned().unwrap_or_default();
 
     let mut keep: Vec<Value> = entries
-        .into_iter()
+        .iter()
         .filter(|e| {
             let d = date_of(e);
             if !day.is_empty() && d != day {
@@ -103,6 +134,7 @@ pub fn query(state: &AppState, q: &HashMap<String, String>) -> Value {
             }
             true
         })
+        .cloned()
         .collect();
     keep.sort_by(|a, b| {
         b.get("at").and_then(|v| v.as_f64()).unwrap_or(0.0)
@@ -112,7 +144,12 @@ pub fn query(state: &AppState, q: &HashMap<String, String>) -> Value {
     let total = keep.len();
     let offset = q.get("offset").and_then(|v| v.parse::<usize>().ok()).unwrap_or(0);
     let limit = q.get("limit").and_then(|v| v.parse::<usize>().ok()).unwrap_or(100).min(1000);
-    let page: Vec<Value> = keep.into_iter().skip(offset).take(limit).collect();
+    let page: Vec<Value> = keep
+        .into_iter()
+        .skip(offset)
+        .take(limit)
+        .map(strip_heavy)
+        .collect();
     json!({
         "entries": page,
         "total": total,
@@ -122,4 +159,21 @@ pub fn query(state: &AppState, q: &HashMap<String, String>) -> Value {
         "groups": [],
         "upstreams": [],
     })
+}
+
+/// 单条详情（带 request_text / response_text / reasoning_text）。
+pub fn entry(state: &AppState, q: &HashMap<String, String>) -> Value {
+    let at = q
+        .get("at")
+        .and_then(|v| v.parse::<f64>().ok())
+        .unwrap_or(-1.0);
+    let upstream = q.get("upstream").cloned().unwrap_or_default();
+    let entries = tail_cached(state);
+    let found = entries.iter().rev().find(|e| {
+        let same_at = (e.get("at").and_then(|v| v.as_f64()).unwrap_or(-1.0) - at).abs() < 0.001;
+        let same_up = upstream.is_empty()
+            || e.get("upstream").and_then(|v| v.as_str()) == Some(upstream.as_str());
+        same_at && same_up
+    });
+    json!({"entry": found.cloned().unwrap_or(Value::Null)})
 }

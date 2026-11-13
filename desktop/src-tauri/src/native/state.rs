@@ -1,8 +1,8 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Mutex, RwLock};
-use std::time::Instant;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, OnceLock, RwLock};
+use std::time::{Instant, SystemTime};
 
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
@@ -261,6 +261,19 @@ pub struct AppState {
     pub catalog_rev: AtomicU64,
     /// catalog 缓存（按版本号）。
     pub catalog_cache: Mutex<Option<(u64, Value)>>,
+    /// 历史文件尾部解析缓存：(文件长度, mtime, entries)。
+    pub journal_cache: Mutex<Option<(u64, Option<SystemTime>, Arc<Vec<Value>>)>>,
+    /// stats.json 读改写串行化。
+    pub stats_lock: Mutex<()>,
+    /// state.json 并发保存串行化（并行拉模型时会同时 save）。
+    pub save_lock: Mutex<()>,
+    /// 统计内存态：请求完成只改内存，定时批量落盘。
+    pub stats_mem: Mutex<Option<Value>>,
+    pub stats_dirty: AtomicBool,
+    /// SSE 事件源：请求完成 / 状态保存后推给前端。
+    pub events_tx: tokio::sync::broadcast::Sender<Value>,
+    /// 流水写入队列：请求路径不碰磁盘，独立线程顺序 append。
+    pub journal_tx: OnceLock<std::sync::mpsc::Sender<Value>>,
 }
 
 impl AppState {
@@ -290,6 +303,13 @@ impl AppState {
             snapshot_cache: Mutex::new(None),
             catalog_rev: AtomicU64::new(1),
             catalog_cache: Mutex::new(None),
+            journal_cache: Mutex::new(None),
+            stats_lock: Mutex::new(()),
+            save_lock: Mutex::new(()),
+            stats_mem: Mutex::new(None),
+            stats_dirty: AtomicBool::new(false),
+            events_tx: tokio::sync::broadcast::channel(128).0,
+            journal_tx: OnceLock::new(),
         }
     }
 
@@ -324,6 +344,7 @@ impl AppState {
     }
 
     pub fn save(&self) -> Result<(), String> {
+        let _guard = self.save_lock.lock().unwrap();
         if let Ok(mut cache) = self.snapshot_cache.lock() {
             *cache = None;
         }
@@ -335,12 +356,16 @@ impl AppState {
         let tmp = self.state_path.with_extension("json.tmp");
         std::fs::write(&tmp, text).map_err(|e| e.to_string())?;
         std::fs::rename(&tmp, &self.state_path).map_err(|e| e.to_string())?;
-        // 状态变了：catalog 版本号自增，前端下次轮询会重新拉 catalog。
-        self.catalog_rev.fetch_add(1, Ordering::Relaxed);
-        if let Ok(mut c) = self.catalog_cache.lock() {
-            *c = None;
-        }
+        let _ = self.events_tx.send(json!({"type": "state"}));
         Ok(())
+    }
+
+    /// 只有影响模型候选表（上游/勾选/分组/路由）的改动才需要让前端重拉 catalog。
+    pub fn bump_catalog(&self) {
+        self.catalog_rev.fetch_add(1, Ordering::Relaxed);
+        if let Ok(mut cache) = self.catalog_cache.lock() {
+            *cache = None;
+        }
     }
 
     pub fn bump_total(&self) {
@@ -404,15 +429,35 @@ pub fn upstream_failure_count(state: &AppState, uid: &str) -> u32 {
 
 /// 追加一条请求流水（JSONL，与 Python 版格式对齐，UI 靠 trail 显示尝试链）。
 pub fn append_journal(state: &AppState, entry: Value) {
-    let path = state.history_path();
-    if let Some(dir) = path.parent() {
-        let _ = std::fs::create_dir_all(dir);
-    }
-    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&path) {
-        use std::io::Write;
-        let line = serde_json::to_string(&entry).unwrap_or_default();
-        let _ = writeln!(f, "{line}");
-    }
+    super::stats::record(state, &entry);
+    let _ = state.events_tx.send(json!({
+        "type": "journal",
+        "at": entry.get("at").cloned().unwrap_or(Value::Null),
+    }));
+    // 独立线程顺序落盘：请求路径上不阻塞 async 运行时。
+    let tx = state.journal_tx.get_or_init(|| {
+        let (tx, rx) = std::sync::mpsc::channel::<Value>();
+        let path = state.history_path();
+        std::thread::spawn(move || {
+            if let Some(dir) = path.parent() {
+                let _ = std::fs::create_dir_all(dir);
+            }
+            while let Ok(item) = rx.recv() {
+                if let Ok(mut f) = std::fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(&path)
+                {
+                    use std::io::Write;
+                    if let Ok(line) = serde_json::to_string(&item) {
+                        let _ = writeln!(f, "{line}");
+                    }
+                }
+            }
+        });
+        tx
+    });
+    let _ = tx.send(entry);
 }
 
 pub fn mask_key(key: &str) -> String {

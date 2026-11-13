@@ -1728,12 +1728,13 @@ function bindDelegatedEvents() {
 }
 
 /* ================= 渲染：模型 ================= */
+let modelLimit = 200;
+
 function renderModels() {
   const cat = state.catalog || [];
   const configured = state.models || {};
   const q = $("#mFilter").value.trim().toLowerCase();
   const mode = $("#mFilterMode").value;
-
   let list = cat.map(e => ({
     name: e.name,
     // 注意：后端字段叫 upstreams（已选用的），不是 ups
@@ -1774,7 +1775,10 @@ function renderModels() {
   else if (mode === "multi") list = list.filter(x => x.ups.length > 1);
 
   const nCfg = Object.keys(configured).length;
-  $("#mCount").textContent = `已选用 ${list.length} 个模型，已配置路由 ${nCfg} 个`;
+  const total = list.length;
+  const page = list.slice(0, modelLimit);
+  $("#mCount").textContent = `已选用 ${total} 个模型，已配置路由 ${nCfg} 个` +
+    (total > page.length ? `（显示前 ${page.length} 个）` : "");
 
   if (!list.length) {
     const anyOffered = cat.length > 0;
@@ -1786,7 +1790,10 @@ function renderModels() {
   }
 
   const STRAT = { priority: "按顺序", round_robin: "轮询", random: "随机" };
-  applyHtml("models", $("#models"), `<div class="mlist">` + list.map(m => {
+  const more = total > page.length
+    ? `<div style="padding:12px 4px"><button class="mini" id="modelsMore">加载更多（还有 ${total - page.length} 个）</button></div>`
+    : "";
+  applyHtml("models", $("#models"), `<div class="mlist">` + page.map(m => {
     const has = m.ups.filter(u => u.enabled).length;
     const cls = m.configured ? "configured" : (m.ups.length ? "" : "none");
     const c = configured[m.name] || {};
@@ -1823,7 +1830,9 @@ function renderModels() {
              title="删除这个模型的路由配置(删除后会退回自动模式)">删除路由</button>`
         : ""}
     </div>`;
-  }).join("") + `</div>`);
+  }).join("") + more + `</div>`);
+  const moreBtn = $("#modelsMore");
+  if (moreBtn) moreBtn.onclick = () => { modelLimit += 200; renderModels(); };
 }
 
 /* ================= 模型编辑 ================= */
@@ -3263,8 +3272,8 @@ function curJournalFilter() {
 async function loadJournal() {
   const f = curJournalFilter();
   const qs = new URLSearchParams({
-    limit: String(reqPage * REQ_PAGE),
-    offset: "0",
+    limit: String(REQ_PAGE),
+    offset: String((reqPage - 1) * REQ_PAGE),
   });
   if (f.day) qs.set("day", f.day);
   if (f.month) qs.set("month", f.month);
@@ -3666,6 +3675,15 @@ function setTab(name) {
   curTab = tab;
   document.title = "llm-router 控制台 · " + TAB_LABEL[tab];
   try { localStorage.setItem("llm-router-tab", tab); } catch (e) {}
+  // 切过去立刻按该 tab 需要的精度拉一次（up/model 要 full，req 要 range）。
+  if (state) {
+    if (tab === "req" || tab === "up" || tab === "model") {
+      refresh().catch(() => {});
+    } else if (tab === "set") {
+      renderSettings();
+    }
+    renderTabNums();
+  }
 }
 
 // tab 栏要粘在 header 底下，而 header 窄屏会换行，高度得实测
@@ -4174,7 +4192,10 @@ async function ensureCatalog() {
 async function refresh() {
   try {
     const prevCatalog = state && state.catalog;
-    state = await api("/stats?range=" + statsRangeKey());
+    const wantFull = curTab === "up" || curTab === "model";
+    let statsUrl = "/stats?full=" + (wantFull ? "1" : "0");
+    if (curTab === "req") statsUrl += "&range=" + encodeURIComponent(statsRangeKey());
+    state = await api(statsUrl);
     if (prevCatalog) state.catalog = prevCatalog;
     // 服务端版本变了（刚重启过）就自动重载页面 —— 否则浏览器还跑着旧的
     // 前端 JS、后端已是新版本，界面上就会出现「两边对不上」的假象。
@@ -4190,37 +4211,40 @@ async function refresh() {
     $("#ver").textContent = "v" + state.version;
     $("#baseUrl").textContent = serverUrl + "/v1";
     $("#statePath").textContent = state.state_path || "";
-    await ensureCatalog();
-    renderUpstreams();
-    renderModels();
-    renderSettings();
+    // catalog 只在模型/上游 tab 需要；其他 tab 不拉 4367 个分组。
+    if (curTab === "model" || curTab === "up") await ensureCatalog();
+    if (curTab === "up") renderUpstreams();
+    if (curTab === "model") renderModels();
+    if (curTab === "set") renderSettings();
     // 签到页：只在这一页上才刷（读的是后端本地状态，不产生上游请求）
     if (curTab === "ck") loadCheckin();
-    // 流水索引（有哪些天/月/分组）→ 填筛选下拉；再取当前筛选下的一页记录。
-    // 两步都要在 renderSide 之前完成，否则列表拿到的是空页。
-    await loadJournalIndex();
-    fillFilterOptions();
-    await loadJournal();
-    renderTabNums();
-    // 请求记录：统计数字每次都可能变（有新请求），列表只在筛选/页数变化时重取，
-    // 否则每 2.5 秒重建一次 DOM，用户展开的详情会被刷没、点击也会丢。
-    const hash = JSON.stringify([
-      journalPage ? journalPage.total : null,
-      journalPage ? (journalPage.entries || []).length : 0,
-      ($("#sideDay") ? $("#sideDay").value : ""),
-      ($("#sideMonth") ? $("#sideMonth").value : ""),
-      ($("#sideFilter") ? $("#sideFilter").value : ""),
-      ($("#sideUpstream") ? $("#sideUpstream").value : ""),
-      ($("#sideMode") ? $("#sideMode").value : ""),
-      (state.stats_range || {}).totals,
-      reqPage,
-    ]);
-    if (hash !== lastSideHash) {
-      lastSideHash = hash;
-      renderSide();
+    // 请求记录：只有这一页才读流水；其他 tab 完全不碰 8MB 历史文件。
+    if (curTab === "req") {
+      await loadJournalIndex();
+      fillFilterOptions();
+      await loadJournal();
+      const hash = JSON.stringify([
+        journalPage ? journalPage.total : null,
+        journalPage ? (journalPage.entries || []).length : 0,
+        ($("#sideDay") ? $("#sideDay").value : ""),
+        ($("#sideMonth") ? $("#sideMonth").value : ""),
+        ($("#sideFilter") ? $("#sideFilter").value : ""),
+        ($("#sideUpstream") ? $("#sideUpstream").value : ""),
+        ($("#sideMode") ? $("#sideMode").value : ""),
+        (state.stats_range || {}).totals,
+        reqPage,
+      ]);
+      if (hash !== lastSideHash) {
+        lastSideHash = hash;
+        renderSide();
+      }
     }
+    renderTabNums();
+    refreshDelay = refreshSeconds() * 1000;
   } catch (e) {
     $("#health").className = "dot off";
+    // 服务端挂了/网络断了：指数退避，别每 5 秒无脑重试。
+    refreshDelay = Math.min(Math.max(refreshDelay * 2, 5000), 60000);
   }
 }
 
@@ -4414,8 +4438,8 @@ $("#copyBtn").onclick = async () => {
   catch (e) { toast("复制失败，请手动选中：" + url, "bad"); }
 };
 
-$("#mFilter").addEventListener("input", renderModels);
-$("#mFilterMode").addEventListener("change", renderModels);
+$("#mFilter").addEventListener("input", () => { modelLimit = 200; renderModels(); });
+$("#mFilterMode").addEventListener("change", () => { modelLimit = 200; renderModels(); });
 $("#mClose").onclick = () => { $("#modal").hidden = true; editing = null; };
 $("#mRename").onclick = async () => {
   if (!editing) return;
@@ -4786,18 +4810,34 @@ $("#ckAutoSave").onclick = saveCkSettings;
 /* ================= 界面刷新间隔 ================= */
 const REFRESH_KEY = "llm-router-refresh-seconds";
 let refreshTimer = null;
+let refreshDelay = 5000;
+let refreshing = false;
 
 function refreshSeconds() {
   const raw = Number(localStorage.getItem(REFRESH_KEY));
   return Number.isFinite(raw) && raw >= 1 && raw <= 120 ? Math.round(raw) : 5;
 }
 
+function scheduleRefresh(delay) {
+  if (refreshTimer) clearTimeout(refreshTimer);
+  refreshTimer = null;
+  if (document.hidden) return; // 窗口最小化/托盘/切后台：完全不发请求
+  refreshTimer = setTimeout(async () => {
+    if (refreshing) return;
+    refreshing = true;
+    try { await refresh(); } finally {
+      refreshing = false;
+      scheduleRefresh(refreshDelay);
+    }
+  }, Math.max(1000, delay));
+}
+
 function applyRefreshInterval() {
   const secs = refreshSeconds();
   const input = $("#refreshInterval");
   if (input && document.activeElement !== input) input.value = String(secs);
-  if (refreshTimer) clearInterval(refreshTimer);
-  refreshTimer = setInterval(refresh, secs * 1000);
+  refreshDelay = secs * 1000;
+  scheduleRefresh(refreshDelay);
 }
 
 function saveRefreshInterval() {
@@ -4814,6 +4854,44 @@ function saveRefreshInterval() {
 }
 $("#refreshIntervalSave").onclick = saveRefreshInterval;
 
+document.addEventListener("visibilitychange", () => {  if (document.hidden) {
+    if (refreshTimer) clearTimeout(refreshTimer);
+    refreshTimer = null;
+  } else {
+    refreshDelay = refreshSeconds() * 1000;
+    if (!refreshing) {
+      refreshing = true;
+      refresh().finally(() => {
+        refreshing = false;
+        scheduleRefresh(refreshDelay);
+      });
+    }
+  }
+});
+
+/* ================= SSE：有请求/改配置时立刻刷一次 ================= */
+let eventSource = null;
+let eventDebounce = null;
+
+function startEvents() {
+  if (eventSource) return;
+  try {
+    eventSource = new EventSource(serverUrl + "/events");
+    eventSource.addEventListener("change", () => {
+      clearTimeout(eventDebounce);
+      eventDebounce = setTimeout(() => { refresh().catch(() => {}); }, 300);
+    });
+    eventSource.onerror = () => {
+      try { eventSource.close(); } catch (e) {}
+      eventSource = null;
+      setTimeout(startEvents, 15000);
+    };
+  } catch (e) {
+    eventSource = null;
+    setTimeout(startEvents, 15000);
+  }
+}
+
 (async function boot() {
   serverUrl = location.origin;
   bindDelegatedEvents();
@@ -4825,6 +4903,7 @@ $("#refreshIntervalSave").onclick = saveRefreshInterval;
   syncTabsTop();
   await refresh();
   applyRefreshInterval();
+  startEvents();
 })();
 </script>
 </body>
