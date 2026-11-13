@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::extract::{Query, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
@@ -30,8 +31,12 @@ pub async fn stats_handler(
     State(state): State<Arc<AppState>>,
     Query(q): Query<HashMap<String, String>>,
 ) -> Response {
-    let mut snap = super::state::snapshot_cached(&state);
-    let stats_data = stats::load_runtime(&state);
+    ok(stats_payload(&state, &q))
+}
+
+fn stats_payload(state: &Arc<AppState>, q: &HashMap<String, String>) -> Value {
+    let mut snap = super::state::snapshot_cached(state);
+    let stats_data = stats::load_runtime(state);
     snap["total_requests"] = json!(stats_data
         .get("totals")
         .and_then(|v| v.get("calls"))
@@ -62,7 +67,20 @@ pub async fn stats_handler(
     if let Some(range) = q.get("range") {
         snap["stats_range"] = stats::render(&stats::range_bucket(&stats_data, range), range);
     }
-    ok(snap)
+    snap
+}
+
+/// 首屏一次请求拿齐：统计快照 + 流水索引 + 第一页记录，省掉 3 个串行 RTT。
+pub async fn bootstrap(
+    State(state): State<Arc<AppState>>,
+    Query(q): Query<HashMap<String, String>>,
+) -> Response {
+    let snap = stats_payload(&state, &q);
+    ok(json!({
+        "stats": snap,
+        "journal_index": journal::index(&state),
+        "journal": journal::query(&state, &q),
+    }))
 }
 
 pub async fn stats_catalog(State(state): State<Arc<AppState>>) -> Response {
@@ -651,6 +669,41 @@ pub async fn journal_entry(
     ok(journal::entry(&state, &q))
 }
 
+/// WebSocket：一条长连接承接所有增量推送，前端不再轮询。
+pub async fn ws(ws: WebSocketUpgrade, State(state): State<Arc<AppState>>) -> Response {
+    ws.on_upgrade(move |socket| ws_loop(socket, state))
+}
+
+async fn ws_loop(mut socket: WebSocket, state: Arc<AppState>) {
+    let mut rx = state.events_tx.subscribe();
+    let hello = json!({
+        "type": "hello",
+        "rev": state.catalog_rev.load(std::sync::atomic::Ordering::Relaxed),
+        "version": super::state::VERSION,
+    });
+    if socket.send(Message::Text(hello.to_string().into())).await.is_err() {
+        return;
+    }
+    loop {
+        tokio::select! {
+            event = rx.recv() => match event {
+                Ok(v) => {
+                    if socket.send(Message::Text(v.to_string().into())).await.is_err() {
+                        break;
+                    }
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                Err(_) => break,
+            },
+            incoming = socket.recv() => match incoming {
+                Some(Ok(Message::Close(_))) | None => break,
+                Some(Ok(_)) => {}
+                Some(Err(_)) => break,
+            },
+        }
+    }
+}
+
 pub async fn proxy_save(State(state): State<Arc<AppState>>, Json(p): Json<Value>) -> Response {
     {
         let mut file = state.file.write().unwrap();
@@ -1003,6 +1056,46 @@ pub async fn set_remote_access(
     }
     let _ = state.save();
     ok(json!({"ok": true, "enabled": enabled, "restart_required": true}))
+}
+
+pub async fn relay_view(State(state): State<Arc<AppState>>) -> Response {
+    let (url, token) = {
+        let file = state.file.read().unwrap();
+        (
+            file.relay_url.clone().unwrap_or_default(),
+            file.relay_token.clone().unwrap_or_default(),
+        )
+    };
+    ok(json!({
+        "ok": true,
+        "url": url,
+        "token_set": !token.is_empty(),
+        "token_hint": super::state::mask_key(&token),
+    }))
+}
+
+pub async fn relay_save(State(state): State<Arc<AppState>>, Json(p): Json<Value>) -> Response {
+    let url = p
+        .get("url")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .trim()
+        .to_string();
+    let token = p
+        .get("token")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .trim()
+        .to_string();
+    {
+        let mut file = state.file.write().unwrap();
+        file.relay_url = if url.is_empty() { None } else { Some(url) };
+        if !token.is_empty() {
+            file.relay_token = Some(token);
+        }
+    }
+    let _ = state.save();
+    ok(json!({"ok": true}))
 }
 
 fn truncate(s: &str, n: usize) -> String {

@@ -50,8 +50,8 @@ fn tail_cached(state: &AppState) -> Arc<Vec<Value>> {
     entries
 }
 
-/// 列表页不需要大文本；详情走 /admin/journal/entry。
-fn strip_heavy(mut entry: Value) -> Value {
+/// 列表页不需要大文本；详情走 /admin/journal/entry。推送也用这个瘦身版。
+pub fn strip_heavy(mut entry: Value) -> Value {
     if let Some(obj) = entry.as_object_mut() {
         for key in ["request_text", "response_text", "reasoning_text"] {
             obj.remove(key);

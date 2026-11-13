@@ -140,6 +140,11 @@ pub struct StateFile {
     /// 允许局域网 / Tailscale 访问（绑定 0.0.0.0，否则只听 127.0.0.1）。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub remote_access: Option<bool>,
+    /// 边缘中继：Worker 地址（如 https://llm-router-relay.<acct>.workers.dev）与共享 token。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub relay_url: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub relay_token: Option<String>,
     #[serde(flatten)]
     pub extra: Map<String, Value>,
 }
@@ -356,7 +361,10 @@ impl AppState {
         let tmp = self.state_path.with_extension("json.tmp");
         std::fs::write(&tmp, text).map_err(|e| e.to_string())?;
         std::fs::rename(&tmp, &self.state_path).map_err(|e| e.to_string())?;
-        let _ = self.events_tx.send(json!({"type": "state"}));
+        let _ = self.events_tx.send(json!({
+            "type": "state",
+            "catalog_rev": self.catalog_rev.load(Ordering::Relaxed),
+        }));
         Ok(())
     }
 
@@ -430,9 +438,10 @@ pub fn upstream_failure_count(state: &AppState, uid: &str) -> u32 {
 /// 追加一条请求流水（JSONL，与 Python 版格式对齐，UI 靠 trail 显示尝试链）。
 pub fn append_journal(state: &AppState, entry: Value) {
     super::stats::record(state, &entry);
+    // 推送只带瘦身后的记录（几百字节），前端直接 prepend，不用再拉一次列表。
     let _ = state.events_tx.send(json!({
         "type": "journal",
-        "at": entry.get("at").cloned().unwrap_or(Value::Null),
+        "entry": super::journal::strip_heavy(entry.clone()),
     }));
     // 独立线程顺序落盘：请求路径上不阻塞 async 运行时。
     let tx = state.journal_tx.get_or_init(|| {

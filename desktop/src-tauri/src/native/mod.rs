@@ -2,6 +2,7 @@ pub mod admin;
 pub mod checkin;
 pub mod journal;
 pub mod proxy;
+pub mod relay;
 pub mod scheduler;
 pub mod state;
 pub mod stats;
@@ -34,12 +35,18 @@ fn webui_etag() -> &'static str {
 
 async fn index(headers: HeaderMap) -> Response {
     let etag = webui_etag();
-    if headers
+    let want = headers
         .get(IF_NONE_MATCH)
         .and_then(|v| v.to_str().ok())
-        .map(|v| v == etag)
-        .unwrap_or(false)
-    {
+        .unwrap_or("");
+    let matched = want.split(',').any(|candidate| {
+        candidate
+            .trim()
+            .trim_start_matches("W/")
+            .trim_matches('"')
+            == etag.trim_matches('"')
+    });
+    if matched {
         return StatusCode::NOT_MODIFIED.into_response();
     }
     (
@@ -98,7 +105,9 @@ pub async fn serve(state: Arc<AppState>, port: u16) -> Result<(), String> {
         .route("/health", get(health))
         .route("/healthz", get(health))
         .route("/events", get(events))
+        .route("/ws", get(admin::ws))
         .route("/stats", get(admin::stats_handler))
+        .route("/bootstrap", get(admin::bootstrap))
         .route("/stats/catalog", get(admin::stats_catalog))
         .route("/admin/stats", get(admin::stats_handler))
         .route("/admin/upstream/add", post(admin::upstream_add))
@@ -117,6 +126,7 @@ pub async fn serve(state: Arc<AppState>, port: u16) -> Result<(), String> {
         .route("/admin/defaults", post(admin::defaults))
         .route("/admin/window", get(admin::window_behavior).post(admin::set_window_behavior))
         .route("/admin/remote", get(admin::remote_access).post(admin::set_remote_access))
+        .route("/admin/relay", get(admin::relay_view).post(admin::relay_save))
         .route("/admin/window/minimize", post(admin::window_minimize))
         .route("/admin/window/toggle-maximize", post(admin::window_toggle_maximize))
         .route("/admin/window/drag", post(admin::window_drag))
@@ -184,6 +194,12 @@ pub async fn serve(state: Arc<AppState>, port: u16) -> Result<(), String> {
                 stats::flush(&flush_state);
             }
         });
+    }
+
+    // 边缘中继 agent：配置了 relay_url 才会真正连接。
+    {
+        let relay_state = state.clone();
+        tokio::spawn(async move { relay::run(relay_state).await });
     }
 
     axum::serve(listener, app)

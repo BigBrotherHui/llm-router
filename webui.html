@@ -749,6 +749,27 @@
         <div class="hint" style="margin-top:8px">只影响当前设备 / 浏览器，桌面和手机可以分别设置。</div>
       </div>
 
+      <div class="card" style="margin-top:14px" id="relayCard" hidden>
+        <h2>边缘中继（手机秒开）</h2>
+        <div class="hint" style="margin:-6px 0 12px">
+          把移动端快照推到 Cloudflare 边缘，手机连最近的边缘节点取数据，首屏不用等桌面回包；
+          没有快照时手机端会显示等待。地址填部署好的 Worker，例如
+          <code>https://llm-router-relay.&lt;账号&gt;.workers.dev</code>。
+        </div>
+        <label class="cap-cell" style="margin-bottom:10px">
+          <span class="cap-k">Worker 地址</span>
+          <input id="relayUrl" placeholder="https://llm-router-relay.xxx.workers.dev">
+        </label>
+        <label class="cap-cell" style="margin-bottom:10px">
+          <span class="cap-k">共享令牌</span>
+          <input id="relayToken" type="password" placeholder="留空表示不修改">
+        </label>
+        <div class="row" style="gap:10px;align-items:center">
+          <button class="primary" id="relaySave">保存</button>
+          <span class="hint" id="relayStatus"></span>
+        </div>
+      </div>
+
       <div class="card" style="margin-top:14px">
         <h2>上游网络出口</h2>
         <div class="hint" style="margin:-6px 0 12px">
@@ -3798,6 +3819,7 @@ function renderSettings() {
   renderProxySettings();
   loadWindowBehavior();
   loadRemoteAccess();
+  loadRelay();
 }
 
 let winBehaviorLoaded = false;
@@ -3895,6 +3917,42 @@ async function saveRemoteAccess() {
 }
 $("#remoteSave").onclick = saveRemoteAccess;
 $("#remoteRefresh").onclick = () => loadRemoteAccess(true);
+
+/* ================= 设置页：边缘中继 ================= */
+let relayLoaded = false;
+
+async function loadRelay(force) {
+  const card = $("#relayCard");
+  if (!card || (relayLoaded && !force)) return;
+  try {
+    const r = await api("/admin/relay", undefined, "GET");
+    card.hidden = false;
+    relayLoaded = true;
+    if ($("#relayUrl")) $("#relayUrl").value = r.url || "";
+    if ($("#relayToken")) $("#relayToken").value = "";
+    $("#relayStatus").textContent = r.token_set ? `已配置令牌（${r.token_hint}）` : "令牌未设置";
+  } catch (e) {
+    card.hidden = true;
+  }
+}
+
+async function saveRelay() {
+  const btn = $("#relaySave");
+  btn.disabled = true;
+  try {
+    await api("/admin/relay", {
+      url: $("#relayUrl").value.trim(),
+      token: $("#relayToken").value.trim(),
+    });
+    relayLoaded = false;
+    await loadRelay(true);
+    toast("边缘中继已保存，桌面端会自动重连", "ok");
+  } catch (e) {
+    toast("保存失败：" + e.message, "bad");
+  }
+  btn.disabled = false;
+}
+$("#relaySave").onclick = saveRelay;
 
 async function saveSettings() {
   const num = el => {
@@ -4172,6 +4230,7 @@ $("#logClear").onclick = () => {
 
 let catalogRev = null;
 let catalogLoading = null;
+let journalHydrated = false;
 
 // /stats 不再带 4367 个分组的 catalog；只有版本号变了才重新拉。
 async function ensureCatalog() {
@@ -4198,11 +4257,27 @@ async function ensureCatalog() {
 async function refresh() {
   try {
     const prevCatalog = state && state.catalog;
-    const wantFull = curTab === "up" || curTab === "model";
-    let statsUrl = "/stats?full=" + (wantFull ? "1" : "0");
-    if (curTab === "req") statsUrl += "&range=" + encodeURIComponent(statsRangeKey());
-    state = await api(statsUrl);
-    if (prevCatalog) state.catalog = prevCatalog;
+    const firstLoad = !state;
+    if (firstLoad && curTab === "req") {
+      // 首屏一次拿齐统计 + 流水索引 + 第一页，省掉 3 个串行 RTT。
+      const bq = new URLSearchParams({
+        full: "0",
+        range: statsRangeKey(),
+        limit: String(REQ_PAGE),
+        offset: "0",
+      });
+      const boot = await api("/bootstrap?" + bq.toString());
+      state = boot.stats || {};
+      journalIndex = boot.journal_index || null;
+      journalPage = boot.journal || null;
+      journalHydrated = true;
+    } else {
+      const wantFull = curTab === "up" || curTab === "model";
+      let statsUrl = "/stats?full=" + (wantFull ? "1" : "0");
+      if (curTab === "req") statsUrl += "&range=" + encodeURIComponent(statsRangeKey());
+      state = await api(statsUrl);
+      if (prevCatalog) state.catalog = prevCatalog;
+    }
     // 服务端版本变了（刚重启过）就自动重载页面 —— 否则浏览器还跑着旧的
     // 前端 JS、后端已是新版本，界面上就会出现「两边对不上」的假象。
     if (pageVersion && state.version && state.version !== pageVersion) {
@@ -4226,9 +4301,14 @@ async function refresh() {
     if (curTab === "ck") loadCheckin();
     // 请求记录：只有这一页才读流水；其他 tab 完全不碰 8MB 历史文件。
     if (curTab === "req") {
-      await loadJournalIndex();
-      fillFilterOptions();
-      await loadJournal();
+      if (!journalHydrated) {
+        await loadJournalIndex();
+        fillFilterOptions();
+        await loadJournal();
+      } else {
+        journalHydrated = false;
+        fillFilterOptions();
+      }
       const hash = JSON.stringify([
         journalPage ? journalPage.total : null,
         journalPage ? (journalPage.entries || []).length : 0,
@@ -4828,6 +4908,9 @@ function scheduleRefresh(delay) {
   if (refreshTimer) clearTimeout(refreshTimer);
   refreshTimer = null;
   if (document.hidden) return; // 窗口最小化/托盘/切后台：完全不发请求
+  // 长连接开着时，轮询只做兜底（30 秒一次）；增量由 WS 推。
+  const live = ws && ws.readyState === 1;
+  const wait = live ? Math.max(delay, 30000) : Math.max(1000, delay);
   refreshTimer = setTimeout(async () => {
     if (refreshing) return;
     refreshing = true;
@@ -4835,7 +4918,7 @@ function scheduleRefresh(delay) {
       refreshing = false;
       scheduleRefresh(refreshDelay);
     }
-  }, Math.max(1000, delay));
+  }, wait);
 }
 
 function applyRefreshInterval() {
@@ -4875,27 +4958,73 @@ document.addEventListener("visibilitychange", () => {  if (document.hidden) {
   }
 });
 
-/* ================= SSE：有请求/改配置时立刻刷一次 ================= */
-let eventSource = null;
+/* ================= WebSocket：增量推送，取代轮询 ================= */
+let ws = null;
+let wsRetry = null;
 let eventDebounce = null;
 
-function startEvents() {
-  if (eventSource) return;
+function startSocket() {
+  if (ws && (ws.readyState === 0 || ws.readyState === 1)) return;
   try {
-    eventSource = new EventSource(serverUrl + "/events");
-    eventSource.addEventListener("change", () => {
-      clearTimeout(eventDebounce);
-      eventDebounce = setTimeout(() => { refresh().catch(() => {}); }, 300);
-    });
-    eventSource.onerror = () => {
-      try { eventSource.close(); } catch (e) {}
-      eventSource = null;
-      setTimeout(startEvents, 15000);
-    };
+    const proto = location.protocol === "https:" ? "wss://" : "ws://";
+    ws = new WebSocket(proto + location.host + "/ws");
   } catch (e) {
-    eventSource = null;
-    setTimeout(startEvents, 15000);
+    ws = null;
+    wsRetry = setTimeout(startSocket, 10000);
+    return;
   }
+  ws.onmessage = (ev) => {
+    try { handleSocket(JSON.parse(ev.data)); } catch (e) {}
+  };
+  ws.onclose = () => {
+    ws = null;
+    clearTimeout(wsRetry);
+    wsRetry = setTimeout(startSocket, 8000);
+  };
+  ws.onerror = () => { try { ws.close(); } catch (e) {} };
+}
+
+function handleSocket(m) {
+  if (!m) return;
+  // 新记录直接推过来，前端 prepend，不再拉列表
+  if (m.type === "journal" && m.entry) {
+    applyJournalDelta(m.entry);
+    return;
+  }
+  // 配置/统计变化：轻量刷一次
+  if (m.type === "state") {
+    clearTimeout(eventDebounce);
+    eventDebounce = setTimeout(() => { refresh().catch(() => {}); }, 300);
+  }
+}
+
+function dayKeyOfTs(at) {
+  const n = Number(at || 0);
+  if (!n) return "";
+  const d = new Date(n * 1000);
+  const p = (x) => String(x).padStart(2, "0");
+  return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())}`;
+}
+
+function applyJournalDelta(entry) {
+  if (!journalPage || curTab !== "req") return;
+  const f = curJournalFilter();
+  const day = dayKeyOfTs(entry.at);
+  if (f.day && day && day !== f.day) return;
+  if (f.month && !day.startsWith(f.month)) return;
+  if (f.group && (entry.model || "") !== f.group) return;
+  if (f.upstream && (entry.upstream || "") !== f.upstream) {
+    const inTrail = (entry.trail || []).some((s) => s.upstream === f.upstream);
+    if (!inTrail) return;
+  }
+  const key = String(entry.at);
+  const list = journalPage.entries || [];
+  if (list.some((x) => String(x.at) === key)) return;
+  journalPage.entries = [entry, ...list].slice(0, 200);
+  journalPage.total = (journalPage.total || 0) + 1;
+  lastSideHash = "";
+  renderSide();
+  renderTabNums();
 }
 
 (async function boot() {
@@ -4909,7 +5038,7 @@ function startEvents() {
   syncTabsTop();
   await refresh();
   applyRefreshInterval();
-  startEvents();
+  startSocket();
 })();
 </script>
 </body>
