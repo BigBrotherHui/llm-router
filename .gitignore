@@ -1,6 +1,5 @@
 # 你的配置和状态：不要提交
 config.toml
-# 配置被人/脚本改过之后留下的备份，同样是含 Key 的
 config.toml.bak*
 *.bak-*
 *.bak-import-*
@@ -14,40 +13,21 @@ upstreams.toml
 
 # 状态目录（上游、模型路由、勾选、分组都存这里）
 .llmrouter/
-
-# 旧的扁平状态文件位置（升级前用的，迁移后可删）
 *.state.json
 *.state.json.bak
 
-# 测试产物
+# 测试 / 诊断产物（含运行时快照，可能有 Key）
 _test_*
-
-# 备份
 _backups/
-
-# Python 缓存
 __pycache__/
 *.pyc
+_*.py
+_*.json
+_*.log
+_probe/
 
 # Tauri 2 桌面端
 desktop/node_modules/
 desktop/src-tauri/target/
 desktop/src-tauri/gen/
 desktop/dist/
-
-# 运维脚本（含本机路径，不进仓库）
-_restart.py
-_restart.log
-_merge_history.py
-_restore_gpt.py
-
-# 诊断 / 探针产物（含运行时快照，_live.json 里可能有 Key）
-_cfg.json
-_live.json
-_fresh.json
-_p.json
-_probe.json
-_recover_before.json
-_sel.json
-_probe/
-_*.py

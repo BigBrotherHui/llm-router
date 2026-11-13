@@ -3655,7 +3655,7 @@ async function loadWindowChrome() {
     const v = $("#tbVer");
     if (v && state && state.version) v.textContent = "v" + state.version;
     syncTabsTop();
-  } catch (e) { /* Python 版/普通浏览器：不显示自定义标题栏 */ }
+  } catch (e) { /* 浏览器直开：不显示自定义标题栏 */ }
 }
 
 function windowCommand(path) {
@@ -3749,7 +3749,7 @@ async function loadWindowBehavior(force) {
     $("#winBehavior").value = r.behavior || "tray";
     winBehaviorLoaded = true;
   } catch (e) {
-    card.hidden = true;   // Python 版没有这个接口，静默隐藏
+    card.hidden = true;   // 后端不支持时静默隐藏
     winBehaviorLoaded = true;
   }
 }

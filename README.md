@@ -1,25 +1,21 @@
-# llm-router · 多上游 LLM API 路由代理
+# llm-router · 多上游 LLM API 路由代理（桌面版）
 
 同一个模型（比如 `deepseek-chat`）你有好几个来源，希望**排好顺序依次调用**，或者**轮流调用来分摊额度**。
 
-打开网页控制台就能全部搞定：填上游 → 一键拉取模型 → 按模型排顺序，不用手写路由配置。
-
-零依赖，只用 Python 标准库（需要 Python 3.11+）。Windows / macOS / Linux 都能跑。
+Tauri 2 单进程桌面应用：Rust 原生 HTTP 服务 + 内嵌控制台 UI，不需要 Python，也没有单独的 backend 进程。
+关闭窗口默认隐藏到系统托盘，后台路由服务持续可用。
 
 ## 快速开始
 
-```bash
-# 1) 复制配置
-copy config.example.toml config.toml     # Windows
-cp config.example.toml config.toml       # macOS / Linux
-
-# 2) 把上游的名字 / 地址 / Key 填进去
-#    然后启动
-python router.py -c config.toml
-#   或者双击 启动.cmd / python 启动.py
+```powershell
+cd desktop
+npm install
+npm run build     # 产出安装包 + 免安装版（见 desktop/README.md）
 ```
 
-启动后打开 **http://127.0.0.1:8010/**：
+或直接用现成产物：`desktop/dist/llm-router-native.exe`（免安装，双击运行）。
+
+启动后打开控制台：
 
 1. 填上游（名字 / 地址 / Key）→ 添加
 2. 在每个上游卡片上点「拉取模型」，把这家支持的模型抓过来
@@ -37,44 +33,14 @@ print(client.chat.completions.create(
 ).choices[0].message.content)
 ```
 
-## 桌面版 / 手机版（Tauri 2）
+## 数据位置
 
-`desktop/` 是 Tauri 2 单进程桌面版：Rust 原生后端内嵌在应用里，直接读同一套
-`.llmrouter` 状态；`router.py` 的 Python 版仍保留作为对照/过渡。
+状态（上游、勾选、分组、模型路由、签到）存在 `.llmrouter/config.state.json`：
 
-```powershell
-cd desktop
-npm install
-npm run build             # 出原生单文件应用和安装包（不需要 Python/pyinstaller）
-```
-
-细节（数据目录、移动端打包、明文 HTTP 配置）见 [desktop/README.md](desktop/README.md)。
-
-## 换电脑（导出全部上游 → 一条命令导入）
-
-上游、Key、勾选、分组、模型路由都存在 `.llmrouter/` 里（含明文 Key，不进仓库），
-所以换机器不能只 clone 代码。两步搞定：
-
-```bash
-# 老机器：导出全部上游（生成 迁移包/ + 一个 zip）
-python migrate.py export
-
-# 新机器：一条命令 = 拉代码 + 导入 + 自检 + 启动（需要 Python 3.11+）
-.\deploy.ps1 -Bundle .\llm-router-migrate-20261031-113234.zip
-```
-
-不用脚本时手动三行：
-
-```bash
-git clone git@github.com:BigBrotherHui/llm-router.git && cd llm-router
-python migrate.py import .\llm-router-migrate-20261031-113234.zip -y
-python 启动.py
-```
-
-`migrate.py export` 产出：`bundle.json`（全量，导入只认它）、`upstreams.full.json`（纯上游明文）、
-`upstreams.toml`（可直接粘进 config.toml 的片段）、`upstreams.masked.md`（脱敏清单）。
-导入支持 `--merge`（和本机现有配置合并）、`--dry-run`（只看要改什么）。
-细节和踩坑见 [DEPLOY.md](DEPLOY.md)。
+- 免安装版放在仓库 `desktop/dist/` 时，自动向上找到仓库现有的 `.llmrouter/`
+- 安装版用 `%APPDATA%\com.llmrouter.desktop\.llmrouter\config.state.json`
+- 可用环境变量 `LLM_ROUTER_STATE` 显式指定
+- 换机器迁移：`python migrate.py export` 导出 zip → 新机器 `python migrate.py import <zip>`
 
 ## 工作方式
 
@@ -83,48 +49,29 @@ python 启动.py
 ```
 第一步：上游来源（只管填名字 / 地址 / Key，不关心模型）
   ├── 上游A     https://api-a.example.com
-  ├── 上游B     https://api-b.example.com
-  ├── 上游C     https://api-c.example.com
-  └── 上游D     https://api-d.example.com
+  └── 上游B     https://api-b.example.com
 
          ↓ 在每个上游卡片上点「拉取模型」，问出这家有哪些模型（默认一个都不选）
 
 第二步：在每个上游卡片上勾选要用的模型
-  上游A  ☑ ds1   ☐ gpt4-a   ☐ other-a
+  上游A  ☑ ds1   ☐ gpt4-a
   上游B  ☑ ds2   ☐ gpt4-b
-  上游C  ☑ ds3   ☐ gpt4-c
-  上游D  ☑ ds4   ☐ gpt4-d
 
          ↓ 勾选后每个模型右边出现「分组名」输入框（关键一步）
 
 第三步：给各家的模型起一个统一的名字
   上游A  ☑ ds1  → 分组名 [deepseek]
   上游B  ☑ ds2  → 分组名 [deepseek]
-  上游C  ☑ ds3  → 分组名 [deepseek]
-  上游D  ☑ ds4  → 分组名 [deepseek]
 
          ↓ 填同一个名字 = 自动合并成一个可调用的模型
 
 模型路由
-  └── deepseek   4 个上游  →  上游A(ds1) → 上游B(ds2) → 上游C(ds3) → 上游D(ds4)
+  └── deepseek   2 个上游  →  上游A(ds1) → 上游B(ds2)
 ```
 
 **客户端永远只用你起的那个统一名字**（这里是 `deepseek`）。请求会按你排的顺序发给各上游，
-每家收到的则是它自己的真实名字（`ds1` / `ds2` / `ds3` / `ds4`），响应里的 `model` 字段会被改回 `deepseek`，
+每家收到的则是它自己的真实名字（`ds1` / `ds2`），响应里的 `model` 字段会被改回 `deepseek`，
 所以调用方完全感觉不到各家命名不同。
-
-### 两个名字的区别
-
-这是整个工具的核心概念，分清楚就不会绕：
-
-| | 谁起的 | 例子 | 在哪填 |
-|---|---|---|---|
-| **真实模型名** | 上游定的，拉取得到 | `ds1`、`ds2`、`deepseek-ai/DeepSeek-V3` | 自动拉取，不用管 |
-| **分组名** | **你起的**，客户端用这个名字调 | `deepseek` | 上游卡片里勾选后，右边那个框（可选已有 / 输入新建） |
-
-不填分组名，默认就用真实名本身（一对一，各家用各自的名字）。
-填了之后，**填法相同的就归到一个分组**——所以第二个上游要合并时，
-直接在候选里点一下已有的 `deepseek` 就行，不用手打、也不会打错。
 
 ### 三种调用方式
 
@@ -134,715 +81,51 @@ python 启动.py
 | **轮流轮询** | 请求 1 走第一个，请求 2 走第二个……转一圈再来 | 多账号分摊额度 |
 | **随机挑一个** | 每次随机 | 打散压力 |
 
-每个分组可以单独设，互不影响。调用名还能整体改（弹窗右上角「改调用名」）：
-**只改你在客户端填的那个名字**，各上游那边的真实模型名一个都不动，它们的映射会自动指向新名字。
+每个分组可以单独设。**失败自动换家**：一个上游连续失败 3 次会进 60 秒冷却，
+期间调用自动跳过它，恢复后回归原位；尝试链完整写进请求流水，UI 里能看到中间换家过程。
 
-### 多套排序：测速重排也不会弄丢原始顺序
+### 两个名字的区别
 
-同一个分组里有十来家上游时，「谁排第一」值得反复调。所以每个分组可以存**多套具名排序**，
-随时切来切去，原始顺序一直被留着：
+| | 谁起的 | 例子 | 在哪填 |
+|---|---|---|---|
+| **真实模型名** | 上游定的，拉取得到 | `ds1`、`ds2`、`deepseek-ai/DeepSeek-V3` | 自动拉取，不用管 |
+| **分组名** | **你起的**，客户端用这个名字调 | `deepseek` | 上游卡片里勾选后，右边那个框（可选已有 / 输入新建） |
 
-```
-模型路由 → 点 deepseek → 具名排序
-   排序 [按测速 ▾]   保存当前顺序为…   用这套排序   删除   ⚡ 按测速重排并保存
-
-   可存多套：原始 / 按测速 / 便宜的先 / 手排的…
-```
-
-- **⚡ 按测速重排并保存**：先给各上游测一次延迟，把快的排前面，然后把这次结果存成一套
-  叫「按测速」的排序。测失败、没测到的排最后。
-- 第一次保存排序时，会把你**当时的顺序**自动记成一套叫「**原始**」的排序。
-  点「用这套排序」就能一键回到最初的样子——不管后面怎么折腾都丢不了。
-- 「原始」是回溯用的，不能删、也不能拿它当新排序的名字；其他名字随便增删，
-  当前顺序不会因为删名字而变。
-- 排序名自己起，比如「按测速」「便宜的先」「夜间用」。拖动 ⠿ 调好顺序后点
-  「保存当前顺序为…」就存下来了。
-- 「原始」「按测速」这类名字只存在状态文件里，不影响客户端调用名。
+不填分组名，默认就用真实名本身（一对一，各家用各自的名字）。
 
 ### 分组里给上游设调用额度
 
-同一个模型有 10 个来源，但只想用其中 8 个？不用把它们删掉，把额度填 **0** 就行。
-
-在模型弹窗的「每个上游的调用额度」里，每个上游一个输入框：
-
-| 填什么 | 含义 | 调用时怎么处理 |
-|---|---|---|
-| **留空** | 不限量（默认） | 照常参与 |
-| **0** | **这家不用** | 调用时直接跳过，排序时自动沉到最后 |
-| 大于 0 的数 | 记下这个上限 | 照常参与（上限只作记录，不会自动停用） |
-
-```
-deepseek 分组
-  上游A  [   ]   不限量   →  正常参与
-  上游B  [ 0 ]   不调用   →  跳过，排最后
-  上游C  [   ]   不限量   →  正常参与
-```
-
-- 一个分组里 10 个上游，把 2 个填 0，就只用剩下 8 个——**不用从路由里删掉**，
-  想用回来把 0 清掉就行，分组、顺序、映射都还在。
-- 额度为 0 的上游：请求时**不会发给它**（在历史记录里也看不到它被打过），
-  排序时也**一律排到最后**——包括按测速重排时，哪怕它测出来最快也不占首选位置。
-- 弹窗里的「首选」预览会实时变：0 额度的会被标成「（额度 0 跳过：…）」，不骗你。
-- 全组都是 0 时保存会被拦住——那样这个分组就没人能调了。
-- 额度是**按分组**记的：同一家上游在 `deepseek` 里被设成 0，不影响它在别的分组里的使用。
-
-> 和「参与」勾选框的区别：勾掉「参与」是从这个分组里**摘掉**（保存后就不在列表里了）；
-> 填 0 是**留着但不用**（位置、顺序都保留，随时改回来）。
-
-## 网页控制台
-
-左侧是三个 tab：**请求记录 / 上游来源 / 模型路由**，点着切换；看的是哪个会记在浏览器里，
-下次打开还是它。顶部「接入方式」按钮里是客户端的接入地址（点「复制」即可）、请求时要填的
-model 名和状态文件位置。
-
-### 上游来源
-
-只填三个框：**名字 / 地址 / Key**。地址带不带 `/v1` 都可以，会自动试出正确的拼法。
-
-添加后会自动拉取该上游的模型列表。点上游卡片上的「选模型」展开面板：
-
-- **左边勾选**要用的模型（拉取后默认一个都不选）
-- **勾上之后，右边出现分组名输入框** —— 点一下会列出**已有分组**直接选，也能输入新名字新建
-  - 候选里会标出每个分组「几个上游在用 / 是否已建路由」
-  - 支持搜索（打几个字就筛）、上下键选择、回车确认
-  - 最下面有「用真实模型名（不分组）」用来清除映射
-- 多个上游里选同一个分组名，它们就会合并成一个可调用的模型
-- 面板里有筛选框、全选、全不选；下面会显示「本上游的分组：deepseek ← ds1」
-
-其他操作：拉取模型、测速、编辑、停用、删除，以及请求数、成功率、平均延迟和延迟对比条。
-
-**测速**：点卡片上的「测速」会给这个上游**勾选的每个模型各发一个最小请求**，实测每个模型的
-连通性和延迟，卡片上逐条列出（短请求通过 / 不可用 / 限流 + 延迟，没测过的显示「未测」）。
-结果会**持久化**，重启后仍显示。一个上游勾了多个模型时，各模型状态可能完全不同 ——
-只测第一个会骗人，所以按模型逐条测。toast 里给一个汇总（N/M 个模型短请求通过，最快 Xs）。
-
-短请求通过不代表长上下文、工具参数或流式调用一定成功。测试会检查保留的最近请求明细，
-若同一上游、同一真实模型的最近实际尝试失败，会同时显示黄色警告和实际错误（包括 HTTP 413
-请求体过大），不会用一次小请求成功掩盖它。后续实际调用成功后，再测试会清除旧警告。
-这是历史错误提示，不是重放原请求；超出明细保留范围的请求无法据此判断。
-
-请求详情、尝试链和测试错误会显示「HTTP 状态码 + 中文可能原因 + 上游详情」。例如 429
-可能是频率、并发、Token 速率或额度限制；具体原因以「上游详情」为准。旧流水中仅有状态码
-的记录会补充通用解释，但不能恢复当时未保存的上游错误正文。
-
-上游卡片按网格排成多列（窗口越宽一屏看到越多），点「选模型」展开的卡片会自动占满一行。
-列表上方有 **全部启用 / 全部停用** 一键切换所有上游的启用状态。
-
-卡片上的小徽标会显示这个上游**实际从哪儿出去**（直连 / 规则 / 强制代理），
-悬停能看到具体端口和来源。见下面「上游出口」。
-
-### 接口类型：chat / responses（上游只开了一套怎么办）
-
-大多数上游只认 OpenAI 的 `/v1/chat/completions`。但有的一家中转**只开了 Responses API**，
-给它的模型发 chat 接口会被直接拒掉：
-
-```
-模型 gpt-6.1-sol 不支持 /v1/chat/completions 接口，请改用 /v1/responses（OpenAI Responses API）
-```
-
-以前这种只能靠「换下一家」绕过去 —— 只有这一家时就是死路。现在编辑上游的弹窗里有一个
-**接口类型**下拉：
-
-| 选项 | 上游实际请求的路径 | 什么时候选 |
-| --- | --- | --- |
-| Chat Completions（默认） | `/v1/chat/completions` | 绝大多数上游 |
-| Responses | `/v1/responses` | 上面那种报错的中转 / 只开 Responses 的模型 |
-
-选了 Responses 之后**客户端一个字都不用改**，照旧调 `/v1/chat/completions`，代理负责三样转换：
-
-- **请求体**：`messages` → `input`（`system` 变 `instructions`，历史 `tool_calls` 变
-  `function_call` 项、`tool` 结果变 `function_call_output`），`tools` / `tool_choice`
-  提到顶层，`max_tokens` → `max_output_tokens`。Responses 不认的参数（`n` / `stop` /
-  `stream_options` 等）会被丢掉 —— 原样透传会被上游以 `Unrecognized request argument` 400。
-- **非流式响应**：`output[]`（`message` / `function_call` / `reasoning`）→ `choices[0].message`，
-  `usage.input_tokens/output_tokens` → `prompt_tokens/completion_tokens`。
-- **参数下限**：Responses 的 `max_output_tokens` **最小 16**（小于它直接 400
-  `Expected a value >= 16, but got 1 instead`），而 chat 那边 `max_tokens: 1` 是合法的
-  （测速探针就用 1 个 token）。转换时统一抬到 16 —— 否则一次测速就会把这一家标成「不可用」。
-- **流式事件**：`response.output_text.delta` → `chat.completion.chunk`，
-  函数参数增量 → `delta.tool_calls`，最后补 `usage` 块和 `data: [DONE]`。
-
-测速、详细测试也一起走 `/v1/responses`，所以卡片不会因为接口类型选对而变红。
-客户端自己就在用 `/v1/responses` 时是**纯透传**（不转换）。
-
-命令行 / 配置文件里对应 `api_mode = "responses"`（认 `api` / `protocol` 这几个别名）。
-配置在网页上改就行，保存后立即生效，不用重启。
-
-### 上游出口：直连 / 规则 / 强制代理
-
-**要解决的问题**：Clash Verge 一开 TUN 模式，进程「自己不设代理」**并不等于直连**。
-TUN 在网络层把 TCP 全接走了，最后走直连还是走节点由 Clash 的**规则**决定 ——
-所以规则模式一开，所有上游都过代理，本来就该直连的那几家（国内 API、本地中转、
-同一城市的中转站）会慢到没法用。反过来有的上游直连根本不通，必须走节点。
-
-做法：给每个上游一个**显式**的出口，靠主动连本地代理端口来施加控制，而不是靠规则。
-
-**先说清楚哪部分不用碰 Clash**：
-
-| 你要的 | 要改 Clash 吗 | 为什么 |
-| --- | --- | --- |
-| 规则模式、强制代理模式 | **不用**。填上端口就生效 | 混合端口（7897）本来就开着，显式连它就走规则/策略组 |
-| 真直连 | **要**，一次性 | 「直连」= 让 Clash 别管这条流量，而 Clash 是唯一知道真实出路的那个 |
-
-最后一行不是我偷懒。实测这台机器：DNS 对所有域名都回 `198.18.x.x`（fake-ip），
-连接一建立本地源地址就是 `198.18.0.1`（TUN 的地址）；即使把 socket 绑定到物理网卡的
-`192.168.1.209` 再连，也直接超时。也就是说 **TUN + fake-ip 下，进程自己拿不到真 IP、
-也绕不出 TUN**，直连只能由 Clash 侧给口子。
-
-三种做法，按省事程度排：
-
-1. **完全不改 Clash 配置**（推荐先试）：把 Verge 的 **TUN 关掉**，只用它的端口
-   （系统代理开不开都行，本程序是显式连端口的）。规则模式照旧生效，
-   「直连」就变成真直连 —— 因为没有任何东西在截流量了。
-   代价：不认系统代理的程序（部分 CLI/游戏）不再被自动代理。
-2. **加一条规则**（最简单的一次性配置）：Clash 里加
-   `- DOMAIN-SUFFIX,api.deepseek.com,DIRECT`。缺点：切「全局模式」时规则不生效。
-3. **加一个 `proxy: DIRECT` 的监听器**（最稳）：规则、TUN、全局模式一律不参与。
-   Verge Rev 里右键订阅卡片 →「编辑扩展配置」，把片段写进去，订阅更新不会冲掉它
-   （注意 `listeners` 是列表，写进去会整体替换订阅里原有的 `listeners`，一般订阅没有）。
-   文档：[扩展配置](https://www.clashverge.dev/guide/extend.html)、
-   [mihomo listeners](https://wiki.metacubex.one/config/inbound/listeners/)。
-
-**设置页 → 上游网络出口**，填三个本地端口：
-
-| 出口 | 填什么 | 说明 |
-| --- | --- | --- |
-| 规则 | Clash 混合端口，通常 `http://127.0.0.1:7897` | 去处由 Clash 规则决定 |
-| 强制代理 | 绑死了策略组的端口 | 不管规则怎么写都走那个节点/组 |
-| 直连 | Clash 里 `proxy: DIRECT` 的监听器 | **只有这个能让「直连」在 TUN 下真直连** |
-
-`http://` 和 `socks5://` 都支持（混合端口两种都吃；socks5 还会把域名交给代理解析，
-DNS 一起走代理）。留空 + 关闭开关 = 完全不加干预，行为和以前一模一样。
-
-「**扫描本机代理端口**」会并发试探常见的本地端口（7890/7897/1080/10808…），
-报出哪个端口是代理、是 http 还是 socks5，并可一键填进「规则端口」。
-
-那页还直接给出**可以粘进 Clash 的片段**：
-
-```yaml
-listeners:
-  - name: llm-router-direct      # 出口写死 DIRECT
-    type: mixed
-    port: 7899
-    listen: 127.0.0.1
-    proxy: DIRECT
-  - name: llm-router-proxy       # 出口写死一个策略组
-    type: mixed
-    port: 7898
-    listen: 127.0.0.1
-    proxy: 节点选择              # 改成你自己的策略组名
-```
-
-`listeners` 里的 `proxy` 优先级最高，规则、TUN、全局模式都不参与 —— 它就是
-「这条入站的出口，别再问规则」。
-
-**每个上游怎么选**：上游卡片 → 编辑 → 网络出口，选 直连 / 规则 / 强制代理 / 跟随全局；
-也可以只给这一家填一个专属的 `proxy_url`（比如某个节点专用端口）。
-
-**别猜，测**：
-
-- 「测所有上游的几条路」：对每个上游的域名，把每条路各测 5 次，报**中位数**和
-  [最快–最慢] 区间。测的是「连上它要多久」（TCP + 代理隧道 + TLS + 一次最小往返），
-  不含模型生成 —— 模型生成时间跟线路无关，会淹没线路差别。
-- 如果某条「直连」其实还被 TUN 接着（DNS 是 fake-ip 且没配直连端口），
-  它会被标成「被 TUN 接管」，并且**不参与「最快」评选** ——
-  这条的数字是真的，但它不是一条独立的路，拿它去比较会得出错误结论。
-- 「按最快的自动选」：按测量结果把每个上游钉到它最快的那条路。
-  只有**明显更快**才切（默认要求快 20% 且省 25ms 以上），免得抖动把上游来回甩；
-  没切的会在提示里说明原因。
-- 编辑弹窗里也有「测一下这家的几条路」，测完可以直接点「用最快的」。
-
-签到请求也走同一个出口（http 与 socks5 都能过），不会出现「推理能通、签到连不上」。
-
-### 模型路由
-
-这里列出**你勾选并分好组的模型**，点任意一个打开配置弹窗：
-
-- 自动列出参与这个分组的所有上游，**每个都标着它那边的真实名字**（如 `上游A · ds1`）
-- **拖动 `⠿` 就能调整调用顺序**（手机：长按整行也能拖，或用行里的 `↑` `↓` 按钮）
-- 每条可以单独勾掉「参与」，临时把某个上游排除
-- 每行右侧的**「测试」按钮**：给这家发一个最小请求，**测的就是这一行那个具体模型**
-  （不是随便挑一个），就地显示 短请求通过 / 不可用 / 限流 + 实测延迟，并提示最近实际调用错误。
-  结果会持久化，重启后仍看得到；冷却结束与短请求通过均不能保证所有实际请求成功。
-- 每行的**「详细测试」按钮**：依次检查短请求、约 9 万字符合成上下文、长上下文流式响应、
-  长上下文流式工具调用及工具结果回传。每项分别显示状态码、总耗时、流式首块时间和具体错误，
-  可检出 HTTP 200 但流提前结束、工具调用缺失或参数不完整等问题。
-  一次最多发送 5 个真实请求，会消耗上游额度；结果保留在当前页面会话中。
-  测试直连该行上游，不自动换家，不代表整个分组的路由或真实业务请求一定正常。
-- 每行还能填**调用额度**：留空 = 不限量，**填 0 = 这家不调用**（调用时跳过、排序时沉到最后）
-- 选「轮流轮询」时，下面会实时显示轮询顺序预览
-- **「具名排序」区**（默认折叠）：下拉切换已存的排序（含自动留底的「原始」），
-  「保存当前顺序为…」起个名字存下来，「⚡ 按测速重排并保存」按延迟重排
-- 右上角「改调用名」可以给整个分组改名叫别的，**上游那边的真实名字不受影响**
-- 列表卡片上「各家名字不同」的紫色标记，提醒你这个分组的成员命名不一致
-
-列表卡片上还会标出「排序：按测速」「2 个不调用」这类状态，不点进去也知道现在什么配置。
-
-还有个「按上游顺序自动配好」：把所有分组按上游当前顺序一次性建好路由，已手工调过的不覆盖。
-
-### 请求记录
-
-左侧第一个 tab。里面「统计」和「请求列表」两列并排（窗口窄时自动叠成一列）：
-
-**统计区**（顶部概览 + 按分组）
-
-- 总请求、成功、失败、输入/输出 token、缓存读、缓存写
-- 每个分组一张卡，显示该分组的调用次数、成功失败、token 用量、平均耗时
-- 卡里用横条画各上游的调用次数对比，哪家接得多一眼看出
-- **统计是全量累计的**：数字直接来自落盘流水，重启不清零，
-  也**跟着下面的筛选走**（选了某天就只统计那天，选了某月就只统计那个月）
-
-**请求区**
-
-- 每次请求一行：时间、状态码、分组名、实际上游、耗时、是否流式
-- **点任意一行展开详情**：
-  - Token 用量：输入 / 输出 / 合计 / 缓存读 / 缓存写（各家字段名不同都做了兼容）
-  - 实际发往上游的模型名、路由来源、试了几个上游
-  - **输入内容**（messages 拼成可读文字，多模态只记文字并标 [图片]）
-  - **输出内容**
-  - 推理模型的**思考过程**（DeepSeek-R1/V4 这类会单独吐 `reasoning_content`）
-- 顶部三个下拉**按天 / 按月 / 按分组**筛选，选项只列真有过记录的那些值
-- 底部「加载更多」是真的去流水里继续取，**想翻多久以前的都行**
-  （不是只翻内存里那几百条）
-
-列表一次取 100 条（滚到底点「加载更多」继续），**这不是数据上限**：
-流水里存着多少就能翻出多少。为了省流量，列表本身不传输入输出正文，
-展开某条时再单独取回来。
-
-**统计和请求流水都不能被清除。** 界面上去掉了「清空统计」，也没有等价的接口：
-流水只增不减（攒满 1 万行会归档成带时间戳的文件 —— 改的是文件名，不是内容），
-统计只随时间往上加。配置想回退就在工具栏点「配置快照」。
-
-### 签到
-
-左侧「签到」tab，把 New API / One API 类站点的每日签到集中到一页。
-
-**凭证是两套，别填错**
-- 上游卡片里的 `sk-...` 是**推理 Key**，只能打 `/v1/*`
-- 签到要的是站点「个人设置 → 访问令牌」那个 token，走 `/api/user/*`
-
-所以签到页给每个上游单独存一个访问令牌，和上游卡片的 Key 各存各的、互不影响。
-填成 `sk-` 开头会当场标红提示。
-
-**怎么用**
-
-- 每行：上游名 + 站点根地址 + 状态徽章 + 「令牌」「签到」按钮
-- 「令牌」展开输入框填访问令牌（老版本 New API 还要填 User id，新版本留空）
-- 「签到」只签这一家；「一键签到」签所有勾了「参与」的
-- 「只探测」只查有没有签到接口、今天签没签，**不真的按下**
-- 「参与」勾掉后，一键签到和自动签到都会跳过它（但单独点「签到」仍然会签）
-
-**自动签到**
-
-基准时刻 + 随机浮动分钟：实际执行时刻 = 基准时刻 + `0～浮动` 内的随机值，
-每天重抽一次，不会分秒不差地打过去。服务中途重启、当天还没签过会补签一次。
-
-**站点差异都做了兼容**
-
-- 两种签到路径都试：`/api/user/self/checkin`（新）和 `/api/user/checkin`
-  （老，`v1.0.0-rc.46` 这种只有它），能用的那条记下来，下次先问它
-- Cloudflare / Turnstile 挂在签到上时**只识别不绕过**：标记成「需人机验证」并短路，
-  之后不再浪费请求。请在站点上用浏览器手动签，或在站点关掉验证后再试
-- 签到奖励按 `/api/status` 的 `quota_per_unit` 换算成金额显示
-- 签到后顺带重查这几个上游的余额（奖励直接进钱包）
-
-签到明细落在 `.llmrouter/<配置名>.checkin.json`（保留最近 2000 条），
-签到页底部能看到每家累计签了几次、拿了多少、上次为什么没签上。
-
-### 其他
-
-- 「拉取模型」和「测速」在**每个上游卡片里**各点各的（顶部那两个批量按钮已去掉：
-  要哪个点哪个，比全量更可控）
-- 没有登录、没有 Key 校验，本机打开就能用
-
-## 接入 Anthropic 客户端（Claude Code 等）
-
-除了 OpenAI 的 `/v1/chat/completions`，这个代理同时提供 **Anthropic Messages API**：
-把客户端的 base_url 指过来就能用，不用装任何 SDK 适配层。
-
-```
-ANTHROPIC_BASE_URL=http://127.0.0.1:8010
-ANTHROPIC_AUTH_TOKEN=随便填
-```
-
-上游绝大多数只认 OpenAI 格式，所以**两个方向都做了转换**：
-
-| 方向 | 转什么 |
-|---|---|
-| 请求 | `system`（字符串或块数组）、内容块（文本 / 图片 / tool_use / tool_result）、`tools` + `tool_choice`、`max_tokens`、`temperature` 等通用参数 |
-| 响应 | `content` 块（`text` / `tool_use`）、`stop_reason`、`usage` 换成 `input_tokens`/`output_tokens`（含缓存字段）、错误体换成 Anthropic 的 `type: error` 形状 |
-| 流式 | OpenAI 的 chunk 转成 Anthropic 的事件序列：`message_start` → `content_block_start/delta/stop` → `message_delta` → `message_stop`；工具参数按 `input_json_delta` 分片发出 |
-
-另外提供 `POST /v1/messages/count_tokens`（本地估算，不真去调上游，也就不会产生费用）。
-
-说明几点：
-
-- **图片**会转成 OpenAI 的 `image_url`（`data:` base64 或 URL 都支持）。
-- **`thinking` / `top_k` / `metadata`** 上游不认，会忽略并在日志里说明 ——
-  静默丢字段最难查，所以宁可留个痕迹。
-- **`count_tokens` 是估算**（中文约 1.5 字/词、英文约 4 字/词）。真实的计费数字一律以
-  上游返回的为准，这个只够客户端判断「上下文还塞不塞得下」。
-- 上游回 200 但内容其实是**网页**（有些网关拿首页兜底），会被判成上游故障换下一家，
-  绝不会把 HTML 当模型回复发回给客户端。
-
-```bash
-curl -X POST http://127.0.0.1:8010/v1/messages \
-  -H "Content-Type: application/json" \
-  -d '{"model":"deepseek","max_tokens":64,
-       "messages":[{"role":"user","content":"你好"}]}'
-# → {"type":"message","role":"assistant","content":[{"type":"text","text":"你好！"}],
-#    "stop_reason":"end_turn","usage":{"input_tokens":...,"output_tokens":...}}
-```
-
-## 配置项速查
-
-平时用网页配就够了，这里只说明 `config.toml` 里的基础设置：
-
-### `[server]`
-
-| 字段 | 默认 | 说明 |
-|---|---|---|
-| `host` | `127.0.0.1` | 只给自己用就保持默认；局域网共用填 `0.0.0.0` |
-| `port` | `8010` | 监听端口 |
-| `log_requests` | `true` | 是否打印请求日志 |
-| `max_body_mb` | `32` | 请求体上限 |
-| `enable_cors` | `false` | 浏览器前端直连时打开 |
-
-### `[router]`
-
-| 字段 | 默认 | 说明 |
-|---|---|---|
-| `default_strategy` | `priority` | 新建模型路由时的默认方式 |
-| `failure_threshold` | `3` | 连续失败几次后暂时踢出队列 |
-| `cooldown_seconds` | `60` | 踢出后多久自动恢复 |
-| `history_limit` | `500` | 内存里保留的请求明细条数（只影响界面能翻出多少条；落盘流水不受影响，统计始终全量累计） |
-| `queue_timeout_seconds` | `15` | 兼容保留（已不再使用） |
-
-### `[[upstreams]]`
-
-| 字段 | 必填 | 说明 |
-|---|---|---|
-| `name` | 建议 | 显示名，可以用中文 |
-| `id` | 否 | 稳定标识，网页上的改动靠它认人；不写自动生成 |
-| `base_url` | 是 | 上游地址，带不带 `/v1` 都行 |
-| `api_key` | 否 | 该上游的 Key（本地 Ollama 随便填） |
-| `enabled` | 否 | `false` 可临时禁用 |
-| `models` | 否 | 想预先声明可用模型时才写；平时让它拉取就行。写了会被视为「已勾选」 |
-| `connect_timeout_seconds` | 否 | 连上游的超时，默认 10 |
-| `read_timeout_seconds` | 否 | 读上游响应的超时，默认 300 |
-| `net_mode` | 否 | 出口：`direct` / `rule` / `proxy` / `inherit`（默认，跟随全局） |
-| `proxy_url` | 否 | 只给这一家指定代理（`http://` 或 `socks5://`）；不写就用 `[proxy]` 那三个端口 |
-| `api_mode` | 否 | 这个上游认哪套接口：`chat`（默认，`/v1/chat/completions`）或 `responses`（`/v1/responses`）。见下面「接口类型」 |
-
-### `[proxy]`（上游出口，可选）
-
-不写这段 = 谁都不显式用代理，行为与以前一致。
-
-| 字段 | 默认 | 说明 |
-|---|---|---|
-| `enabled` | `false` | 出口控制的开关 |
-| `default_mode` | `rule` | 「跟随全局」的上游按这个模式走 |
-| `rule` | 空 | 规则端口，通常 Clash 混合端口 `http://127.0.0.1:7897` |
-| `proxy` | 空 | 强制代理端口（绑死策略组） |
-| `direct` | 空 | 直连端口：Clash 里 `proxy: DIRECT` 的监听器。留空 = 自己直连（TUN 下会被规则接管） |
-
-> 平时不用手写。网页上的勾选、分组、排序都会存进 `.llmrouter/` 子目录（见下）。
-
-## 遇到问题
-
-**Q：请求时先说某个上游失败，然后才成功？**
-正常。这就是故障转移——第一个上游挂了会自动换下一个，响应头 `X-Upstream` 告诉你最后是谁处理的。
-
-**Q：我自己参数写错了，会白白消耗其他上游吗？**
-不会。`400` 这类客户端错误原样返回给你，只有 `401/403/429/5xx` 这种「上游自己的问题」才切换。切换的判定列表在 `router.py` 的 `DEFAULT_RETRY_STATUS`。
-
-**Q：有「最多试几个上游」的限制吗？**
-没有。配了几个就一路试到底，直到成功或者全部失败。
-
-**Q：某个模型我没勾选，请求它会怎样？**
-依然能用，走「自动兜底」：先看你有没有给某个上游的这个模型起过分组名，再挑确实拉取到这个模型的上游。历史记录里会标明。想精确控制就用勾选 + 分组 + 排序。
-
-**Q：我按测速重排之后，还能回到原来的顺序吗？**
-能。第一次保存排序时，你当时的顺序会自动被记成一套叫「**原始**」的排序，
-之后在模型弹窗的「具名排序」下拉里点它、再点「用这套排序」就回来了。
-每套排序都独立存着，可以存很多套（「按测速」「便宜的先」…），来回切不会互相覆盖。
-「原始」是回溯用的，删不掉；其他名字随时可删，删名字不影响当前顺序。
-
-**Q：按测速重排时，测失败或者没测到的上游排哪？**
-排到最后。另外额度填 0 的上游也一律排最后——它本来就不参与调用，不该占首选位置，
-哪怕它测出来最快也不会被排到前面。
-
-**Q：我不想用某个上游了，是删掉还是填 0？**
-只是**暂时不想用它**就填 0：分组、顺序、模型名映射全都留着，以后把 0 清掉就能用回来，
-期间请求也不会发给它。**以后都不想用**才删掉。
-（填 0 和勾掉「参与」的区别：勾掉「参与」保存后这个上游就从分组里摘掉了，填 0 是留着不用。）
-
-**Q：同一个模型我有 10 个来源，只想要其中 8 个，怎么弄？**
-在模型路由里点这个分组，下面「每个上游的调用额度」把不想用的那 2 个填 0，
-其余留空即可。请求只会发给你留空（或大于 0）的那 8 个。
-
-**Q：额度填了数字（比如 100），用来做什么？**
-只作为**记录**（给已知额度少的来源做个标注，界面上会显示「限额度」）。路由器不会
-因为用满了就停用它——要停用就填 0。想让「用尽就换下一个」自动生效，靠的是上游自己
-返回 429/额度用尽的错误码，那时路由器会自动切换下一个。
-
-**Q：Claude Code / Anthropic SDK 能直接用吗？**
-能，见上面「接入 Anthropic 客户端」。请求和响应两个方向都会转换，
-`/v1/messages` 和 `/v1/messages/count_tokens` 都提供。
-
-**Q：开了 Clash 的 TUN / 规则模式，所有上游都走代理变慢，怎么办？**
-每个上游单独选出口，见上面「上游出口」。要点：
-TUN 下「程序不设代理」≠ 直连，必须让 Clash 给一个 `proxy: DIRECT` 的端口来当直连出口，
-再在「设置 → 上游网络出口」里把它填进「直连端口」，然后给该直连的上游选「直连」。
-哪家该走哪条别猜，点「测所有上游的几条路」实测，再「按最快的自动选」。
-
-**Q：走代理和直连哪条更快，能自动判断吗？**
-能，但只能靠实测。「测所有上游的几条路」对每条路各测 5 次取中位数（单次测量抖动很大，
-同一家两次测出 15ms 和 63ms 很常见）。点「按最快的自动选」会按结果分别钉死，
-差距太小（不到 20% 或省不到 25ms）时不动，避免抖动把上游来回甩。
-
-**Q：A 家叫 ds1、B 家叫 ds2，怎么让它们变成一个模型？**
-勾选之后在各自右边的「分组名」框里都填同一个名字（比如 `deepseek`），就会自动合并成一条路由。客户端只请求 `deepseek`，路由器按你的顺序发给各家，实际发送的是各家的真实名（`ds1`/`ds2`），响应里的 model 会改回 `deepseek`。详见上面「工作方式」。
-
-**Q：我只填了分组名，没建路由，能调用吗？**
-能。会自动按分组兜底，顺序按上游顺序。想要确定的顺序就点进模型路由里排一下。
-
-**Q：上游的 /v1/models 报不全，我能不能手填模型名？**
-能。你在配置弹窗或分组里手填的名字，路由器会认，并记进这个上游的模型表，不会被过滤掉。这是刻意的——不少厂商的模型列表是不完整的。
-
-**Q：为什么拉取完模型一个都没选中？**
-故意的。一个上游动辄几十上百个模型，全选进来会让列表没法看，也容易误调。你只勾要用的那几个。
-
-**Q：上游下架了某个模型怎么办？**
-下次拉取时会自动把它从你的勾选里清掉，并在拉取结果里告诉你清掉了哪些。
-
-**Q：网页上的改动存在哪？会弄乱我的 config.toml 吗？**
-存进 `.llmrouter/config.state.json`，**你的 config.toml 完全不被改动**，注释和排版都安全。
-
-状态文件特意放在 `.llmrouter/` 子目录里，不跟项目文件混在一起——这样清理项目时（比如 `rm *.json`）
-不会误伤你的配置。另外它还有几层保护：每次保存前把当前版本轮转进
-`.llmrouter/versions/`（保留最近 20 份带时间戳的快照）、另留一份 `.bak`、
-写入用原子替换、重置时是移进 `.llmrouter/trash/` 而不是删除。
-
-出错也能退回来：「请求记录」页右上角「配置快照」里列出这些快照，点「回退到此」即可
-（回退前会先把当前状态也存一份，所以回退本身同样可撤销）。
-
-**Q：能把统计和请求记录清空吗？**
-不能，这是刻意的。流水只增不减，攒满 1 万行会**归档**成带时间戳的文件
-（改文件名，不删内容），统计只随时间往上加。界面上没有清空入口，
-`/admin/reset` 也只复位冷却和失败计数，不动统计。
-这样可以保证「发生过什么」永久可查 —— 之前误点一次就没了的坑就是这么来的。
-
-**Q：网页上能看到我的 Key 吗？**
-不能，只显示掩码，比如 `sk-off…3456`。
-
-**Q：上游列表接口格式不一样（`data` / `models` / 嵌套的 `result.models`）？**
-都兼容，会自动识别。完全不认识的格式会明确报错，不会静默当成 0 个模型。
-
-**Q：客户端要填什么 API Key？**
-随便填。这个代理是本机自用，不校验 Key。
-
-**Q：支持流式吗？**
-支持，SSE 逐块透传，不会被缓冲。上游返回 200 但流是空的，也会判定失败并切换到下一个。
-
-**Q：怎么自测？**
-`python selftest.py` 会起几个假上游，验证一整套行为（模型拉取、勾选、分组合并、按顺序/轮询/故障转移、流式、增删改、路径拼接、持久化、明细上限、中文名、多套具名排序、上游额度、Anthropic 适配等）。
-
-其中专门有一组测试模拟「ABCD 四个上游，同一个模型分别叫 ds1/ds2/ds3/ds4」：
-验证统一成分组名之后能正确合并、按顺序调用、并且各家收到的是自己的真实名字。
-
-排序和额度也各有一组（假上游带人工延迟，所以测速结果可预测）：
-一组验证「按测速重排 → 存成具名排序 → 切回原始顺序」整条链路，另一组验证
-「额度 0 的上游确实不会被调用、并按测速重排时沉到最后」。
-
-**Anthropic 适配**那组会同时验两个方向：请求确实被转成了 OpenAI 格式发上去
-（system 数组、图片、tools、tool_result），响应确实被转回 Anthropic 结构
-（`content` 块、`stop_reason`、`input_tokens`），流式的事件序列也是 Anthropic 那套。
-另外还验了错误体转换和「缺 model/messages 要报 400」。
-
-假上游里有一个是「严格模式」的：它只接受 `/v1/xxx` 形式的路径，拼成 `/v1/v1/xxx` 就返回 404。
-现实中的厂商（硅基流动、火山方舟）就是这样，所以这个测试专门用来防路径拼错的回归。
-
-**Q：只校验配置不启动？**
-`python router.py -c config.toml --check`
-
-## 管理接口
-
-网页用的就是这些接口，想写脚本调也可以：
-
-```bash
-# 完整状态（上游、模型路由、最近请求）
-curl http://127.0.0.1:8010/stats
-
-# 拉取模型列表
-curl -X POST -H "Content-Type: application/json" -d '{}' \
-  http://127.0.0.1:8010/admin/fetch-models
-
-# 勾选某个上游要用的模型（勾选即参与路由）
-curl -X POST -H "Content-Type: application/json" \
-  -d '{"id":"u1","models":["ds1","ds2"]}' \
-  http://127.0.0.1:8010/admin/select-models
-curl -X POST -H "Content-Type: application/json" -d '{"id":"u1","all":true}' \
-  http://127.0.0.1:8010/admin/select-models      # 全选
-curl -X POST -H "Content-Type: application/json" -d '{"id":"u1","none":true}' \
-  http://127.0.0.1:8010/admin/select-models      # 全不选
-
-# 给各家的模型起统一的名字（分组）—— 填同一个值就合并
-curl -X POST -H "Content-Type: application/json" \
-  -d '{"id":"u1","mapping":{"ds1":"deepseek"}}' \
-  http://127.0.0.1:8010/admin/set-group
-curl -X POST -H "Content-Type: application/json" \
-  -d '{"id":"u2","mapping":{"ds2":"deepseek"}}' \
-  http://127.0.0.1:8010/admin/set-group
-# 传空字符串取消映射，回到用真实名当分组名
-curl -X POST -H "Content-Type: application/json" \
-  -d '{"id":"u2","mapping":{"ds2":""}}' \
-  http://127.0.0.1:8010/admin/set-group
-
-# 给整个分组改名（所有上游的映射一起改）
-curl -X POST -H "Content-Type: application/json" \
-  -d '{"from":"deepseek","to":"llm"}' \
-  http://127.0.0.1:8010/admin/rename-group
-
-# ---- 上游出口（直连 / 规则 / 强制代理）----
-# 保存三个本地端口（Clash 混合端口 / 绑死策略组的端口 / proxy: DIRECT 的端口）
-curl -X POST -H "Content-Type: application/json" -d '{
-  "enabled":true,"default_mode":"rule",
-  "urls":{"rule":"http://127.0.0.1:7897","proxy":"http://127.0.0.1:7898",
-          "direct":"http://127.0.0.1:7899"}}' \
-  http://127.0.0.1:8010/admin/proxy/save
-# 扫本机常见端口，报出哪个是代理（http / socks5）；body 加 "fill":true 顺手填规则端口
-curl -X POST -H "Content-Type: application/json" -d '{}' \
-  http://127.0.0.1:8010/admin/proxy/detect
-# 实测每个上游几条路各要多久（每条测 5 次取中位数；可传 "ids":["u1"], "samples":5）
-curl -X POST -H "Content-Type: application/json" -d '{}' \
-  http://127.0.0.1:8010/admin/net/bench
-# 按实测结果把每个上游切到它最快的那条（差距不到 20%/25ms 时不切，原因在 kept 里）
-curl -X POST -H "Content-Type: application/json" -d '{}' \
-  http://127.0.0.1:8010/admin/net/auto
-
-# 添加 / 修改 / 删除上游
-curl -X POST -H "Content-Type: application/json" \
-  -d '{"name":"新上游","base_url":"https://api.example.com","api_key":"sk-x"}' \
-  http://127.0.0.1:8010/admin/upstream/add
-curl -X POST -H "Content-Type: application/json" \
-  -d '{"id":"u1","name":"改个名","enabled":false}' \
-  http://127.0.0.1:8010/admin/upstream/update
-# 单独给某个上游指定出口（net_mode: direct/rule/proxy/inherit；proxy_url 留空回用全局端口）
-curl -X POST -H "Content-Type: application/json" \
-  -d '{"id":"u1","net_mode":"direct"}' \
-  http://127.0.0.1:8010/admin/upstream/update
-curl -X POST -H "Content-Type: application/json" -d '{"id":"u1"}' \
-  http://127.0.0.1:8010/admin/upstream/delete
-
-# 保存某个模型的路由（数组顺序 = 调用顺序；quota 可省略 = 不限量）
-curl -X POST -H "Content-Type: application/json" -d '{
-  "name":"deepseek-chat","strategy":"priority",
-  "entries":[{"upstream":"u1","model":"deepseek-chat"},
-             {"upstream":"u2","model":"deepseek-ai/DeepSeek-V3","quota":0}]}' \
-  http://127.0.0.1:8010/admin/model/save
-curl -X POST -H "Content-Type: application/json" -d '{"name":"deepseek-chat"}' \
-  http://127.0.0.1:8010/admin/model/delete
-
-# 具名排序：列出 / 存 / 切 / 删（原顺序不丢）
-curl -X POST -H "Content-Type: application/json" -d '{"name":"deepseek"}' \
-  http://127.0.0.1:8010/admin/model/orderings
-# 把当前顺序存成「便宜的先」（也可以在 body 里带 order 数组一起应用）
-curl -X POST -H "Content-Type: application/json" \
-  -d '{"name":"deepseek","label":"便宜的先"}' \
-  http://127.0.0.1:8010/admin/model/order/save
-curl -X POST -H "Content-Type: application/json" -d '{"name":"deepseek","label":"原始"}' \
-  http://127.0.0.1:8010/admin/model/order/apply     # 切回原始顺序
-curl -X POST -H "Content-Type: application/json" -d '{"name":"deepseek","label":"便宜的先"}' \
-  http://127.0.0.1:8010/admin/model/order/delete
-
-# 按测速结果重排并存成一套排序（results 一般直接用 /admin/speedtest 的输出）
-curl -X POST -H "Content-Type: application/json" -d '{
-  "name":"deepseek","label":"按测速",
-  "results":[{"upstream":"u1","ok":true,"latency_seconds":0.4},
-             {"upstream":"u2","ok":false,"latency_seconds":null}]}' \
-  http://127.0.0.1:8010/admin/model/reorder-by-speed
-
-# 给分组里的上游设调用额度（0 = 不调用、调用时跳过、排序时沉到最后；null = 不限量）
-curl -X POST -H "Content-Type: application/json" \
-  -d '{"name":"deepseek","upstream":"u1","model":"ds1","quota":0}' \
-  http://127.0.0.1:8010/admin/model/quota
-# 批量设：一次改多家
-curl -X POST -H "Content-Type: application/json" -d '{
-  "name":"deepseek",
-  "entries":[{"upstream":"u1","model":"ds1","quota":0},
-             {"upstream":"u2","model":"ds2","quota":null}]}' \
-  http://127.0.0.1:8010/admin/model/quota
-
-# 一键给所有模型建路由
-curl -X POST -H "Content-Type: application/json" -d '{}' \
-  http://127.0.0.1:8010/admin/auto-configure
-
-# 签到：看当前表格 / 存访问令牌 / 执行 / 自动签到设置
-curl http://127.0.0.1:8010/admin/checkin
-curl -X POST -H "Content-Type: application/json" \
-  -d '{"id":"u1","token":"nap_你的访问令牌"}' \
-  http://127.0.0.1:8010/admin/checkin/config
-# "__keep__" = 只改开关，不动已存的令牌
-curl -X POST -H "Content-Type: application/json" \
-  -d '{"id":"u1","token":"__keep__","enabled":false}' \
-  http://127.0.0.1:8010/admin/checkin/config
-# 只签指定上游；不传 ids = 签所有勾了「参与」的
-curl -X POST -H "Content-Type: application/json" -d '{"ids":["u1"]}' \
-  http://127.0.0.1:8010/admin/checkin/run
-# probe=true 只探测接口，不真的按下签到
-curl -X POST -H "Content-Type: application/json" -d '{"probe":true}' \
-  http://127.0.0.1:8010/admin/checkin/run
-# 每天 08:00 起 30 分钟内随机签一次
-curl -X POST -H "Content-Type: application/json" \
-  -d '{"enabled":true,"at":"08:00","random_minutes":30}' \
-  http://127.0.0.1:8010/admin/checkin/settings
-
-# 测速 / 复位冷却 / 恢复成配置文件的样子
-curl -X POST -H "Content-Type: application/json" -d '{}' http://127.0.0.1:8010/admin/speedtest
-curl -X POST -H "Content-Type: application/json" -d '{}' http://127.0.0.1:8010/admin/reset
-curl -X POST -H "Content-Type: application/json" -d '{}' http://127.0.0.1:8010/admin/reset-to-config
-
-# 调用记录（全都在落盘流水里，可按天/月/分组筛，可翻页）
-curl "http://127.0.0.1:8010/admin/journal/index"                  # 有哪些天/月/分组
-curl "http://127.0.0.1:8010/admin/journal?limit=100"              # 最新 100 条
-curl "http://127.0.0.1:8010/admin/journal?day=2026-10-12"         # 某一天
-curl "http://127.0.0.1:8010/admin/journal?month=2026-10&group=deepseek&offset=0&limit=50"
-curl "http://127.0.0.1:8010/admin/journal/entry?at=1791785481.2"  # 单条（带输入输出正文）
-
-# 记录与快照（统计和流水都不能被清除，这里只能看和回退配置）
-curl http://127.0.0.1:8010/admin/journal/files          # 流水文件清单
-curl http://127.0.0.1:8010/admin/state/versions         # 可回退的配置快照
-curl http://127.0.0.1:8010/admin/admin-log              # 最近的管理操作
-curl -X POST -H "Content-Type: application/json" \
-  -d '{"file":"config.state.20261013-003257.json"}' \
-  http://127.0.0.1:8010/admin/state/restore             # 回退到某个快照
-curl -X POST -H "Content-Type: application/json" -d '{}' \
-  http://127.0.0.1:8010/admin/stats/rebuild             # 按流水重算统计（一般用不到）
-```
-
-> `/admin/reset` 现在只复位冷却和失败计数，**不再清空统计和流水**（那两个已经不可清除）。
-> 聚合统计在启动时会自动和流水对平，正常不需要手动 rebuild。
+同一个模型有 10 个来源，但只想用其中 8 个？把额度填 **0** 就行——不用删掉，
+这家不调用、排序时沉到最后，想用回来把 0 清掉就行。额度是**按分组**记的。
+
+## 桌面应用特性
+
+- **单进程**：Tauri 窗口 + Axum HTTP 服务，无 Python / 无 backend exe
+- **无边框窗口**：自定义标题栏（拖动 / 最小化 / 最大化 / 关闭），Windows 11 圆角
+- **关闭到托盘**：默认点 × 隐藏到系统托盘（类似 QQ），后台服务不中断；
+  托盘左键恢复窗口、右键菜单可显示/退出；设置页可改为最小化或退出
+- **自动签到**：New API / One API / sub2api 系签到，基准时刻 + 随机窗口每天一次，
+  服务重启当天未签会补签；JWT 过期令牌直接标出来
+- **失败冷却**：连续失败 3 次 → 60 秒冷却 → 自动跳过，恢复后回归原位
+- **尝试链**：每次请求的完整换家过程写进流水，请求记录里可展开
+
+## 端口
+
+默认 `8010`。已在跑别的实例时设 `LLM_ROUTER_PORT=18010` 换端口；端口被占时桌面版
+会自动尝试 +1 往后找空闲端口（暂未实现自动找端口，端口冲突时会提示）。
 
 ## 文件说明
 
-| 文件 | 用途 |
-|---|---|
-| `router.py` | 主程序，单文件 |
-| `webui.html` | 网页控制台（和 router.py 放同一目录） |
-| `config.example.toml` | 配置模板 |
-| `config.toml` | 你自己的配置（从模板复制） |
-| `.llmrouter/config.state.json` | 你的上游/勾选/分组/路由存这里，自动生成 |
-| `.llmrouter/config.state.json.bak` | 上一版状态的自动备份 |
-| `.llmrouter/versions/` | 每次保存前轮转出的带时间戳快照（保留最近 20 份），可在「配置快照」里回退 |
-| `.llmrouter/config.stats.json` | 累计统计（总量 + 按天汇总），每来一个请求更新，重启不清零、不可清除 |
-| `.llmrouter/config.history.jsonl` | 请求流水（含输入输出），**只增不减**；攒满 1 万行归档成 `config.history.<时间戳>.jsonl` |
-| `.llmrouter/config.admin.log` | 管理操作审计（改了什么、什么时候、来自哪个地址） |
-| `.llmrouter/trash/` | 重置时把旧状态移到这里，可恢复 |
-| `.llmrouter/config.checkin.json` | 签到记录（每天签了谁、给了多少） |
-| `checkin.py` | 签到模块（New API / One API 站点的每日签到，可选） |
-| `启动.cmd` / `启动.py` | 一键启动 |
-| `migrate.py` | 迁移工具：导出/导入全部上游（含 Key、勾选、分组、路由） |
-| `deploy.ps1` | 新机器一键部署：拉代码 + 导入迁移包 + 自检 + 启动 |
-| `DEPLOY.md` | 换电脑的完整步骤和踩坑清单 |
-| `selftest.py` | 自测脚本 |
+```
+webui.html            控制台 UI（桌面版内嵌 + 浏览器直开都可用）
+config.example.toml   初始配置模板（首次启动复制）
+desktop/              Tauri 2 桌面应用（Rust 原生后端）
+  └─ src-tauri/src/native/   路由 / 状态 / 签到 / 统计 / 流水
+migrate.py            导出/导入全部上游（换机器迁移）
+```
+
+## 遇到问题
+
+- 控制台打不开：确认端口没被占；或设 `LLM_ROUTER_PORT` 换端口重启
+- 状态文件在哪：见上面「数据位置」；`LLM_ROUTER_STATE` 可显式指定
+- 想回退到某个历史配置：控制台「设置 → 配置快照」

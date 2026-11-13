@@ -1,7 +1,6 @@
 # llm-router desktop（Tauri 2 · 原生 Rust 后端）
 
 单进程桌面应用：Tauri 窗口 + 内嵌 Rust HTTP 服务，**不需要 Python，也没有单独的 backend exe**。
-`router.py` 的 Python 版仍保留在仓库根目录，作为过渡/对照。
 
 窗口是无边框的，顶部标题栏由 webui 自己绘制（只在使用桌面壳传 `?native=1` 时显示），
 支持拖动、最小化、最大化/还原、关闭；关闭按钮默认隐藏到系统托盘，可在设置页切换为最小化或退出。
@@ -55,7 +54,7 @@ npm run dev
 默认点右上角关闭按钮是**隐藏到系统托盘**，后台 HTTP 服务继续工作（客户端调用不中断）。
 托盘图标左键恢复窗口，右键菜单可显示主界面或退出。
 在「设置」页最上方的「窗口行为」里可以改成「最小化到任务栏」或「退出程序」；设置存在状态文件的
-`window_behavior` 字段（`minimize` / `close`），保存后立即生效。
+`window_behavior` 字段（`tray` / `minimize` / `close`），保存后立即生效。
 
 ## 数据和端口
 
@@ -64,7 +63,7 @@ npm run dev
 `%APPDATA%\com.llmrouter.desktop\.llmrouter\config.state.json`（首次启动为空，
 网页控制台添加上游即可）。
 
-想加载已有的 Python 版状态做迁移/对照，启动前设：
+想显式指定状态文件位置（比如迁移过来的旧数据），启动前设：
 
 ```powershell
 $env:LLM_ROUTER_STATE = "C:\path\to\llm-router\.llmrouter\config.state.json"
@@ -80,8 +79,8 @@ npm run dev
 签到页配置读取与保存 + New API / One API 常见签到路径 + 每日自动签到调度
 （基准时刻 + 随机窗口，服务重启后当天未签会补签）。
 
-仍按 Python 版行为继续补齐：签到奖励汇率换算、代理出口探测/网络测速、
-历史版本恢复、余额查询。这些页面在原生版里目前返回空结果或占位提示，不影响核心转发。
+仍继续补齐：签到奖励汇率换算、代理出口探测/网络测速、
+历史版本恢复、余额查询。这些页面目前返回空结果或占位提示，不影响核心转发。
 
 ## 移动端
 

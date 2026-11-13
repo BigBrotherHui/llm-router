@@ -148,6 +148,85 @@ impl StateFile {
     pub fn find_upstream_mut(&mut self, id: &str) -> Option<&mut Upstream> {
         self.upstreams.iter_mut().find(|u| u.id == id)
     }
+
+    /// 按「勾选 + 分组」重建模型路由，保留已有的人工顺序。
+    /// 与 Python 版 sync_routes 同语义：每个分组一条路由，成员 = 所有上游里
+    /// 勾选了且归到这个分组的真实模型；已有成员保持相对位置，新成员追加末尾；
+    /// 没有成员的分组删掉；显式删除过的分组（suppressed）不自动建回。
+    pub fn sync_routes(&mut self, default_strategy: &str) -> (Vec<String>, Vec<String>) {
+        let mut target: std::collections::BTreeMap<String, Vec<(String, String)>> = Default::default();
+        for up in &self.upstreams {
+            for real in up.selected() {
+                let group = up.group_of(&real);
+                if self.suppressed_models.contains(&group) {
+                    continue;
+                }
+                target.entry(group).or_default().push((up.id.clone(), real));
+            }
+        }
+
+        let mut created = Vec::new();
+        let mut removed = Vec::new();
+
+        let groups_to_remove: Vec<String> = self
+            .models
+            .keys()
+            .filter(|g| !target.contains_key(*g))
+            .cloned()
+            .collect();
+        for group in groups_to_remove {
+            self.models.remove(&group);
+            removed.push(group);
+        }
+
+        for (group, members) in target {
+            match self.models.get_mut(&group) {
+                None => {
+                    self.models.insert(
+                        group.clone(),
+                        ModelRoute {
+                            strategy: default_strategy.to_string(),
+                            entries: members
+                                .iter()
+                                .map(|(uid, real)| RouteEntry {
+                                    upstream: uid.clone(),
+                                    model: real.clone(),
+                                    enabled: true,
+                                    quota: None,
+                                })
+                                .collect(),
+                            ..Default::default()
+                        },
+                    );
+                    created.push(group);
+                }
+                Some(route) => {
+                    let wanted: std::collections::HashSet<(String, String)> =
+                        members.iter().cloned().collect();
+                    let mut kept: Vec<RouteEntry> = route
+                        .entries
+                        .iter()
+                        .filter(|e| wanted.contains(&(e.upstream.clone(), e.model.clone())))
+                        .cloned()
+                        .collect();
+                    let have: std::collections::HashSet<(String, String)> =
+                        kept.iter().map(|e| (e.upstream.clone(), e.model.clone())).collect();
+                    for (uid, real) in &members {
+                        if !have.contains(&(uid.clone(), real.clone())) {
+                            kept.push(RouteEntry {
+                                upstream: uid.clone(),
+                                model: real.clone(),
+                                enabled: true,
+                                quota: None,
+                            });
+                        }
+                    }
+                    route.entries = kept;
+                }
+            }
+        }
+        (created, removed)
+    }
 }
 
 /// 上游运行时健康状态（不落盘，进程内）。

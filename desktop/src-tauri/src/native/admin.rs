@@ -220,7 +220,13 @@ pub async fn select_models(State(state): State<Arc<AppState>>, Json(p): Json<Val
             models.into_iter().filter(|m| up.available_models.contains(m)).collect()
         };
         up.selected_models = Some(allowed.clone());
-        let _ = allowed;
+        let default_strategy = file
+            .defaults
+            .get("default_strategy")
+            .and_then(|v| v.as_str())
+            .unwrap_or("priority")
+            .to_string();
+        let _ = file.sync_routes(&default_strategy);
     }
     let _ = state.save();
     ok(json!({"ok": true}))
@@ -245,6 +251,14 @@ pub async fn set_group(State(state): State<Arc<AppState>>, Json(p): Json<Value>)
                 }
             }
         }
+        let default_strategy = file
+            .defaults
+            .get("default_strategy")
+            .and_then(|v| v.as_str())
+            .unwrap_or("priority")
+            .to_string();
+        let (created, removed) = file.sync_routes(&default_strategy);
+        let _ = (created, removed);
     }
     let _ = state.save();
     ok(json!({"ok": true}))
@@ -286,13 +300,19 @@ pub async fn model_save(State(state): State<Arc<AppState>>, Json(p): Json<Value>
 }
 
 pub async fn model_delete(State(state): State<Arc<AppState>>, Json(p): Json<Value>) -> Response {
-    let name = p.get("name").and_then(|v| v.as_str()).unwrap_or("");
+    let name = p.get("name").and_then(|v| v.as_str()).unwrap_or("").to_string();
     {
         let mut file = state.file.write().unwrap();
-        file.models.remove(name);
+        if file.models.remove(&name).is_none() {
+            return not_found("没有配置这个模型");
+        }
+        // 记一笔：用户明确删的。sync_routes 按「勾选+分组」自动重建时不建回来。
+        if !file.suppressed_models.contains(&name) {
+            file.suppressed_models.push(name.clone());
+        }
     }
     let _ = state.save();
-    ok(json!({"ok": true}))
+    ok(json!({"ok": true, "deleted": name}))
 }
 
 pub async fn model_quota(State(state): State<Arc<AppState>>, Json(p): Json<Value>) -> Response {

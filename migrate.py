@@ -377,7 +377,7 @@ def cmd_import(args) -> int:
           f"模型路由 {len(state.get('models') or {})} 条")
     print(f"  状态文件 {state_path}")
     print()
-    print("下一步：python 启动.py   （或双击 启动.cmd），然后开 http://127.0.0.1:8010/")
+    print("下一步：启动 llm-router 桌面版（desktop/dist/llm-router-native.exe 或安装包），")
     return 0
 
 
