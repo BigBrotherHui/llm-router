@@ -250,6 +250,8 @@ pub struct AppState {
     pub checkin_last_day: Mutex<String>,
     pub app: Mutex<Option<tauri::AppHandle>>,
     pub health: Mutex<HashMap<String, UpstreamHealth>>,
+    /// 实际监听端口（端口漂移时由 serve 更新）。
+    pub port: std::sync::atomic::AtomicU16,
 }
 
 impl AppState {
@@ -275,6 +277,7 @@ impl AppState {
             checkin_last_day: Mutex::new(String::new()),
             app: Mutex::new(app),
             health: Mutex::new(HashMap::new()),
+            port: std::sync::atomic::AtomicU16::new(0),
         }
     }
 

@@ -86,11 +86,30 @@ pub async fn serve(state: Arc<AppState>, port: u16) -> Result<(), String> {
         .route("/v1/models", get(proxy::list_models))
         .route("/v1/chat/completions", post(proxy::chat_completions))
         .layer(DefaultBodyLimit::max(64 * 1024 * 1024))
-        .with_state(state);
+        .with_state(state.clone());
 
-    let listener = tokio::net::TcpListener::bind(("127.0.0.1", port))
-        .await
-        .map_err(|e| format!("监听 127.0.0.1:{port} 失败: {e}"))?;
+    // 请求的端口被占（比如别的程序或旧实例）时，从 +1 开始往后找空闲端口，
+    // 避免桌面版静默连到别人身上、出现「两个版本状态不一样」的错觉。
+    let mut listener = None;
+    let mut actual_port = port;
+    for offset in 0..20u16 {
+        let p = port + offset;
+        match tokio::net::TcpListener::bind(("127.0.0.1", p)).await {
+            Ok(l) => {
+                listener = Some(l);
+                actual_port = p;
+                break;
+            }
+            Err(_) => continue,
+        }
+    }
+    let listener = listener.ok_or_else(|| {
+        format!("127.0.0.1:{port} 起连续 20 个端口都被占用，请设置 LLM_ROUTER_PORT 换个端口")
+    })?;
+    if actual_port != port {
+        eprintln!("[native] 端口 {port} 被占，已改用 {actual_port}");
+        state.port.store(actual_port, std::sync::atomic::Ordering::Relaxed);
+    }
     axum::serve(listener, app)
         .await
         .map_err(|e| format!("HTTP 服务退出: {e}"))

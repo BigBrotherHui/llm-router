@@ -28,10 +28,11 @@ struct BootstrapInfo {
 }
 
 #[tauri::command]
-fn bootstrap_info() -> BootstrapInfo {
+fn bootstrap_info(state: tauri::State<'_, Arc<native::state::AppState>>) -> BootstrapInfo {
+    let bound = state.port.load(std::sync::atomic::Ordering::Relaxed);
     BootstrapInfo {
         desktop: cfg!(desktop),
-        server_url: format!("http://127.0.0.1:{}", port()),
+        server_url: format!("http://127.0.0.1:{}", if bound != 0 { bound } else { port() }),
         version: env!("CARGO_PKG_VERSION").to_string(),
     }
 }
@@ -95,16 +96,22 @@ fn force_borderless(window: &tauri::WebviewWindow) {
 }
 
 #[tauri::command]
-async fn start_backend() -> Result<(), String> {
-    let port = port();
+async fn start_backend(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, Arc<native::state::AppState>>,
+) -> Result<String, String> {
+    let _ = app;
     let deadline = Instant::now() + Duration::from_secs(30);
-    while Instant::now() < deadline {
-        if port_open(port) {
-            return Ok(());
+    loop {
+        let p = state.port.load(std::sync::atomic::Ordering::Relaxed);
+        if p != 0 && port_open(p) {
+            return Ok(format!("http://127.0.0.1:{p}"));
+        }
+        if Instant::now() > deadline {
+            return Err("原生服务 30 秒内没有启动".to_string());
         }
         std::thread::sleep(Duration::from_millis(100));
     }
-    Err(format!("原生服务 30 秒内没有启动（127.0.0.1:{port}）"))
 }
 
 #[cfg(desktop)]
