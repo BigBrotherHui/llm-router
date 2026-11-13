@@ -2611,9 +2611,10 @@ async function addUpstream() {
     $("#newName").value = ""; $("#newUrl").value = ""; $("#newKey").value = "";
     toast("已添加，正在拉取它的模型…", "ok");
     await refresh();
-    // 直接用接口返回的 id，别靠 base_url 回查（state 可能还没来得及刷新）
+    // 直接用接口返回的 id，别靠 base_url 回查（state 可能还没来得及刷新）。
+    // 模型列表拉取放到后台，不要让「添加」按钮一直等一个慢上游。
     const newId = r.upstream && r.upstream.id;
-    if (newId) await fetchModels([newId]);
+    if (newId) fetchModels([newId]).catch(() => {});
   } catch (e) {
     toast("添加失败：" + e.message, "bad");
   }

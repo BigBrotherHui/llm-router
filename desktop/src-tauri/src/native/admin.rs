@@ -145,7 +145,12 @@ pub async fn fetch_models(State(state): State<Arc<AppState>>, Json(p): Json<Valu
     let mut results = Vec::new();
     for up in targets {
         let url = super::proxy::models_url(&up.base_url);
-        let mut req = state.client.get(&url);
+        let timeout = up.first_timeout_seconds.unwrap_or(30.0).clamp(5.0, 60.0);
+        let mut req = state
+            .client
+            .get(&url)
+            .timeout(std::time::Duration::from_secs_f64(timeout))
+            .header("Accept", "application/json");
         if let Some(k) = up.api_keys.first() {
             req = req.header("authorization", format!("Bearer {k}"));
         }
@@ -402,6 +407,14 @@ pub async fn order_delete(State(state): State<Arc<AppState>>, Json(p): Json<Valu
 }
 
 pub async fn window_behavior(State(state): State<Arc<AppState>>) -> Response {
+    // webui 加载时会调用这里；此时窗口一定已经创建，顺手强制无边框，
+    // 避免个别 Windows/打包组合忽略启动配置里的 decorations=false。
+    if let Some(w) = main_window(&state) {
+        #[cfg(windows)]
+        crate::force_borderless(&w);
+        #[cfg(not(windows))]
+        let _ = w.set_decorations(false);
+    }
     let behavior = state
         .file
         .read()
@@ -409,8 +422,24 @@ pub async fn window_behavior(State(state): State<Arc<AppState>>) -> Response {
         .window_behavior
         .clone()
         .unwrap_or_else(|| "minimize".to_string());
+    let (config_windows, open_windows) = state
+        .app
+        .lock()
+        .ok()
+        .and_then(|app| app.as_ref().map(|a| {
+            let cfg = a
+                .config()
+                .app
+                .windows
+                .iter()
+                .map(|w| json!({"label": w.label, "decorations": w.decorations}))
+                .collect::<Vec<_>>();
+            (cfg, a.webview_windows().len())
+        }))
+        .unwrap_or((vec![], 0));
     ok(json!({"ok": true, "behavior": behavior, "native": true,
-        "found": main_window(&state).is_some()}))
+        "found": main_window(&state).is_some(),
+        "config_windows": config_windows, "open_windows": open_windows}))
 }
 
 fn main_window(state: &AppState) -> Option<tauri::WebviewWindow> {

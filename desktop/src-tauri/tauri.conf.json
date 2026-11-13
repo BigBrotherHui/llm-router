@@ -8,27 +8,18 @@
   },
   "app": {
     "withGlobalTauri": true,
-    "windows": [
-      {
-        "label": "main",
-        "title": "llm-router",
-        "width": 1280,
-        "height": 860,
-        "minWidth": 860,
-        "minHeight": 560,
-        "center": true,
-        "resizable": true,
-        "fullscreen": false,
-        "decorations": false,
-        "transparent": false
-      }
-    ],
     "security": {
       "csp": null
     }
   },
   "bundle": {
     "active": true,
+    "targets": ["nsis", "msi"],
+    "windows": {
+      "nsis": {
+        "installMode": "currentUser"
+      }
+    },
     "icon": [
       "icons/32x32.png",
       "icons/128x128.png",

@@ -4,7 +4,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use tauri::Manager;
+use tauri::{Manager, RunEvent};
 
 mod native;
 
@@ -39,6 +39,35 @@ fn port_open(port: u16) -> bool {
     TcpStream::connect_timeout(&addr, Duration::from_millis(250)).is_ok()
 }
 
+#[cfg(windows)]
+fn force_borderless(window: &tauri::WebviewWindow) {
+    use windows::Win32::UI::WindowsAndMessaging::{
+        GetWindowLongW, SetWindowLongW, SetWindowPos, GWL_STYLE, SWP_FRAMECHANGED, SWP_NOMOVE,
+        SWP_NOSIZE, SWP_NOZORDER, WS_CAPTION, WS_MAXIMIZEBOX, WS_MINIMIZEBOX, WS_SYSMENU,
+        WS_THICKFRAME,
+    };
+    if let Ok(hwnd) = window.hwnd() {
+        unsafe {
+            let style = GetWindowLongW(hwnd, GWL_STYLE);
+            let mask = (WS_CAPTION.0
+                | WS_THICKFRAME.0
+                | WS_SYSMENU.0
+                | WS_MINIMIZEBOX.0
+                | WS_MAXIMIZEBOX.0) as i32;
+            let _ = SetWindowLongW(hwnd, GWL_STYLE, style & !mask);
+            let _ = SetWindowPos(
+                hwnd,
+                None,
+                0,
+                0,
+                0,
+                0,
+                SWP_FRAMECHANGED | SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER,
+            );
+        }
+    }
+}
+
 #[tauri::command]
 async fn start_backend() -> Result<(), String> {
     let port = port();
@@ -58,6 +87,21 @@ pub fn run() {
         .setup(|app| {
             #[cfg(desktop)]
             {
+                // 手动创建窗口，确保 Windows 上一定走无边框分支（配置文件在
+                // 某些打包组合下会被系统标题栏样式覆盖）。
+                let _window = tauri::WebviewWindowBuilder::new(
+                    app,
+                    "main",
+                    tauri::WebviewUrl::App("index.html".into()),
+                )
+                .title("llm-router")
+                .inner_size(1280.0, 860.0)
+                .min_inner_size(860.0, 560.0)
+                .center()
+                .resizable(true)
+                .decorations(false)
+                .transparent(false)
+                .build()?;
                 let port = port();
                 let data_dir = app
                     .path()
@@ -84,12 +128,16 @@ pub fn run() {
                 let state = Arc::new(native::state::AppState::new(state_path, Some(app.handle().clone())));
                 app.manage(state.clone());
                 native::scheduler::spawn(state.clone());
-                // 端口上已有 Python 版/另一个实例时，窗口没有自有标题栏可依赖，
-                // 退回系统标题栏，保证还能拖动/关闭。
-                if port_open(port) {
-                    if let Some(window) = app.get_webview_window("main") {
-                        let _ = window.set_decorations(true);
-                    }
+                // 无边框：配置在部分 Windows/打包组合下会被系统标题栏覆盖，
+                // 等窗口真正创建后再强制设一次 decorations=false。
+                {
+                    let handle = app.handle().clone();
+                    tauri::async_runtime::spawn(async move {
+                        tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+                        if let Some(window) = handle.get_webview_window("main") {
+                            force_borderless(&window);
+                        }
+                    });
                 }
                 tauri::async_runtime::spawn(async move {
                     if let Err(e) = native::serve(state, port).await {
@@ -128,5 +176,13 @@ pub fn run() {
         .build(tauri::generate_context!())
         .expect("failed to build tauri application");
 
-    app.run(|_app_handle, _event| {});
+    app.run(|app_handle, event| match event {
+        RunEvent::Ready => {
+            #[cfg(desktop)]
+            if let Some(window) = app_handle.get_webview_window("main") {
+                force_borderless(&window);
+            }
+        }
+        _ => {}
+    });
 }
