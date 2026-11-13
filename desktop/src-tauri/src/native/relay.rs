@@ -5,8 +5,10 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
+use base64::Engine as _;
 use futures_util::{SinkExt, StreamExt};
 use serde_json::{json, Value};
+use tokio::sync::mpsc::UnboundedSender;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::Message;
 
@@ -116,6 +118,7 @@ async fn session(state: &Arc<AppState>, url: &str, token: &str) -> Result<(), St
         .map_err(|e| format!("发送快照失败: {e}"))?;
 
     let mut rx = state.events_tx.subscribe();
+    let (tx, mut outbox) = tokio::sync::mpsc::unbounded_channel::<String>();
     loop {
         tokio::select! {
             event = rx.recv() => match event {
@@ -132,13 +135,30 @@ async fn session(state: &Arc<AppState>, url: &str, token: &str) -> Result<(), St
                 Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
                 Err(_) => return Ok(()),
             },
+            outbound = outbox.recv() => {
+                if let Some(text) = outbound {
+                    if ws.send(Message::Text(text)).await.is_err() {
+                        return Ok(());
+                    }
+                }
+            },
             inbound = ws.next() => match inbound {
                 Some(Ok(Message::Text(text))) => {
-                    if text.contains("\"pull\"") {
-                        let snap = snapshot(state);
-                        if ws.send(Message::Text(snap.to_string())).await.is_err() {
-                            return Ok(());
+                    let parsed: Value = serde_json::from_str(&text).unwrap_or(Value::Null);
+                    match parsed.get("type").and_then(|t| t.as_str()) {
+                        Some("pull") => {
+                            let snap = snapshot(state);
+                            if ws.send(Message::Text(snap.to_string())).await.is_err() {
+                                return Ok(());
+                            }
                         }
+                        Some("req") => {
+                            // 完整控制台的 API 调用：并发转发到本机 8010，结果再回传边缘。
+                            let state = state.clone();
+                            let tx = tx.clone();
+                            tokio::spawn(async move { handle_rpc(state, tx, parsed).await; });
+                        }
+                        _ => {}
                     }
                 }
                 Some(Ok(Message::Ping(p))) => {
@@ -150,4 +170,74 @@ async fn session(state: &Arc<AppState>, url: &str, token: &str) -> Result<(), St
             },
         }
     }
+}
+
+/// 把边缘转发来的 HTTP 请求打到本机服务，再把状态/头/体（base64）回传。
+async fn handle_rpc(state: Arc<AppState>, tx: UnboundedSender<String>, req: Value) {
+    let id = req.get("id").and_then(|v| v.as_str()).unwrap_or("").to_string();
+    let method = req.get("method").and_then(|v| v.as_str()).unwrap_or("GET");
+    let path = req.get("path").and_then(|v| v.as_str()).unwrap_or("/");
+    let port = state
+        .port
+        .load(std::sync::atomic::Ordering::Relaxed);
+    let port = if port == 0 { 8010 } else { port };
+    let url = format!("http://127.0.0.1:{port}{path}");
+
+    let mut builder = state
+        .client
+        .request(
+            method.parse().unwrap_or(reqwest::Method::GET),
+            &url,
+        )
+        .timeout(Duration::from_secs(30));
+    if let Some(headers) = req.get("headers").and_then(|v| v.as_object()) {
+        for (k, v) in headers {
+            if let Some(s) = v.as_str() {
+                builder = builder.header(k, s);
+            }
+        }
+    }
+    if let Some(body) = req.get("body").and_then(|v| v.as_str()) {
+        if !body.is_empty() {
+            if let Ok(bytes) = base64::engine::general_purpose::STANDARD.decode(body) {
+                builder = builder.body(bytes);
+            }
+        }
+    }
+
+    let payload = match builder.send().await {
+        Ok(resp) => {
+            let status = resp.status().as_u16();
+            let mut headers = serde_json::Map::new();
+            for (k, v) in resp.headers() {
+                let name = k.as_str().to_lowercase();
+                if ["content-length", "content-encoding", "transfer-encoding"]
+                    .contains(&name.as_str())
+                {
+                    continue;
+                }
+                if let Ok(s) = v.to_str() {
+                    headers.insert(name, json!(s));
+                }
+            }
+            let bytes = resp.bytes().await.unwrap_or_default();
+            json!({
+                "type": "res",
+                "id": id,
+                "status": status,
+                "headers": headers,
+                "body": base64::engine::general_purpose::STANDARD.encode(&bytes),
+            })
+        }
+        Err(e) => json!({
+            "type": "res",
+            "id": id,
+            "status": 502,
+            "headers": {"content-type": "application/json"},
+            "body": base64::engine::general_purpose::STANDARD.encode(
+                json!({"error": e.to_string()}).to_string()
+            ),
+        }),
+    };
+    let _ = tx.send(payload.to_string());
 }

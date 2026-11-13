@@ -3,8 +3,9 @@ import { svelte } from "@sveltejs/vite-plugin-svelte";
 
 export default defineConfig({
   plugins: [svelte()],
+  base: "/m/",
   build: {
-    outDir: "../public",
+    outDir: "../public/m",
     emptyOutDir: true,
     target: "es2020",
   },
