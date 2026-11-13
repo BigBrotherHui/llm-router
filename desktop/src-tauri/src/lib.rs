@@ -42,7 +42,8 @@ fn port_open(port: u16) -> bool {
 #[cfg(windows)]
 fn force_borderless(window: &tauri::WebviewWindow) {
     use windows::Win32::Graphics::Dwm::{
-        DwmSetWindowAttribute, DWMWA_WINDOW_CORNER_PREFERENCE, DWMWCP_ROUND,
+        DwmSetWindowAttribute, DWMWA_BORDER_COLOR, DWMWA_USE_IMMERSIVE_DARK_MODE,
+        DWMWA_WINDOW_CORNER_PREFERENCE, DWMWCP_ROUND,
     };
     use windows::Win32::UI::WindowsAndMessaging::{
         GetWindowLongW, SetWindowLongW, SetWindowPos, GWL_STYLE, SWP_FRAMECHANGED, SWP_NOMOVE,
@@ -67,13 +68,27 @@ fn force_borderless(window: &tauri::WebviewWindow) {
                 0,
                 SWP_FRAMECHANGED | SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER,
             );
-            // Windows 11：无边框窗口也保留系统级圆角
+            // Windows 11：无边框窗口也保留系统级圆角，并把系统窗口描边压成深色。
             let corner = DWMWCP_ROUND;
             let _ = DwmSetWindowAttribute(
                 hwnd,
                 DWMWA_WINDOW_CORNER_PREFERENCE,
                 &corner as *const _ as *const std::ffi::c_void,
                 std::mem::size_of_val(&corner) as u32,
+            );
+            let border: u32 = 0x00140D09; // #090d14 的 COLORREF（BGR）
+            let _ = DwmSetWindowAttribute(
+                hwnd,
+                DWMWA_BORDER_COLOR,
+                &border as *const _ as *const std::ffi::c_void,
+                std::mem::size_of_val(&border) as u32,
+            );
+            let dark: i32 = 1;
+            let _ = DwmSetWindowAttribute(
+                hwnd,
+                DWMWA_USE_IMMERSIVE_DARK_MODE,
+                &dark as *const _ as *const std::ffi::c_void,
+                std::mem::size_of_val(&dark) as u32,
             );
         }
     }
@@ -112,6 +127,7 @@ pub fn run() {
                 .resizable(true)
                 .decorations(false)
                 .transparent(false)
+                .shadow(false)
                 .background_color(tauri::window::Color(9, 13, 20, 255))
                 .build()?;
                 let port = port();
