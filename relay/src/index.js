@@ -15,6 +15,10 @@ export class Relay {
 
   async fetch(request) {
     const url = new URL(request.url);
+    // 内部诊断 ping 不需要 token（只用于测边缘到 DO 的延迟）。
+    if (url.pathname.endsWith("/ping")) {
+      return new Response("pong");
+    }
     const token =
       url.searchParams.get("token") ||
       (request.headers.get("authorization") || "").replace(/^Bearer\s+/i, "");
@@ -86,6 +90,26 @@ export default {
       return new Response(JSON.stringify({ ok: true, edge: true }), {
         headers: { "content-type": "application/json" },
       });
+    }
+    // 诊断：手机打开 /where 能看到落在哪个边缘、到 DO 的毫秒数。
+    if (url.pathname === "/where") {
+      const id = env.RELAY.idFromName("main-apac");
+      const started = Date.now();
+      let ping = "error";
+      try {
+        const r = await env.RELAY.get(id, { locationHint: "apac" }).fetch("https://do/ping");
+        ping = await r.text();
+      } catch (e) {
+        ping = String(e);
+      }
+      return new Response(JSON.stringify({
+        edge: request.cf ? request.cf.colo : null,
+        country: request.cf ? request.cf.country : null,
+        city: request.cf ? request.cf.city : null,
+        asn: request.cf ? request.cf.asn : null,
+        do_ms: Date.now() - started,
+        do: ping,
+      }), { headers: { "content-type": "application/json" } });
     }
     if (url.pathname === "/agent" || url.pathname === "/client" || url.pathname === "/snapshot") {
       const id = env.RELAY.idFromName("main-apac");
