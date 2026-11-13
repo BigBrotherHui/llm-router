@@ -87,9 +87,15 @@
   try { info = await api.invoke('bootstrap_info'); }
   catch (e) { info = { desktop: true, server_url: 'http://127.0.0.1:8010' }; }
 
-  const go = (url) => { localStorage.setItem('llm_router_server', url); location.replace(url + '/'); };
+  // 桌面壳是无边框窗口，必须带 ?native=1 才会渲染自定义标题栏（拖动/最小化/关闭）。
+  // 所有桌面入口（自动启动、手动连接、重试）都要带上，否则窗口没有标题栏。
+  let isDesktop = !!info.desktop;
+  const go = (url) => {
+    localStorage.setItem('llm_router_server', url);
+    location.replace(url + '/' + (isDesktop ? '?native=1' : ''));
+  };
 
-  if (info.desktop) {
+  if (isDesktop) {
     sub.textContent = '启动本地服务…首次启动需要几秒钟';
     setStatus('正在启动内置路由器…');
     try {
