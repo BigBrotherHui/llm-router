@@ -408,10 +408,20 @@
   .up:hover,.mcard:hover{border-color:rgba(90,162,255,.5)}
   .badge{background:rgba(9,14,22,.62);border-color:rgba(255,255,255,.10)}
   .toast div{background:rgba(25,36,52,.94);backdrop-filter:blur(14px);border-radius:10px}
-  ::-webkit-scrollbar{width:10px;height:10px}
-  ::-webkit-scrollbar-track{background:transparent}
-  ::-webkit-scrollbar-thumb{background:rgba(148,177,215,.18);border-radius:8px;border:2px solid transparent;background-clip:content-box}
-  ::-webkit-scrollbar-thumb:hover{background:rgba(148,177,215,.32);background-clip:content-box}
+  ::-webkit-scrollbar{width:9px;height:9px}
+  ::-webkit-scrollbar-track{background:rgba(255,255,255,.035);border-radius:10px;margin:2px}
+  ::-webkit-scrollbar-thumb{
+    background:linear-gradient(180deg,rgba(90,162,255,.78),rgba(124,108,255,.78));
+    border-radius:10px;border:2px solid transparent;background-clip:padding-box;
+  }
+  ::-webkit-scrollbar-thumb:hover{
+    background:linear-gradient(180deg,#6db1ff,#8d7dff);
+    border-radius:10px;border:2px solid transparent;background-clip:padding-box;
+  }
+  ::-webkit-scrollbar-corner{background:transparent}
+  *{scrollbar-width:thin;scrollbar-color:rgba(90,162,255,.55) rgba(255,255,255,.04)}
+  html{background:transparent}
+  body{border-radius:14px;overflow-x:hidden}
 
   /* ================= 无边框窗口的自定义标题栏 ================= */
   #nativeTitlebar{
@@ -419,8 +429,10 @@
     width:100vw;max-width:100vw;box-sizing:border-box;
     background:linear-gradient(180deg,rgba(16,24,37,.96),rgba(12,19,29,.94));
     border-bottom:1px solid rgba(255,255,255,.075);
+    border-radius:14px 14px 0 0;
     position:sticky;top:0;z-index:120;user-select:none;
     -webkit-app-region:drag;
+    overflow:hidden;
   }
   #nativeTitlebar .tb-brand{display:flex;align-items:center;gap:9px;min-width:0}
   #nativeTitlebar .tb-logo{
