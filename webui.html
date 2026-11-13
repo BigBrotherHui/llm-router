@@ -4146,9 +4146,36 @@ $("#logClear").onclick = () => {
   renderLog();
 };
 
+let catalogRev = null;
+let catalogLoading = null;
+
+// /stats 不再带 4367 个分组的 catalog；只有版本号变了才重新拉。
+async function ensureCatalog() {
+  const rev = state && state.catalog_rev;
+  if (state.catalog && catalogRev === rev) return;
+  if (catalogLoading) {
+    await catalogLoading;
+    if (state.catalog && catalogRev === rev) return;
+  }
+  catalogLoading = api("/stats/catalog")
+    .then(r => {
+      state.catalog = r.catalog || [];
+      catalogRev = r.rev;
+    })
+    .catch(() => {
+      // 拉失败就先空着，记下版本避免每 5 秒重试轰炸
+      if (!state.catalog) state.catalog = [];
+      catalogRev = rev;
+    })
+    .finally(() => { catalogLoading = null; });
+  await catalogLoading;
+}
+
 async function refresh() {
   try {
+    const prevCatalog = state && state.catalog;
     state = await api("/stats?range=" + statsRangeKey());
+    if (prevCatalog) state.catalog = prevCatalog;
     // 服务端版本变了（刚重启过）就自动重载页面 —— 否则浏览器还跑着旧的
     // 前端 JS、后端已是新版本，界面上就会出现「两边对不上」的假象。
     if (pageVersion && state.version && state.version !== pageVersion) {
@@ -4163,6 +4190,7 @@ async function refresh() {
     $("#ver").textContent = "v" + state.version;
     $("#baseUrl").textContent = serverUrl + "/v1";
     $("#statePath").textContent = state.state_path || "";
+    await ensureCatalog();
     renderUpstreams();
     renderModels();
     renderSettings();

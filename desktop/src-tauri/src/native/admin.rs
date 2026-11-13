@@ -42,6 +42,10 @@ pub async fn stats_handler(
     ok(snap)
 }
 
+pub async fn stats_catalog(State(state): State<Arc<AppState>>) -> Response {
+    ok(super::state::catalog_cached(&state))
+}
+
 pub async fn upstream_add(State(state): State<Arc<AppState>>, Json(p): Json<Value>) -> Response {
     let name = p.get("name").and_then(|v| v.as_str()).unwrap_or("").trim().to_string();
     let base_url = p.get("base_url").and_then(|v| v.as_str()).unwrap_or("").trim().to_string();

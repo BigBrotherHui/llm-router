@@ -257,6 +257,10 @@ pub struct AppState {
     pub port: std::sync::atomic::AtomicU16,
     /// /stats 快照缓存（1 秒），避免每次轮询都重建 4000+ 分组的 catalog。
     pub snapshot_cache: Mutex<Option<(Instant, Value)>>,
+    /// 状态版本号：每次保存自增，前端据此判断要不要重新拉 catalog。
+    pub catalog_rev: AtomicU64,
+    /// catalog 缓存（按版本号）。
+    pub catalog_cache: Mutex<Option<(u64, Value)>>,
 }
 
 impl AppState {
@@ -284,6 +288,8 @@ impl AppState {
             health: Mutex::new(HashMap::new()),
             port: std::sync::atomic::AtomicU16::new(0),
             snapshot_cache: Mutex::new(None),
+            catalog_rev: AtomicU64::new(1),
+            catalog_cache: Mutex::new(None),
         }
     }
 
@@ -329,6 +335,11 @@ impl AppState {
         let tmp = self.state_path.with_extension("json.tmp");
         std::fs::write(&tmp, text).map_err(|e| e.to_string())?;
         std::fs::rename(&tmp, &self.state_path).map_err(|e| e.to_string())?;
+        // 状态变了：catalog 版本号自增，前端下次轮询会重新拉 catalog。
+        self.catalog_rev.fetch_add(1, Ordering::Relaxed);
+        if let Ok(mut c) = self.catalog_cache.lock() {
+            *c = None;
+        }
         Ok(())
     }
 
@@ -583,7 +594,6 @@ pub fn snapshot(state: &AppState) -> Value {
         models.insert(name.clone(), val);
     }
 
-    let catalog = build_catalog(&file);
     json!({
         "version": VERSION,
         "http_error_hints": {},
@@ -600,9 +610,29 @@ pub fn snapshot(state: &AppState) -> Value {
         "suppressed_models": file.suppressed_models,
         "upstreams": upstreams,
         "models": models,
-        "catalog": catalog,
+        "catalog_rev": state.catalog_rev.load(Ordering::Relaxed),
         "call_stats": {"groups": [], "totals": {"calls":0,"ok":0,"failed":0,"attempts":0,"input":0,"output":0,"total":0,"cache_read":0,"cache_write":0}, "upstreams": []},
     })
+}
+
+/// 模型候选总表（体积大），单独接口按需加载；状态没变时复用缓存。
+pub fn catalog_cached(state: &AppState) -> Value {
+    let rev = state.catalog_rev.load(Ordering::Relaxed);
+    if let Ok(cache) = state.catalog_cache.lock() {
+        if let Some((cached_rev, catalog)) = cache.as_ref() {
+            if *cached_rev == rev {
+                return json!({"ok": true, "rev": rev, "catalog": catalog});
+            }
+        }
+    }
+    let catalog = {
+        let file = state.file.read().unwrap();
+        build_catalog(&file)
+    };
+    if let Ok(mut cache) = state.catalog_cache.lock() {
+        *cache = Some((rev, json!(catalog)));
+    }
+    json!({"ok": true, "rev": rev, "catalog": catalog})
 }
 
 fn catalog_entry<'a>(map: &'a mut HashMap<String, Value>, group: &str) -> &'a mut Value {

@@ -53,6 +53,7 @@ pub async fn serve(state: Arc<AppState>, port: u16) -> Result<(), String> {
         .route("/health", get(health))
         .route("/healthz", get(health))
         .route("/stats", get(admin::stats_handler))
+        .route("/stats/catalog", get(admin::stats_catalog))
         .route("/admin/stats", get(admin::stats_handler))
         .route("/admin/upstream/add", post(admin::upstream_add))
         .route("/admin/upstream/update", post(admin::upstream_update))
