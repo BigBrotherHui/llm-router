@@ -111,8 +111,8 @@ pub fn run() {
                 .center()
                 .resizable(true)
                 .decorations(false)
-                .transparent(false)
-                .background_color(tauri::window::Color(9, 13, 20, 255))
+                .transparent(true)
+                .background_color(tauri::window::Color(9, 13, 20, 0))
                 .build()?;
                 let port = port();
                 let data_dir = app

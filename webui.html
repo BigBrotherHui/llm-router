@@ -421,8 +421,8 @@
   }
   ::-webkit-scrollbar-corner{background:transparent}
   *{scrollbar-width:thin;scrollbar-color:rgba(90,162,255,.55) rgba(255,255,255,.04)}
-  html{background:#090d14}
-  body{border-radius:0;overflow-x:hidden}
+  html,body{width:100%;min-height:100%;margin:0;padding:0;background:#090d14}
+  body{border-radius:0;overflow-x:hidden;min-height:100vh}
 
   /* ================= 无边框窗口的自定义标题栏 ================= */
   #nativeTitlebar{
@@ -3313,6 +3313,13 @@ function fmtNum(n) {
   return String(n);
 }
 
+// 请求次数等计数值显示实际数字，不做 k/M 缩写；token 数继续用 fmtNum。
+function fmtCount(n) {
+  if (n == null) return "—";
+  const v = Number(n);
+  return Number.isFinite(v) ? v.toLocaleString("zh-CN") : String(n);
+}
+
 function usageCells(u, withCache) {
   if (!u || !Object.keys(u).length) {
     return `<div class="tkn"><div><b>—</b><span>无用量数据</span></div></div>`;
@@ -3348,7 +3355,7 @@ function renderSide() {
   const fullCalls = journalPage ? journalPage.total : (totals.calls != null ? totals.calls : null);
   const shown = journalPage ? (journalPage.entries || []) : [];
   const shownHint = fullCalls != null
-    ? `${fmtNum(shown.length)} / ${fmtNum(fullCalls)} 条`
+    ? `${fmtCount(shown.length)} / ${fmtCount(fullCalls)} 条`
     : `${shown.length} 条`;
   $("#sideCount").textContent = `${curFilterLabel()} ${shownHint}`;
   $("#sideCount").className = "badge" + (totals.failed ? " warn" : "");
@@ -3377,9 +3384,9 @@ function renderSide() {
     可能大于客户端请求失败数。和右侧列表同口径。
   </div>
   <div class="ov">
-    <div class="ovc"><b>${fmtNum(uSel.calls)}</b><span>调用次数</span></div>
-    <div class="ovc"><b style="color:var(--ok)">${fmtNum(uSel.ok)}</b><span>成功</span></div>
-    <div class="ovc"><b style="color:${uSel.failed ? "var(--bad)" : "var(--dim)"}">${fmtNum(uSel.failed)}</b><span>失败</span></div>
+    <div class="ovc"><b>${fmtCount(uSel.calls)}</b><span>调用次数</span></div>
+    <div class="ovc"><b style="color:var(--ok)">${fmtCount(uSel.ok)}</b><span>成功</span></div>
+    <div class="ovc"><b style="color:${uSel.failed ? "var(--bad)" : "var(--dim)"}">${fmtCount(uSel.failed)}</b><span>失败</span></div>
     <div class="ovc"><b>${fmtNum(u.input)}</b><span>输入 token</span></div>
     <div class="ovc"><b>${fmtNum(u.output)}</b><span>输出 token</span></div>
     <div class="ovc"><b style="color:var(--ok)">${fmtNum(u.cache_read)}</b><span>缓存读</span></div>
@@ -3388,10 +3395,10 @@ function renderSide() {
   } else {
   statHtml = `
   <div class="ov">
-    <div class="ovc"><b>${fmtNum(totals.calls)}</b><span>总请求</span></div>
-    <div class="ovc"><b style="color:var(--ok)">${fmtNum(totals.ok)}</b><span>成功</span></div>
-    <div class="ovc"><b style="color:${totals.failed ? "var(--bad)" : "var(--dim)"}">${fmtNum(totals.failed)}</b><span>失败</span></div>
-    <div class="ovc"><b>${fmtNum(totals.attempts)}</b><span>上游尝试</span></div>
+    <div class="ovc"><b>${fmtCount(totals.calls)}</b><span>总请求</span></div>
+    <div class="ovc"><b style="color:var(--ok)">${fmtCount(totals.ok)}</b><span>成功</span></div>
+    <div class="ovc"><b style="color:${totals.failed ? "var(--bad)" : "var(--dim)"}">${fmtCount(totals.failed)}</b><span>失败</span></div>
+    <div class="ovc"><b>${fmtCount(totals.attempts)}</b><span>上游尝试</span></div>
     <div class="ovc"><b>${fmtNum(totals.input)}</b><span>输入 token</span></div>
     <div class="ovc"><b>${fmtNum(totals.output)}</b><span>输出 token</span></div>
     <div class="ovc"><b style="color:var(--ok)">${fmtNum(totals.cache_read)}</b><span>缓存读</span></div>
@@ -3424,10 +3431,10 @@ function renderSide() {
           <span class="hint">均 ${fmtLat(g.avg_elapsed)}</span>
         </div>
         <div class="gstat-nums">
-          <div><b>${fmtNum(g.calls)}</b><span>请求次数</span></div>
-          <div><b style="color:var(--ok)">${fmtNum(g.ok)}</b><span>成功</span></div>
-          <div><b style="color:${g.failed ? "var(--bad)" : "var(--dim)"}">${fmtNum(g.failed)}</b><span>失败</span></div>
-          ${g.attempts != null ? `<div><b>${fmtNum(g.attempts)}</b><span>上游调用</span></div>` : ""}
+          <div><b>${fmtCount(g.calls)}</b><span>请求次数</span></div>
+          <div><b style="color:var(--ok)">${fmtCount(g.ok)}</b><span>成功</span></div>
+          <div><b style="color:${g.failed ? "var(--bad)" : "var(--dim)"}">${fmtCount(g.failed)}</b><span>失败</span></div>
+          ${g.attempts != null ? `<div><b>${fmtCount(g.attempts)}</b><span>上游调用</span></div>` : ""}
           <div><b>${fmtNum(g.usage.input)}</b><span>输入</span></div>
           <div><b>${fmtNum(g.usage.output)}</b><span>输出</span></div>
           <div class="tkn"><b style="color:var(--ok);font-size:13.5px">${fmtNum(g.usage.cache_read)}</b><span>缓存读</span></div>
@@ -3446,7 +3453,7 @@ function renderSide() {
             <span class="track">${okw > 0 ? `<i class="ok" style="width:${okw}%"></i>` : ""}${
               fw ? `<i class="fail" style="width:${fw}%"></i>` : ""}</span>
             <span class="cnt" title="调用 ${x.calls} 次 · 成功 ${x.ok} · 失败 ${x.failed}">${
-              `${fmtNum(x.calls)}<span class="okf">${x.failed ? ` · ${fmtNum(x.failed)}败` : ""}</span>`}</span>
+              `${fmtCount(x.calls)}<span class="okf">${x.failed ? ` · ${fmtCount(x.failed)}败` : ""}</span>`}</span>
           </div>`;
           };
           // 同一上游在这个分组里挂了多个模型时，上游汇总条下面再列模型细分；
@@ -3567,7 +3574,7 @@ function renderSide() {
   const rest = (journalPage ? journalPage.total : shown.length) - shown.length;
   if (rest > 0) {
     $("#sideReqs").innerHTML += `<div style="text-align:center;padding:6px 0 2px">
-      <button class="mini" id="reqMore">加载更多（还有 ${fmtNum(rest)} 条）</button>
+      <button class="mini" id="reqMore">加载更多（还有 ${fmtCount(rest)} 条）</button>
     </div>`;
     $("#reqMore").onclick = async () => {
       reqPage += 1;
