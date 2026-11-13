@@ -13,6 +13,17 @@
   let ws = null;
   let retry = 0;
 
+  // 先用普通 HTTP 把边缘缓存的快照拿回来（比等 WebSocket 握手快一截），
+  // 之后再用 WS 收增量。
+  async function pullSnapshot() {
+    if (!token) return;
+    try {
+      const r = await fetch(`/snapshot?token=${encodeURIComponent(token)}`, { cache: "no-store" });
+      const m = await r.json();
+      if (m && m.type === "snapshot") applySnapshot(m);
+    } catch (e) {}
+  }
+
   const fmt = (n) => {
     const v = Number(n || 0);
     if (v >= 1e9) return (v / 1e9).toFixed(1) + "B";
@@ -29,6 +40,15 @@
     journal = m.journal || [];
     journalTotal = m.journal_total || journal.length;
     lastAt = m.at || Date.now() / 1000;
+    try { localStorage.setItem("llm-relay-snapshot", JSON.stringify(m)); } catch (e) {}
+  }
+
+  // 上次看到的快照先渲染出来，页面立刻有内容，再去边缘取最新。
+  function loadCached() {
+    try {
+      const raw = localStorage.getItem("llm-relay-snapshot");
+      if (raw) applySnapshot(JSON.parse(raw));
+    } catch (e) {}
   }
 
   function connect() {
@@ -39,8 +59,7 @@
     } catch (e) {
       return scheduleRetry();
     }
-    ws.onopen = () => { connected = true; retry = 0; ws.send(JSON.stringify({ type: "pull" })); };
-    ws.onclose = () => { connected = false; scheduleRetry(); };
+    ws.onopen = () => { connected = true; retry = 0; ws.send(JSON.stringify({ type: "pull" })); };    ws.onclose = () => { connected = false; scheduleRetry(); };
     ws.onerror = () => { try { ws.close(); } catch (e) {} };
     ws.onmessage = (ev) => {
       let m;
@@ -69,7 +88,7 @@
     connect();
   }
 
-  $effect(() => { connect(); });
+  $effect(() => { loadCached(); pullSnapshot(); connect(); });
 </script>
 
 <div class="wrap">

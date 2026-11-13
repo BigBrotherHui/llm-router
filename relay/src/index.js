@@ -22,6 +22,17 @@ export class Relay {
       return new Response("forbidden", { status: 403 });
     }
 
+    // 普通 HTTP 拿缓存快照：手机首屏不用等 WebSocket 握手。
+    if (url.pathname.endsWith("/snapshot")) {
+      const snapshot = (await this.state.storage.get("snapshot")) || "";
+      return new Response(snapshot || JSON.stringify({ type: "empty" }), {
+        headers: {
+          "content-type": "application/json",
+          "cache-control": "no-store",
+        },
+      });
+    }
+
     const pair = new WebSocketPair();
     const [client, server] = Object.values(pair);
     this.state.acceptWebSocket(server);
@@ -76,9 +87,10 @@ export default {
         headers: { "content-type": "application/json" },
       });
     }
-    if (url.pathname === "/agent" || url.pathname === "/client") {
-      const id = env.RELAY.idFromName("main");
-      return env.RELAY.get(id).fetch(request);
+    if (url.pathname === "/agent" || url.pathname === "/client" || url.pathname === "/snapshot") {
+      const id = env.RELAY.idFromName("main-apac");
+      // 固定放到亚太，避免 DO 落在欧洲导致国内手机跨洲往返。
+      return env.RELAY.get(id, { locationHint: "apac" }).fetch(request);
     }
     return env.ASSETS.fetch(request);
   },
