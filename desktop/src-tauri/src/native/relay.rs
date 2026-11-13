@@ -15,7 +15,8 @@ use super::state::AppState;
 /// 手机端只需要「摘要」：统计、上游概览、模型路由概览、最近 50 条记录。
 pub fn snapshot(state: &AppState) -> Value {
     let stats = super::stats::load_runtime(state);
-    let totals = stats
+    // 只要汇总数字：不要把 totals 里嵌套的 models/upstreams 全量历史推给手机。
+    let totals = super::stats::meta(&stats)
         .get("totals")
         .cloned()
         .unwrap_or_else(|| json!({}));
@@ -41,30 +42,17 @@ pub fn snapshot(state: &AppState) -> Value {
         let file = state.file.read().unwrap();
         for (name, route) in &file.models {
             let enabled = route.entries.iter().filter(|e| e.enabled).count();
-            let mut names: Vec<String> = route
-                .entries
-                .iter()
-                .map(|e| {
-                    file.upstreams
-                        .iter()
-                        .find(|u| u.id == e.upstream)
-                        .map(|u| u.name.clone())
-                        .unwrap_or_else(|| e.upstream.clone())
-                })
-                .collect();
-            names.dedup();
             models.push(json!({
                 "name": name,
                 "entries": route.entries.len(),
                 "enabled": enabled,
-                "upstreams": names,
             }));
         }
     }
     models.sort_by(|a, b| a["name"].as_str().cmp(&b["name"].as_str()));
 
     let mut q: HashMap<String, String> = HashMap::new();
-    q.insert("limit".to_string(), "50".to_string());
+    q.insert("limit".to_string(), "20".to_string());
     let page = super::journal::query(state, &q);
     let journal = page.get("entries").cloned().unwrap_or_else(|| json!([]));
     let journal_total = page.get("total").cloned().unwrap_or_else(|| json!(0));
@@ -95,6 +83,10 @@ pub async fn run(state: Arc<AppState>) {
             continue;
         }
         let url = format!("{}/agent", base.trim_end_matches('/'));
+        // tungstenite 只认 ws/wss 前缀；用户填的是 https 地址。
+        let url = url
+            .replacen("https://", "wss://", 1)
+            .replacen("http://", "ws://", 1);
         if let Err(e) = session(&state, &url, token.as_str()).await {
             eprintln!("[relay] {e}");
         }
