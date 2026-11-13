@@ -255,6 +255,8 @@ pub struct AppState {
     pub health: Mutex<HashMap<String, UpstreamHealth>>,
     /// 实际监听端口（端口漂移时由 serve 更新）。
     pub port: std::sync::atomic::AtomicU16,
+    /// /stats 快照缓存（1 秒），避免每次轮询都重建 4000+ 分组的 catalog。
+    pub snapshot_cache: Mutex<Option<(Instant, Value)>>,
 }
 
 impl AppState {
@@ -281,6 +283,7 @@ impl AppState {
             app: Mutex::new(app),
             health: Mutex::new(HashMap::new()),
             port: std::sync::atomic::AtomicU16::new(0),
+            snapshot_cache: Mutex::new(None),
         }
     }
 
@@ -315,6 +318,9 @@ impl AppState {
     }
 
     pub fn save(&self) -> Result<(), String> {
+        if let Ok(mut cache) = self.snapshot_cache.lock() {
+            *cache = None;
+        }
         let file = self.file.read().unwrap();
         let text = serde_json::to_string_pretty(&*file).map_err(|e| e.to_string())?;
         if let Some(dir) = self.state_path.parent() {
@@ -411,6 +417,21 @@ pub fn mask_key(key: &str) -> String {
         chars[..6].iter().collect::<String>(),
         chars[chars.len() - 4..].iter().collect::<String>()
     )
+}
+
+pub fn snapshot_cached(state: &AppState) -> Value {
+    if let Ok(cache) = state.snapshot_cache.lock() {
+        if let Some((at, value)) = cache.as_ref() {
+            if at.elapsed() < std::time::Duration::from_secs(1) {
+                return value.clone();
+            }
+        }
+    }
+    let value = snapshot(state);
+    if let Ok(mut cache) = state.snapshot_cache.lock() {
+        *cache = Some((Instant::now(), value.clone()));
+    }
+    value
 }
 
 pub fn snapshot(state: &AppState) -> Value {

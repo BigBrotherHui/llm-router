@@ -10,7 +10,7 @@ use tauri::Manager;
 
 use super::journal;
 use super::proxy;
-use super::state::{snapshot, AppState, ModelRoute, RouteEntry, Upstream};
+use super::state::{AppState, ModelRoute, RouteEntry, Upstream};
 use super::stats;
 
 fn ok(v: Value) -> Response {
@@ -29,7 +29,7 @@ pub async fn stats_handler(
     State(state): State<Arc<AppState>>,
     Query(q): Query<HashMap<String, String>>,
 ) -> Response {
-    let mut snap = snapshot(&state);
+    let mut snap = super::state::snapshot_cached(&state);
     let stats_data = stats::load(&state.stats_path());
     let range = q.get("range").cloned().unwrap_or_default();
     snap["total_requests"] = json!(stats_data
