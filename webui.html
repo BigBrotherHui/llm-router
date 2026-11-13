@@ -584,6 +584,21 @@
         </div>
       </div>
 
+      <div class="card" style="margin-top:14px" id="winBehaviorCard" hidden>
+        <h2>窗口行为</h2>
+        <div class="hint" style="margin:-6px 0 12px">
+          点右上角关闭按钮时的默认动作。最小化会保留后台服务，客户端调用不会中断；退出则停止服务。
+        </div>
+        <div class="row" style="gap:12px;align-items:center;flex-wrap:wrap">
+          <select id="winBehavior" style="font-size:13px;max-width:260px">
+            <option value="minimize">最小化到任务栏（默认）</option>
+            <option value="close">退出程序</option>
+          </select>
+          <button class="primary" id="winBehaviorSave">保存</button>
+          <span class="hint" id="winBehaviorStatus"></span>
+        </div>
+      </div>
+
       <div class="card" style="margin-top:14px">
         <h2>上游网络出口</h2>
         <div class="hint" style="margin:-6px 0 12px">
@@ -3565,6 +3580,33 @@ function renderSettings() {
   }
   // 同一页上的「上游网络出口」：端口、每个上游的实际出口、Clash 片段
   renderProxySettings();
+  loadWindowBehavior();
+}
+
+let winBehaviorLoaded = false;
+async function loadWindowBehavior(force) {
+  const card = $("#winBehaviorCard");
+  if (!card || (winBehaviorLoaded && !force)) return;
+  try {
+    const r = await api("/admin/window", undefined, "GET");
+    card.hidden = false;
+    $("#winBehavior").value = r.behavior || "minimize";
+    winBehaviorLoaded = true;
+  } catch (e) {
+    card.hidden = true;   // Python 版没有这个接口，静默隐藏
+    winBehaviorLoaded = true;
+  }
+}
+
+async function saveWindowBehavior() {
+  try {
+    await api("/admin/window", { behavior: $("#winBehavior").value });
+    $("#winBehaviorStatus").textContent = "已保存";
+    toast("窗口行为已保存", "ok");
+  } catch (e) {
+    $("#winBehaviorStatus").textContent = "";
+    toast("保存失败：" + e.message, "bad");
+  }
 }
 
 async function saveSettings() {
@@ -3594,6 +3636,7 @@ async function saveSettings() {
   btn.disabled = false;
 }
 $("#setSave").onclick = saveSettings;
+$("#winBehaviorSave").onclick = saveWindowBehavior;
 
 /* ================= 设置页：上游网络出口 ================= */
 // 三个本地端口 + 每个上游实际走哪条。测路结果只存在这个浏览器里（lastNetBench），

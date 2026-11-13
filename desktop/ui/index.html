@@ -1,0 +1,123 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<meta name="color-scheme" content="dark">
+<title>llm-router</title>
+<style>
+  :root{--bg:#0f1115;--card:#171a21;--line:#2a2f3a;--text:#e8eaf0;--muted:#98a2b3;--accent:#4f8cff}
+  *{box-sizing:border-box}
+  html,body{height:100%}
+  body{margin:0;background:radial-gradient(1200px 800px at 50% -10%,#1b2333 0%,var(--bg) 55%);
+       color:var(--text);font:15px/1.55 -apple-system,BlinkMacSystemFont,"Segoe UI",system-ui,"PingFang SC","Microsoft YaHei",sans-serif;
+       display:flex;align-items:center;justify-content:center;padding:24px;overflow:hidden}
+  .card{width:min(460px,100%);background:var(--card);border:1px solid var(--line);border-radius:16px;
+        padding:32px 30px;box-shadow:0 24px 80px rgba(0,0,0,.45)}
+  .logo{width:46px;height:46px;border-radius:12px;background:linear-gradient(135deg,#4f8cff,#7b5cff);
+        display:flex;align-items:center;justify-content:center;font-weight:700;font-size:18px;letter-spacing:.5px;margin-bottom:18px}
+  h1{margin:0 0 6px;font-size:20px;font-weight:650}
+  p.sub{margin:0 0 24px;color:var(--muted);font-size:13px}
+  .status{display:flex;align-items:center;gap:10px;color:var(--muted);font-size:13px;min-height:42px;
+          background:#12151b;border:1px solid var(--line);border-radius:10px;padding:10px 12px;margin-bottom:16px}
+  .dot{width:8px;height:8px;border-radius:50%;background:var(--accent);flex:none;animation:pulse 1.2s ease-in-out infinite}
+  .dot.err{background:#ff5d5d;animation:none}
+  @keyframes pulse{0%,100%{opacity:.35}50%{opacity:1}}
+  label{display:block;font-size:12px;color:var(--muted);margin:0 0 6px}
+  input{width:100%;padding:11px 12px;border-radius:10px;border:1px solid var(--line);background:#12151b;color:var(--text);
+        font:inherit;outline:none}
+  input:focus{border-color:var(--accent)}
+  button{width:100%;margin-top:12px;padding:11px 14px;border:0;border-radius:10px;background:var(--accent);color:#fff;
+         font:inherit;font-weight:600;cursor:pointer}
+  button.secondary{background:#232936;color:var(--text)}
+  button:disabled{opacity:.5;cursor:default}
+  .hide{display:none!important}
+  .hint{margin-top:14px;color:#6b7484;font-size:12px;text-align:center}
+</style>
+</head>
+<body>
+<main class="card">
+  <div class="logo">LR</div>
+  <h1>llm-router</h1>
+  <p class="sub" id="sub">正在准备本地服务…</p>
+
+  <div class="status" id="status"><span class="dot" id="dot"></span><span id="statusText">启动中</span></div>
+
+  <section id="connect" class="hide">
+    <label for="server">服务地址（运行 router 的机器）</label>
+    <input id="server" type="url" inputmode="url" placeholder="http://192.168.1.10:8010" autocomplete="off" spellcheck="false">
+    <button id="connectBtn">连接</button>
+  </section>
+
+  <button id="retry" class="secondary hide">重试</button>
+  <p class="hint" id="hint"></p>
+</main>
+<script>
+(async () => {
+  const $ = (id) => document.getElementById(id);
+  const statusEl = $('statusText'), dot = $('dot'), sub = $('sub'), hint = $('hint');
+  const setStatus = (text, err = false) => { statusEl.textContent = text; dot.classList.toggle('err', err); };
+  const api = window.__TAURI__ && window.__TAURI__.core;
+
+  const normalize = (raw) => {
+    let v = (raw || '').trim();
+    if (!v) return '';
+    if (!/^https?:\/\//i.test(v)) v = 'http://' + v;
+    try {
+      const u = new URL(v);
+      if (!u.port) u.port = '8010';
+      return u.origin;
+    } catch { return ''; }
+  };
+
+  const showConnect = (prefill) => {
+    $('connect').classList.remove('hide');
+    $('sub').textContent = '连接到正在运行的路由器';
+    if (prefill) $('server').value = prefill;
+    $('server').focus();
+  };
+
+  if (!api) { // plain browser preview
+    showConnect(localStorage.getItem('llm_router_server') || 'http://127.0.0.1:8010');
+    setStatus('浏览器模式：请直接打开路由器地址', true);
+    return;
+  }
+
+  let info;
+  try { info = await api.invoke('bootstrap_info'); }
+  catch (e) { info = { desktop: true, server_url: 'http://127.0.0.1:8010' }; }
+
+  const go = (url) => { localStorage.setItem('llm_router_server', url); location.replace(url + '/'); };
+
+  if (info.desktop) {
+    sub.textContent = '启动本地服务…首次启动需要几秒钟';
+    setStatus('正在启动内置路由器…');
+    try {
+      await api.invoke('start_backend');
+      setStatus('就绪，正在打开控制台…');
+      setTimeout(() => location.replace(info.server_url + '/'), 150);
+    } catch (e) {
+      setStatus('本地服务启动失败', true);
+      sub.textContent = '可以重试，或手动填写一个已运行的服务地址';
+      $('retry').classList.remove('hide');
+      showConnect(localStorage.getItem('llm_router_server') || 'http://127.0.0.1:8010');
+      hint.textContent = String(e || '');
+    }
+  } else {
+    const saved = localStorage.getItem('llm_router_server');
+    if (saved) { setStatus('正在连接 ' + saved); go(saved); }
+    else { setStatus('填写运行 llm-router 的机器地址'); showConnect(''); }
+  }
+
+  $('connectBtn').addEventListener('click', () => {
+    const url = normalize($('server').value);
+    if (!url) { setStatus('地址格式不对，例如 http://192.168.1.10:8010', true); return; }
+    setStatus('正在连接 ' + url);
+    go(url);
+  });
+  $('server').addEventListener('keydown', (e) => { if (e.key === 'Enter') $('connectBtn').click(); });
+  $('retry').addEventListener('click', () => location.reload());
+})();
+</script>
+</body>
+</html>

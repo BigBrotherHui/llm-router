@@ -37,6 +37,19 @@ print(client.chat.completions.create(
 ).choices[0].message.content)
 ```
 
+## 桌面版 / 手机版（Tauri 2）
+
+`desktop/` 是 Tauri 2 单进程桌面版：Rust 原生后端内嵌在应用里，直接读同一套
+`.llmrouter` 状态；`router.py` 的 Python 版仍保留作为对照/过渡。
+
+```powershell
+cd desktop
+npm install
+npm run build             # 出原生单文件应用和安装包（不需要 Python/pyinstaller）
+```
+
+细节（数据目录、移动端打包、明文 HTTP 配置）见 [desktop/README.md](desktop/README.md)。
+
 ## 换电脑（导出全部上游 → 一条命令导入）
 
 上游、Key、勾选、分组、模型路由都存在 `.llmrouter/` 里（含明文 Key，不进仓库），

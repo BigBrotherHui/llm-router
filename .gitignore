@@ -29,6 +29,12 @@ _backups/
 __pycache__/
 *.pyc
 
+# Tauri 2 桌面端
+desktop/node_modules/
+desktop/src-tauri/target/
+desktop/src-tauri/gen/
+desktop/dist/
+
 # 运维脚本（含本机路径，不进仓库）
 _restart.py
 _restart.log
