@@ -96,7 +96,14 @@ fn order(
             }
             pairs
         }
-        _ => pairs,
+        _ => {
+            // priority：可用的排前面（保持配置顺序），冷却中的垫底——
+            // 和 Python 版 _order() 同语义，保证严格按用户排的顺序优先调用。
+            let (ready, cooling): (Vec<_>, Vec<_>) = pairs
+                .into_iter()
+                .partition(|(up, _)| super::state::upstream_available(state, &up.id));
+            ready.into_iter().chain(cooling).collect()
+        }
     }
 }
 
@@ -151,8 +158,46 @@ pub async fn chat_completions(
     let mut attempts: Vec<Value> = Vec::new();
     let mut last_status = StatusCode::BAD_GATEWAY;
     let mut last_message = "所有上游都失败了".to_string();
+    let started_all = std::time::Instant::now();
 
-    for (up, real_model) in candidates {
+    // 每次尝试记录进 journal（trail 字段），UI 的尝试链才有完整顺序。
+    macro_rules! push_attempt {
+        ($up:expr, $model:expr, $ok:expr, $status:expr, $elapsed:expr, $err:expr) => {
+            attempts.push(json!({
+                "upstream": $up.name, "upstream_id": $up.id, "model": $model,
+                "ok": $ok, "status": $status,
+                "elapsed_seconds": $elapsed,
+                "error": $err, "reason": $err,
+            }));
+        };
+    }
+    macro_rules! finish_journal {
+        ($final_up:expr, $final_model:expr, $final_status:expr, $final_ok:expr, $final_err:expr) => {{
+            super::state::append_journal(
+                &state,
+                json!({
+                    "at": chrono::Utc::now().timestamp() as f64,
+                    "time": chrono::Local::now().format("%H:%M:%S").to_string(),
+                    "upstream_id": $final_up.id,
+                    "upstream": $final_up.name,
+                    "key": super::state::mask_key($final_up.api_keys.first().map(|s| s.as_str()).unwrap_or("")),
+                    "model": requested,
+                    "effective_model": $final_model,
+                    "status": $final_status,
+                    "elapsed_seconds": started_all.elapsed().as_secs_f64(),
+                    "ok": $final_ok,
+                    "stream": stream,
+                    "attempts": attempts.len(),
+                    "route_source": "配置",
+                    "error": $final_err,
+                    "usage": {},
+                    "trail": attempts,
+                }),
+            );
+        }};
+    }
+
+    for (up, real_model) in &candidates {
         let url = join_url(&up.base_url, "/chat/completions");
         let mut out = payload.clone();
         out["model"] = json!(real_model);
@@ -176,6 +221,10 @@ pub async fn chat_completions(
                         .unwrap_or("application/json")
                         .to_string();
                     if stream {
+                        super::state::record_upstream_result(&state, &up.id, true, "");
+                        push_attempt!(up, real_model, true, status.as_u16(), started.elapsed().as_secs_f64(), "");
+                        finish_journal!(up, real_model, 200, true, "");
+                        state.bump_total();
                         let requested_name = requested.clone();
                         let mut source = resp.bytes_stream();
                         let body_stream = async_stream::stream! {
@@ -210,16 +259,16 @@ pub async fn chat_completions(
                     let bytes = match resp.bytes().await {
                         Ok(b) => b,
                         Err(e) => {
+                            super::state::record_upstream_result(&state, &up.id, false, &e.to_string());
+                            push_attempt!(up, real_model, false, status.as_u16(), started.elapsed().as_secs_f64(), e.to_string());
                             last_message = format!("读取上游响应失败: {e}");
                             continue;
                         }
                     };
                     let body = rewrite_model(&bytes, &requested).unwrap_or(bytes);
-                    attempts.push(json!({
-                        "upstream": up.name, "upstream_id": up.id,
-                        "model": real_model, "ok": true, "status": status.as_u16(),
-                        "elapsed_seconds": started.elapsed().as_secs_f64(),
-                    }));
+                    super::state::record_upstream_result(&state, &up.id, true, "");
+                    push_attempt!(up, real_model, true, status.as_u16(), started.elapsed().as_secs_f64(), "");
+                    finish_journal!(up, real_model, 200, true, "");
                     state.bump_total();
                     return Response::builder()
                         .status(StatusCode::OK)
@@ -228,27 +277,31 @@ pub async fn chat_completions(
                         .unwrap();
                 }
                 let text = resp.text().await.unwrap_or_default();
+                super::state::record_upstream_result(&state, &up.id, false, &truncate(&text, 200));
+                push_attempt!(up, real_model, false, status.as_u16(), started.elapsed().as_secs_f64(), truncate(&text, 200));
                 last_status = StatusCode::from_u16(status.as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
                 last_message = format!("上游 {} 返回 HTTP {}: {}", up.name, status, truncate(&text, 400));
-                attempts.push(json!({
-                    "upstream": up.name, "upstream_id": up.id, "model": real_model,
-                    "ok": false, "status": status.as_u16(),
-                    "elapsed_seconds": started.elapsed().as_secs_f64(),
-                    "error": truncate(&text, 400),
-                }));
             }
             Err(e) => {
+                super::state::record_upstream_result(&state, &up.id, false, &e.to_string());
+                push_attempt!(up, real_model, false, Value::Null, started.elapsed().as_secs_f64(), e.to_string());
                 last_message = format!("连接上游 {} 失败: {e}", up.name);
-                attempts.push(json!({
-                    "upstream": up.name, "upstream_id": up.id, "model": real_model,
-                    "ok": false, "status": Value::Null,
-                    "elapsed_seconds": started.elapsed().as_secs_f64(),
-                    "error": e.to_string(),
-                }));
             }
         }
     }
     state.bump_total();
+    // 全部失败：最后一家当记录主体，trail 里保留完整尝试链。
+    let (final_up, final_model) = candidates
+        .last()
+        .cloned()
+        .map(|(u, m)| (u, m))
+        .unwrap_or_else(|| {
+            (
+                Upstream { id: "-".into(), name: "-".to_string(), ..Default::default() },
+                requested.clone(),
+            )
+        });
+    finish_journal!(final_up, final_model, last_status.as_u16(), false, last_message);
     error_response(last_status, &last_message, &attempts)
 }
 

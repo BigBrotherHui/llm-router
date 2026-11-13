@@ -150,6 +150,16 @@ impl StateFile {
     }
 }
 
+/// 上游运行时健康状态（不落盘，进程内）。
+#[derive(Debug, Clone, Default)]
+pub struct UpstreamHealth {
+    pub consecutive_failures: u32,
+    /// 冷却截止时刻（UNIX 秒）；0 = 未冷却。
+    pub cooldown_until: i64,
+    pub last_error: String,
+    pub last_used: Option<i64>,
+}
+
 pub struct AppState {
     pub file: RwLock<StateFile>,
     pub state_path: PathBuf,
@@ -160,6 +170,7 @@ pub struct AppState {
     pub checkin_plan: Mutex<Option<(String, i64)>>,
     pub checkin_last_day: Mutex<String>,
     pub app: Mutex<Option<tauri::AppHandle>>,
+    pub health: Mutex<HashMap<String, UpstreamHealth>>,
 }
 
 impl AppState {
@@ -184,6 +195,7 @@ impl AppState {
             checkin_plan: Mutex::new(None),
             checkin_last_day: Mutex::new(String::new()),
             app: Mutex::new(app),
+            health: Mutex::new(HashMap::new()),
         }
     }
 
@@ -234,6 +246,73 @@ impl AppState {
     }
 }
 
+pub const FAILURE_THRESHOLD: u32 = 3;
+pub const COOLDOWN_SECONDS: i64 = 60;
+
+pub fn record_upstream_result(state: &AppState, uid: &str, ok: bool, error: &str) {
+    let mut health = state.health.lock().unwrap();
+    let entry = health.entry(uid.to_string()).or_default();
+    if ok {
+        entry.consecutive_failures = 0;
+        entry.cooldown_until = 0;
+        entry.last_error.clear();
+    } else {
+        entry.consecutive_failures += 1;
+        entry.last_error = error.chars().take(200).collect();
+        if entry.consecutive_failures >= FAILURE_THRESHOLD {
+            entry.cooldown_until = chrono::Utc::now().timestamp() + COOLDOWN_SECONDS;
+            entry.consecutive_failures = 0;
+        }
+    }
+    entry.last_used = Some(chrono::Utc::now().timestamp());
+}
+
+/// true = 不在冷却期。
+pub fn upstream_available(state: &AppState, uid: &str) -> bool {
+    let health = state.health.lock().unwrap();
+    match health.get(uid) {
+        Some(h) => chrono::Utc::now().timestamp() >= h.cooldown_until,
+        None => true,
+    }
+}
+
+pub fn upstream_last_error(state: &AppState, uid: &str) -> String {
+    let health = state.health.lock().unwrap();
+    health
+        .get(uid)
+        .map(|h| h.last_error.clone())
+        .unwrap_or_default()
+}
+
+pub fn upstream_cooling_remaining(state: &AppState, uid: &str) -> i64 {
+    let health = state.health.lock().unwrap();
+    health
+        .get(uid)
+        .map(|h| {
+            let now = chrono::Utc::now().timestamp();
+            (h.cooldown_until - now).max(0)
+        })
+        .unwrap_or(0)
+}
+
+pub fn upstream_failure_count(state: &AppState, uid: &str) -> u32 {
+    let health = state.health.lock().unwrap();
+    health.get(uid).map(|h| h.consecutive_failures).unwrap_or(0)
+}
+
+/// 追加一条请求流水（JSONL，与 Python 版格式对齐，UI 靠 trail 显示尝试链）。
+pub fn append_journal(state: &AppState, entry: Value) {
+    let path = state.history_path();
+    if let Some(dir) = path.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&path) {
+        use std::io::Write;
+        let line = serde_json::to_string(&entry).unwrap_or_default();
+        let _ = writeln!(f, "{line}");
+    }
+}
+
 pub fn mask_key(key: &str) -> String {
     let chars: Vec<char> = key.chars().collect();
     if chars.is_empty() {
@@ -279,6 +358,15 @@ pub fn snapshot(state: &AppState) -> Value {
                 .into_iter()
                 .map(|(k, v)| (k, json!(v)))
                 .collect();
+            let consec_fail = upstream_failure_count(state, &u.id);
+            let cool_remaining = upstream_cooling_remaining(state, &u.id);
+            let is_available = upstream_available(state, &u.id);
+            let last_err_raw = upstream_last_error(state, &u.id);
+            let last_err_val = if last_err_raw.is_empty() {
+                Value::Null
+            } else {
+                json!(last_err_raw)
+            };
             json!({
                 "id": u.id,
                 "name": u.name,
@@ -309,10 +397,10 @@ pub fn snapshot(state: &AppState) -> Value {
                 "requests": 0,
                 "successes": 0,
                 "failures": 0,
-                "consecutive_failures": 0,
-                "cooldown_remaining_seconds": 0,
-                "available": true,
-                "last_error": Value::Null,
+                "consecutive_failures": consec_fail,
+                "cooldown_remaining_seconds": cool_remaining,
+                "available": is_available,
+                "last_error": last_err_val,
                 "avg_latency_seconds": 0,
                 "last_used": Value::Null,
                 "last_check": u.last_check,
