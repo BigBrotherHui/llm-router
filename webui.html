@@ -700,11 +700,12 @@
       <div class="card" style="margin-top:14px" id="winBehaviorCard" hidden>
         <h2>窗口行为</h2>
         <div class="hint" style="margin:-6px 0 12px">
-          点右上角关闭按钮时的默认动作。最小化会保留后台服务，客户端调用不会中断；退出则停止服务。
+          点右上角关闭按钮时的默认动作。托盘/最小化都会保留后台服务，客户端调用不会中断；退出则停止服务。
         </div>
         <div class="row" style="gap:12px;align-items:center;flex-wrap:wrap">
           <select id="winBehavior" style="font-size:13px;max-width:260px">
-            <option value="minimize">最小化到任务栏（默认）</option>
+            <option value="tray">隐藏到系统托盘（默认）</option>
+            <option value="minimize">最小化到任务栏</option>
             <option value="close">退出程序</option>
           </select>
           <button class="primary" id="winBehaviorSave">保存</button>
@@ -3745,7 +3746,7 @@ async function loadWindowBehavior(force) {
   try {
     const r = await api("/admin/window", undefined, "GET");
     card.hidden = false;
-    $("#winBehavior").value = r.behavior || "minimize";
+    $("#winBehavior").value = r.behavior || "tray";
     winBehaviorLoaded = true;
   } catch (e) {
     card.hidden = true;   // Python 版没有这个接口，静默隐藏

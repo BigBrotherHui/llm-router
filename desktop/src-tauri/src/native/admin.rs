@@ -421,7 +421,7 @@ pub async fn window_behavior(State(state): State<Arc<AppState>>) -> Response {
         .unwrap()
         .window_behavior
         .clone()
-        .unwrap_or_else(|| "minimize".to_string());
+        .unwrap_or_else(|| "tray".to_string());
     let (config_windows, open_windows) = state
         .app
         .lock()
@@ -488,8 +488,8 @@ pub async fn set_window_behavior(
     Json(p): Json<Value>,
 ) -> Response {
     let behavior = p.get("behavior").and_then(|v| v.as_str()).unwrap_or("");
-    if behavior != "minimize" && behavior != "close" {
-        return bad("behavior 只能是 minimize 或 close");
+    if behavior != "tray" && behavior != "minimize" && behavior != "close" {
+        return bad("behavior 只能是 tray、minimize 或 close");
     }
     {
         let mut file = state.file.write().unwrap();

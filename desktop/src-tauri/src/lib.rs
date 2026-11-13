@@ -6,6 +6,9 @@ use std::time::{Duration, Instant};
 
 use tauri::{Manager, RunEvent};
 
+#[cfg(desktop)]
+use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
+
 mod native;
 
 const DEFAULT_PORT: u16 = 8010;
@@ -104,6 +107,50 @@ async fn start_backend() -> Result<(), String> {
     Err(format!("原生服务 30 秒内没有启动（127.0.0.1:{port}）"))
 }
 
+#[cfg(desktop)]
+fn show_main_window(app: &tauri::AppHandle) {
+    if let Some(window) = app.get_webview_window("main") {
+        let _ = window.show();
+        let _ = window.unminimize();
+        let _ = window.set_focus();
+    }
+}
+
+#[cfg(desktop)]
+fn setup_tray(app: &tauri::App) -> tauri::Result<()> {
+    let show = tauri::menu::MenuItem::with_id(app, "show", "显示主界面", true, None::<&str>)?;
+    let quit = tauri::menu::MenuItem::with_id(app, "quit", "退出", true, None::<&str>)?;
+    let menu = tauri::menu::Menu::with_items(app, &[&show, &quit])?;
+    let icon = app
+        .default_window_icon()
+        .cloned()
+        .expect("窗口图标缺失，无法创建托盘图标");
+    let tray = TrayIconBuilder::new()
+        .icon(icon)
+        .menu(&menu)
+        .tooltip("llm-router")
+        .show_menu_on_left_click(false)
+        .on_menu_event(|app, event| match event.id().as_ref() {
+            "show" => show_main_window(app),
+            "quit" => app.exit(0),
+            _ => {}
+        })
+        .on_tray_icon_event(|tray, event| {
+            if let TrayIconEvent::Click {
+                button: MouseButton::Left,
+                button_state: MouseButtonState::Up,
+                ..
+            } = event
+            {
+                show_main_window(tray.app_handle());
+            }
+        })
+        .build(app)?;
+    // TrayIcon 是引用计数资源，必须由应用持有，否则图标会被回收。
+    app.manage(tray);
+    Ok(())
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     let app = tauri::Builder::default()
@@ -127,6 +174,7 @@ pub fn run() {
                 .shadow(false)
                 .background_color(tauri::window::Color(9, 13, 20, 255))
                 .build()?;
+                setup_tray(app)?;
                 let port = port();
                 let data_dir = app
                     .path()
@@ -184,9 +232,12 @@ pub fn run() {
                         .unwrap()
                         .window_behavior
                         .clone()
-                        .unwrap_or_else(|| "minimize".to_string());
+                        .unwrap_or_else(|| "tray".to_string());
                     if behavior == "close" {
                         window.app_handle().exit(0);
+                    } else if behavior == "tray" {
+                        api.prevent_close();
+                        let _ = window.hide();
                     } else {
                         api.prevent_close();
                         let _ = window.minimize();
