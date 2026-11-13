@@ -137,6 +137,9 @@ pub struct StateFile {
     pub checkin_settings: Value,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub window_behavior: Option<String>,
+    /// 允许局域网 / Tailscale 访问（绑定 0.0.0.0，否则只听 127.0.0.1）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub remote_access: Option<bool>,
     #[serde(flatten)]
     pub extra: Map<String, Value>,
 }

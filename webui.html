@@ -713,6 +713,26 @@
         </div>
       </div>
 
+      <div class="card" style="margin-top:14px" id="remoteCard" hidden>
+        <h2>远程访问（Tailscale）</h2>
+        <div class="hint" style="margin:-6px 0 12px">
+          开启后本机服务监听 <code>0.0.0.0</code>，手机 / 平板安装 Tailscale 并登录同一账号，
+          用下面的地址打开控制台即可看到上游和模型路由。
+          <br><b>安全提醒</b>：控制台没有登录鉴权，只建议走 Tailscale 私网，不要直接映射到公网。
+        </div>
+        <label class="row" style="gap:8px;cursor:pointer;margin-bottom:12px">
+          <input type="checkbox" id="remoteEnabled">
+          <span style="font-size:13px">允许手机 / 局域网访问（保存后需重启应用生效）</span>
+        </label>
+        <div class="row" style="gap:10px;flex-wrap:wrap;margin-bottom:10px">
+          <button class="primary" id="remoteSave">保存</button>
+          <button class="mini" id="remoteRefresh">刷新状态</button>
+          <span class="hint" id="remoteSaveStatus"></span>
+        </div>
+        <div id="remoteStatus" class="hint"></div>
+        <div id="remoteUrls" style="margin-top:10px"></div>
+      </div>
+
       <div class="card" style="margin-top:14px">
         <h2>上游网络出口</h2>
         <div class="hint" style="margin:-6px 0 12px">
@@ -3737,6 +3757,7 @@ function renderSettings() {
   // 同一页上的「上游网络出口」：端口、每个上游的实际出口、Clash 片段
   renderProxySettings();
   loadWindowBehavior();
+  loadRemoteAccess();
 }
 
 let winBehaviorLoaded = false;
@@ -3764,6 +3785,76 @@ async function saveWindowBehavior() {
     toast("保存失败：" + e.message, "bad");
   }
 }
+
+/* ================= 设置页：远程访问（Tailscale） ================= */
+let remoteLoaded = false;
+
+async function loadRemoteAccess(force) {
+  const card = $("#remoteCard");
+  if (!card || (remoteLoaded && !force)) return;
+  try {
+    const r = await api("/admin/remote", undefined, "GET");
+    card.hidden = false;
+    remoteLoaded = true;
+    renderRemote(r);
+  } catch (e) {
+    card.hidden = true;
+  }
+}
+
+function renderRemote(r) {
+  const ts = r.tailscale || {};
+  let status;
+  if (!ts.installed) {
+    status = "Tailscale 未安装：这台电脑和手机都需要安装 Tailscale，并登录同一账号（tailscale.com/download）。";
+  } else if (!ts.running) {
+    status = "Tailscale 服务未运行：" + (ts.message || "请打开 Tailscale 并登录");
+  } else if (!ts.online) {
+    status = "Tailscale 已启动但未连接（状态：" + (ts.backend_state || "unknown") + "），请先在 Tailscale 里登录。";
+  } else {
+    status = "Tailscale 已连接" + (ts.dns_name ? " · " + ts.dns_name : "");
+  }
+  $("#remoteStatus").textContent = status;
+
+  const enabled = !!r.enabled;
+  $("#remoteEnabled").checked = enabled;
+  const box = $("#remoteUrls");
+  if (!enabled) {
+    box.innerHTML = '<div class="hint">开启并重启应用后，这里会显示手机可用的地址。</div>';
+    return;
+  }
+  const urls = r.urls || [];
+  box.innerHTML = urls
+    .map(u => `<div class="row" style="gap:8px;margin-bottom:6px">
+      <code style="flex:1;min-width:0;overflow:auto">${esc(u)}</code>
+      <button class="mini" data-copy="${esc(u)}">复制</button>
+    </div>`)
+    .join("") + '<div class="hint" style="margin-top:6px">手机上打开 Tailscale 后，用上面的地址访问即可。</div>';
+  box.querySelectorAll("[data-copy]").forEach(btn => {
+    btn.onclick = () => {
+      navigator.clipboard.writeText(btn.dataset.copy)
+        .then(() => toast("已复制", "ok"))
+        .catch(() => {});
+    };
+  });
+}
+
+async function saveRemoteAccess() {
+  const btn = $("#remoteSave");
+  btn.disabled = true;
+  try {
+    const r = await api("/admin/remote", { enabled: $("#remoteEnabled").checked });
+    $("#remoteSaveStatus").textContent = "已保存" + (r.restart_required ? "，重启应用后生效" : "");
+    toast(r.enabled ? "已开启远程访问，重启应用后生效" : "已关闭远程访问，重启应用后生效", "ok");
+    await loadRemoteAccess(true);
+  } catch (e) {
+    $("#remoteSaveStatus").textContent = "";
+    toast("保存失败：" + e.message, "bad");
+  }
+  btn.disabled = false;
+}
+$("#remoteSave").onclick = saveRemoteAccess;
+$("#remoteRefresh").onclick = () => loadRemoteAccess(true);
 
 async function saveSettings() {
   const num = el => {

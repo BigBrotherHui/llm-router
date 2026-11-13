@@ -36,6 +36,13 @@ async fn favicon() -> Response {
 }
 
 pub async fn serve(state: Arc<AppState>, port: u16) -> Result<(), String> {
+    // 远程访问开关决定监听地址：关 = 只听本机；开 = 0.0.0.0（局域网 / Tailscale）。
+    let remote = state
+        .file
+        .read()
+        .map(|f| f.remote_access.unwrap_or(false))
+        .unwrap_or(false);
+    let bind_host = if remote { "0.0.0.0" } else { "127.0.0.1" };
     let app = Router::new()
         .route("/", get(index))
         .route("/ui", get(index))
@@ -61,6 +68,7 @@ pub async fn serve(state: Arc<AppState>, port: u16) -> Result<(), String> {
         .route("/admin/model/order/delete", post(admin::order_delete))
         .route("/admin/defaults", post(admin::defaults))
         .route("/admin/window", get(admin::window_behavior).post(admin::set_window_behavior))
+        .route("/admin/remote", get(admin::remote_access).post(admin::set_remote_access))
         .route("/admin/window/minimize", post(admin::window_minimize))
         .route("/admin/window/toggle-maximize", post(admin::window_toggle_maximize))
         .route("/admin/window/drag", post(admin::window_drag))
@@ -94,7 +102,7 @@ pub async fn serve(state: Arc<AppState>, port: u16) -> Result<(), String> {
     let mut actual_port = port;
     for offset in 0..20u16 {
         let p = port + offset;
-        match tokio::net::TcpListener::bind(("127.0.0.1", p)).await {
+        match tokio::net::TcpListener::bind((bind_host, p)).await {
             Ok(l) => {
                 listener = Some(l);
                 actual_port = p;
@@ -104,12 +112,15 @@ pub async fn serve(state: Arc<AppState>, port: u16) -> Result<(), String> {
         }
     }
     let listener = listener.ok_or_else(|| {
-        format!("127.0.0.1:{port} 起连续 20 个端口都被占用，请设置 LLM_ROUTER_PORT 换个端口")
+        format!("{bind_host}:{port} 起连续 20 个端口都被占用，请设置 LLM_ROUTER_PORT 换个端口")
     })?;
     if actual_port != port {
         eprintln!("[native] 端口 {port} 被占，已改用 {actual_port}");
-        state.port.store(actual_port, std::sync::atomic::Ordering::Relaxed);
     }
+    // 无论是否漂移都要写入实际端口，start_backend 靠它返回真实地址。
+    state
+        .port
+        .store(actual_port, std::sync::atomic::Ordering::Relaxed);
     axum::serve(listener, app)
         .await
         .map_err(|e| format!("HTTP 服务退出: {e}"))

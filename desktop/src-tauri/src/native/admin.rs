@@ -826,6 +826,129 @@ pub async fn rename_group(State(state): State<Arc<AppState>>, Json(p): Json<Valu
     ok(json!({"ok": true, "from": from, "to": to}))
 }
 
+fn tailscale_exe() -> Option<std::path::PathBuf> {
+    let candidates = [
+        std::env::var("ProgramFiles")
+            .ok()
+            .map(|p| std::path::Path::new(&p).join("Tailscale").join("tailscale.exe")),
+        std::env::var("ProgramFiles(x86)")
+            .ok()
+            .map(|p| std::path::Path::new(&p).join("Tailscale").join("tailscale.exe")),
+    ];
+    for c in candidates.into_iter().flatten() {
+        if c.exists() {
+            return Some(c);
+        }
+    }
+    if let Ok(path) = std::env::var("PATH") {
+        for dir in std::env::split_paths(&path) {
+            let p = dir.join(if cfg!(windows) { "tailscale.exe" } else { "tailscale" });
+            if p.exists() {
+                return Some(p);
+            }
+        }
+    }
+    None
+}
+
+/// 读本机 Tailscale 状态：装没装、服务起没起、登录没登录、tailnet 地址。
+fn tailscale_status() -> Value {
+    let Some(exe) = tailscale_exe() else {
+        return json!({"installed": false, "running": false, "online": false,
+            "message": "未安装 Tailscale"});
+    };
+    match std::process::Command::new(&exe)
+        .args(["status", "--json"])
+        .output()
+    {
+        Ok(out) if out.status.success() => {
+            let text = String::from_utf8_lossy(&out.stdout);
+            let v: Value = serde_json::from_str(&text).unwrap_or(Value::Null);
+            let backend = v
+                .get("BackendState")
+                .and_then(|x| x.as_str())
+                .unwrap_or("")
+                .to_string();
+            let self_v = v.get("Self");
+            let dns_name = self_v
+                .and_then(|s| s.get("DNSName"))
+                .and_then(|x| x.as_str())
+                .unwrap_or("")
+                .trim_end_matches('.')
+                .to_string();
+            let ips: Vec<String> = self_v
+                .and_then(|s| s.get("TailscaleIPs"))
+                .and_then(|x| x.as_array())
+                .map(|a| {
+                    a.iter()
+                        .filter_map(|i| i.as_str().map(|s| s.to_string()))
+                        .collect()
+                })
+                .unwrap_or_default();
+            json!({
+                "installed": true, "running": true,
+                "online": backend == "Running",
+                "backend_state": backend,
+                "dns_name": dns_name,
+                "ips": ips,
+            })
+        }
+        Ok(out) => {
+            let raw = String::from_utf8_lossy(&out.stderr).trim().to_string();
+            let msg = if raw.contains("failed to connect to local tailscaled") {
+                "Tailscale 服务未运行，请打开 Tailscale 并登录".to_string()
+            } else if raw.is_empty() {
+                "Tailscale 服务未运行".to_string()
+            } else {
+                raw
+            };
+            json!({"installed": true, "running": false, "online": false, "message": msg})
+        }
+        Err(e) => json!({"installed": true, "running": false, "online": false,
+            "message": e.to_string()}),
+    }
+}
+
+pub async fn remote_access(State(state): State<Arc<AppState>>) -> Response {
+    let enabled = state
+        .file
+        .read()
+        .map(|f| f.remote_access.unwrap_or(false))
+        .unwrap_or(false);
+    let port = state.port.load(std::sync::atomic::Ordering::Relaxed);
+    let port = if port == 0 { 8010 } else { port };
+    let ts = tailscale_status();
+    let mut urls: Vec<String> = vec![format!("http://127.0.0.1:{port}")];
+    if enabled {
+        if let Some(dns) = ts.get("dns_name").and_then(|v| v.as_str()) {
+            if !dns.is_empty() {
+                urls.push(format!("http://{dns}:{port}"));
+            }
+        }
+        if let Some(ips) = ts.get("ips").and_then(|v| v.as_array()) {
+            for ip in ips.iter().filter_map(|v| v.as_str()) {
+                if ip.contains('.') {
+                    urls.push(format!("http://{ip}:{port}"));
+                }
+            }
+        }
+    }
+    ok(json!({"ok": true, "enabled": enabled, "port": port, "urls": urls, "tailscale": ts}))
+}
+
+pub async fn set_remote_access(
+    State(state): State<Arc<AppState>>,
+    Json(p): Json<Value>,
+) -> Response {
+    let enabled = p.get("enabled").and_then(|v| v.as_bool()).unwrap_or(false);
+    {
+        let mut file = state.file.write().unwrap();
+        file.remote_access = Some(enabled);
+    }
+    let _ = state.save();
+    ok(json!({"ok": true, "enabled": enabled, "restart_required": true}))
+}
+
 fn truncate(s: &str, n: usize) -> String {
     if s.chars().count() <= n {
         s.to_string()
