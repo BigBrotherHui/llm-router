@@ -13,6 +13,7 @@ use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::Router;
+use tower_http::compression::CompressionLayer;
 
 use state::AppState;
 
@@ -94,6 +95,7 @@ pub async fn serve(state: Arc<AppState>, port: u16) -> Result<(), String> {
         .route("/v1/models", get(proxy::list_models))
         .route("/v1/chat/completions", post(proxy::chat_completions))
         .layer(DefaultBodyLimit::max(64 * 1024 * 1024))
+        .layer(CompressionLayer::new())
         .with_state(state.clone());
 
     // 请求的端口被占（比如别的程序或旧实例）时，从 +1 开始往后找空闲端口，
