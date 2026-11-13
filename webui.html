@@ -3259,8 +3259,12 @@ function curFilterLabel() {
 
 // 当前筛选条件（传给后端）
 function curJournalFilter() {
-  const day = ($("#sideDay") && $("#sideDay").value) || "";
+  let day = ($("#sideDay") && $("#sideDay").value) || "";
   const month = ($("#sideMonth") && $("#sideMonth").value) || "";
+  // 「今天」这个 option 要等 index 回来才填得进下拉框；在它出现之前如果 day 为空，
+  // 第一次请求就会拉全量、之后才切成当天（刷新时闪一下全部记录就是这个）。
+  // 首次进入直接按今天查，不再依赖下拉框有没有那个 option。
+  if (!day && !month && !journalDayDefaulted) day = dayKeyOf();
   const g = ($("#sideFilter") && $("#sideFilter").value) || "";
   const u = ($("#sideUpstream") && $("#sideUpstream").value) || "";
   const up = parseUpFilter(u);
@@ -3769,8 +3773,10 @@ function renderTabNums() {
 // 统计范围跟着筛选走：选了某天就按天统计，选了某月就按月，否则全量。
 // 这样面板上的数字和下面的列表永远是同一个口径。
 function statsRangeKey() {
-  const day = ($("#sideDay") && $("#sideDay").value) || "";
+  let day = ($("#sideDay") && $("#sideDay").value) || "";
   const month = ($("#sideMonth") && $("#sideMonth").value) || "";
+  // 和 curJournalFilter 同理：首次进入时下拉框还没有「今天」，直接按今天统计。
+  if (!day && !month && !journalDayDefaulted) day = dayKeyOf();
   if (day) return "day:" + day;
   if (month) return "month:" + month;
   return "all";
