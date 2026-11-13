@@ -733,6 +733,22 @@
         <div id="remoteUrls" style="margin-top:10px"></div>
       </div>
 
+      <div class="card" style="margin-top:14px" id="refreshCard">
+        <h2>界面刷新</h2>
+        <div class="hint" style="margin:-6px 0 12px">
+          控制台每隔多少秒拉一次状态和请求记录。默认 5 秒；手机走 Tailscale / 中继时建议 5–10 秒。
+        </div>
+        <div class="row" style="gap:10px;align-items:flex-end;flex-wrap:wrap">
+          <label class="cap-cell" style="max-width:200px">
+            <span class="cap-k">刷新间隔(秒)</span>
+            <input type="number" min="1" max="120" step="1" id="refreshInterval" placeholder="5">
+          </label>
+          <button class="primary" id="refreshIntervalSave">保存</button>
+          <span class="hint" id="refreshIntervalStatus"></span>
+        </div>
+        <div class="hint" style="margin-top:8px">只影响当前设备 / 浏览器，桌面和手机可以分别设置。</div>
+      </div>
+
       <div class="card" style="margin-top:14px">
         <h2>上游网络出口</h2>
         <div class="hint" style="margin:-6px 0 12px">
@@ -4739,6 +4755,37 @@ $("#ckRunAll").onclick = () => runCheckin(null, false);
 $("#ckProbeAll").onclick = () => runCheckin(null, true);
 $("#ckAutoSave").onclick = saveCkSettings;
 
+/* ================= 界面刷新间隔 ================= */
+const REFRESH_KEY = "llm-router-refresh-seconds";
+let refreshTimer = null;
+
+function refreshSeconds() {
+  const raw = Number(localStorage.getItem(REFRESH_KEY));
+  return Number.isFinite(raw) && raw >= 1 && raw <= 120 ? Math.round(raw) : 5;
+}
+
+function applyRefreshInterval() {
+  const secs = refreshSeconds();
+  const input = $("#refreshInterval");
+  if (input && document.activeElement !== input) input.value = String(secs);
+  if (refreshTimer) clearInterval(refreshTimer);
+  refreshTimer = setInterval(refresh, secs * 1000);
+}
+
+function saveRefreshInterval() {
+  const input = $("#refreshInterval");
+  const n = Math.round(Number((input.value || "").trim()));
+  if (!Number.isFinite(n) || n < 1 || n > 120) {
+    $("#refreshIntervalStatus").textContent = "请输入 1–120 之间的整数";
+    return;
+  }
+  localStorage.setItem(REFRESH_KEY, String(n));
+  applyRefreshInterval();
+  $("#refreshIntervalStatus").textContent = `已保存，每 ${n} 秒刷新`;
+  toast(`刷新间隔已改为 ${n} 秒`, "ok");
+}
+$("#refreshIntervalSave").onclick = saveRefreshInterval;
+
 (async function boot() {
   serverUrl = location.origin;
   bindDelegatedEvents();
@@ -4749,7 +4796,7 @@ $("#ckAutoSave").onclick = saveCkSettings;
   await loadWindowChrome();
   syncTabsTop();
   await refresh();
-  setInterval(refresh, 2500);
+  applyRefreshInterval();
 })();
 </script>
 </body>
