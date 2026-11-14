@@ -39,6 +39,9 @@ pub struct AgentInfo {
     pub expected_model: Option<String>,
     pub expected_base: Option<String>,
     pub applied_at: Option<String>,
+    /// DSH 这类 Agent 的「默认模型」是单独一处配置，单独回报
+    pub default_provider: Option<String>,
+    pub default_model: Option<String>,
     pub notes: String,
     /// 识别来源：内置规则 / npm 全局包 / 安装目录……
     pub source: String,
@@ -296,6 +299,8 @@ fn make_agent(
         expected_model: None,
         expected_base: None,
         applied_at: None,
+        default_provider: None,
+        default_model: None,
         notes: notes.to_string(),
         source: "内置规则".to_string(),
         pkg: None,
@@ -1066,7 +1071,32 @@ fn apply_drift(state: &AppState, agents: &mut [AgentInfo]) {
             };
             a.connected = still_connected;
             a.drifted = !still_connected || model_gone;
-            if a.drifted {
+            // DSH 的默认模型是单独的 agent-default-model 条目，import 时若钉过，
+            // 现在被谁改回别的 provider（Magpie 就是这么干的）就算漂移。
+            if a.id == "dsh-tui" {
+                let pin = rec
+                    .get("pin_default")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
+                if pin {
+                    let provider_off = a.default_provider.as_deref() != Some("llmrouter");
+                    let model_off = a.default_model.as_deref() != Some(expected_model.as_str());
+                    if provider_off || model_off {
+                        a.drifted = true;
+                        let now = match (&a.default_provider, &a.default_model) {
+                            (Some(p), Some(m)) => format!("{p}/{m}"),
+                            (Some(p), None) => p.clone(),
+                            (None, Some(m)) => m.clone(),
+                            (None, None) => "（条目被删掉了）".to_string(),
+                        };
+                        a.notes = format!(
+                            "{}；⚠ 默认模型已被改回 {}，可点「一键修回」",
+                            a.notes, now
+                        );
+                    }
+                }
+            }
+            if a.drifted && !a.notes.contains("⚠ 配置已漂移") && !a.notes.contains("⚠ 默认模型") {
                 let why = if !still_connected {
                     "配置已不再指向本机 llm-router"
                 } else {
@@ -1134,7 +1164,7 @@ fn persist(path: &Path, content: &str, dry_run: bool) -> Result<(Option<String>,
 const NEW_FILE_MARKER: &str = "__LLMROUTER_CREATED_BY_IMPORT__";
 
 /// VS Code 的 settings.json 常带 // 注释或尾逗号，先做一遍保留字符串字面量的清洗。
-fn strip_jsonc(text: &str) -> String {
+pub(super) fn strip_jsonc(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
     let mut chars = text.chars().peekable();
     let mut in_string = false;
@@ -1468,10 +1498,15 @@ fn template_paths(id: &str) -> Option<Vec<PathBuf>> {
         "zcode" => vec![h.join(".zcode").join("v2").join("config.json")],
         "workbuddy" => vec![h.join(".workbuddy").join("models.json")],
         // DeepSeek Harness（dsh / dsh-tui 共用一套 host 配置）
-        "dsh-tui" => vec![
-            h.join(".dsh").join("settings.yaml"),
-            h.join(".dsh").join(".env"),
-        ],
+        "dsh-tui" => {
+            let mut v = vec![
+                h.join(".dsh").join("settings.yaml"),
+                h.join(".dsh").join(".env"),
+            ];
+            // profile patch 层才是桌面版真正读的路由（Magpie 也是改它）
+            v.extend(dsh_patch_paths());
+            v
+        }
         _ => return None,
     })
 }
@@ -1486,7 +1521,7 @@ fn template_notes(id: &str) -> &'static str {
         "zcode" => "追加 provider.llm-router（kind=anthropic）而不覆盖 magpie；默认模型需在 ZCode UI 里选。",
         "workbuddy" => "在 models.json 数组追加一条自定义模型；默认模型需在 WorkBuddy UI 里选。",
         "dsh-tui" => {
-            "把 llm-router 作为 openai-completions provider 追加到 ~/.dsh/settings.yaml，并在 ~/.dsh/.env 写 LLM_ROUTER_KEY；重启 dsh web / dsh-tui 后在模型列表里选「LLM Router」下的模型。"
+            "把 llm-router 作为 openai-completions provider 追加到 ~/.dsh/settings.yaml 与 ~/.dsh/profiles/*/cordis.patch.yml（桌面版真正读的 patch 层），并在 ~/.dsh/.env 写 LLM_ROUTER_API_KEY；勾选「同时切默认模型」会把 agent-default-model 钉到 llmrouter，重启 dsh web 后生效。"
         }
         _ => "",
     }
@@ -1514,6 +1549,42 @@ fn apply_templates(out: &mut [AgentInfo], port: u16) {
                 .unwrap_or(false);
             a.current_model = m;
             a.current_base = b;
+            // patch 层里 agent-default-model 现在钉的是谁 —— 这才是「DSH 实际在用哪个模型」。
+            // 桌面版真正读的是 profiles/tauri（Magpie 也只重写这一份），优先看它；
+            // 没有带上默认模型的 tauri 时，退回第一个带默认模型的其它 profile。
+            let mut chosen: Option<(Option<String>, Option<String>)> = None;
+            let mut tauri: Option<(Option<String>, Option<String>)> = None;
+            for pp in dsh_patch_paths() {
+                let t = std::fs::read_to_string(&pp).unwrap_or_default();
+                let (dp, dm) = read_dsh_patch_default(&t);
+                if dp.is_none() && dm.is_none() {
+                    continue;
+                }
+                if pp
+                    .parent()
+                    .and_then(|x| x.file_name())
+                    .map(|x| x == "tauri")
+                    .unwrap_or(false)
+                {
+                    tauri = Some((dp, dm));
+                    break;
+                }
+                if chosen.is_none() {
+                    chosen = Some((dp, dm));
+                }
+            }
+            if let Some((dp, dm)) = tauri.or(chosen) {
+                if dp.as_deref() == Some("llmrouter") {
+                    a.connected = true;
+                    // 默认模型已经钉到本机路由时，卡片上的「模型」就用钉的那个，
+                    // 而不是 settings.yaml 里 provider 块的第一条（那只是列表顺序）。
+                    if dm.is_some() {
+                        a.current_model = dm.clone();
+                    }
+                }
+                a.default_provider = dp;
+                a.default_model = dm;
+            }
             continue;
         }
         let (m, b, c) = read_current(&paths[0], port);
@@ -1694,6 +1765,232 @@ fn dsh_settings_with_provider(raw: &str, block: &str) -> Result<String, String> 
     Ok(replace_managed(raw, START, END, block))
 }
 
+/// DSH 每个 profile 的 patch 层：~/.dsh/profiles/<profile>/cordis.patch.yml
+/// 真正决定桌面版模型来源的就是这一层（Magpie 也是改它）。
+fn dsh_patch_paths() -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    let dir = home().join(".dsh").join("profiles");
+    if let Ok(entries) = std::fs::read_dir(&dir) {
+        for e in entries.flatten() {
+            let p = e.path().join("cordis.patch.yml");
+            if p.is_file() {
+                out.push(p);
+            }
+        }
+    }
+    out.sort();
+    out
+}
+
+/// 缩进 n 个空格的行的前导空格数；空行/注释返回 usize::MAX（调用方按需要跳过）。
+fn line_indent(line: &str) -> usize {
+    line.len() - line.trim_start().len()
+}
+
+fn is_blank_or_comment(line: &str) -> bool {
+    let t = line.trim();
+    t.is_empty() || t.starts_with('#')
+}
+
+/// 生成 patch 层里 llm-router provider 节点（indent 6，挂在 llm-pi-ai.config.providers 下）。
+fn dsh_patch_provider_block(all: &[String], openai: &str) -> String {
+    let mut b = String::new();
+    b.push_str("      # >>> llm-router managed >>>\n");
+    b.push_str("      llmrouter:\n");
+    b.push_str("        displayName: LLM Router\n");
+    b.push_str("        apiKeyEnv: LLMROUTER_API_KEY\n");
+    b.push_str("        api: openai-completions\n");
+    b.push_str(&format!("        baseURL: \"{}\"\n", yaml_str(openai)));
+    b.push_str("        models:\n");
+    for m in all {
+        let id = yaml_str(m);
+        b.push_str(&format!("          - id: \"{id}\"\n"));
+        b.push_str(&format!("            name: \"{id} · LLM Router\"\n"));
+        b.push_str("            contextWindow: 128000\n");
+        b.push_str("            maxTokens: 8192\n");
+        b.push_str("            input:\n");
+        b.push_str("              - text\n");
+        b.push_str("              - image\n");
+    }
+    b.push_str("      # <<< llm-router managed <<<\n");
+    b
+}
+
+/// 用我们的块替换 patch 层里已有的 `llmrouter:` provider；没有就插到 `providers:` 之后。
+fn patch_llmrouter_provider(text: &str, block: &str) -> Result<String, String> {
+    let mut lines: Vec<String> = text.lines().map(|s| s.to_string()).collect();
+    let key_at = lines.iter().position(|l| {
+        l.trim_end().starts_with("llmrouter:")
+            && line_indent(l) == 6
+            && l.trim_start().starts_with("llmrouter:")
+    });
+    let block_lines: Vec<String> = block.lines().map(|s| s.to_string()).collect();
+    if let Some(i) = key_at {
+        // 找到 provider 节点结束：下一个缩进 <= 6 的实义行
+        let mut j = i + 1;
+        while j < lines.len() {
+            let l = &lines[j];
+            if is_blank_or_comment(l) {
+                // managed 块的注释行属于旧块，一并吃掉
+                j += 1;
+                continue;
+            }
+            if line_indent(l) <= 6 {
+                break;
+            }
+            j += 1;
+        }
+        lines.splice(i..j, block_lines);
+        return Ok(lines.join("\n") + "\n");
+    }
+    // 没有就插在 providers: 之后
+    let providers = lines.iter().position(|l| {
+        let t = l.trim_start();
+        line_indent(l) == 4 && t.starts_with("providers:")
+    });
+    let Some(p) = providers else {
+        return Err("patch 层里没有找到 llm-pi-ai 的 providers: 节点，已跳过".into());
+    };
+    let mut at = p + 1;
+    while at < lines.len() && is_blank_or_comment(&lines[at]) {
+        at += 1;
+    }
+    lines.splice(at..at, block_lines);
+    Ok(lines.join("\n") + "\n")
+}
+
+/// 读 patch 层里 agent-default-model 现在钉的是谁。
+fn read_dsh_patch_default(text: &str) -> (Option<String>, Option<String>) {
+    let mut provider = None;
+    let mut model = None;
+    let mut inside = false;
+    for line in text.lines() {
+        let t = line.trim_start();
+        if t.starts_with("- id:") {
+            inside = t.contains("agent-default-model");
+            if !inside {
+                continue;
+            }
+        }
+        if !inside {
+            continue;
+        }
+        // patch 层里可能是 `provider: magpie` 也可能是流式 `config: { provider: x, model: y }`
+        if provider.is_none() {
+            if let Some(v) = line_value_of(line, "provider") {
+                provider = Some(v);
+            }
+        }
+        if model.is_none() {
+            if let Some(v) = line_value_of(line, "model") {
+                model = Some(v);
+            }
+        }
+        if provider.is_some() && model.is_some() {
+            break;
+        }
+    }
+    (provider, model)
+}
+
+/// 从一行里取 `key: value`（含流式 `{ key: value, ... }`）的 value，取不到返回 None。
+fn line_value_of(line: &str, key: &str) -> Option<String> {
+    let hay = line;
+    let mut search = 0usize;
+    while search < hay.len() {
+        let Some(rel) = hay[search..].find(key) else {
+            break;
+        };
+        let at = search + rel;
+        let before_ok = at == 0
+            || matches!(
+                hay.as_bytes()[at - 1],
+                b' ' | b'{' | b',' | b'\t' | b'-' | b'\n'
+            );
+        if before_ok {
+            if let Some(rest) = hay[at + key.len()..].strip_prefix(':') {
+                let v: String = rest
+                    .trim()
+                    .chars()
+                    .take_while(|c| !matches!(c, ',' | '}' | '\n' | '#'))
+                    .collect();
+                let v = v.trim().trim_matches('"').trim_matches('\'').to_string();
+                if !v.is_empty() {
+                    return Some(v);
+                }
+            }
+        }
+        search = at + key.len();
+    }
+    None
+}
+
+/// 把 agent-default-model 钉到 llm-router：改 provider/model，没有这个条目就追加一条。
+fn patch_default_model(text: &str, provider: &str, model: &str) -> Result<String, String> {
+    let mut lines: Vec<String> = text.lines().map(|s| s.to_string()).collect();
+    let at = lines
+        .iter()
+        .position(|l| l.trim_start().starts_with("- id:") && l.contains("agent-default-model"));
+    let Some(i) = at else {
+        let mut out = text.trim_end().to_string();
+        out.push_str(&format!(
+            "\n- id: agent-default-model\n  config:\n    provider: {provider}\n    model: \"{}\"\n",
+            yaml_str(model)
+        ));
+        return Ok(out);
+    };
+    // 条目范围：到下一个顶层 `- ` 行为止
+    let mut end = i + 1;
+    while end < lines.len() && !lines[end].trim_start().starts_with("- ") {
+        end += 1;
+    }
+    let mut done_provider = false;
+    let mut done_model = false;
+    for l in lines.iter_mut().take(end).skip(i + 1) {
+        if is_blank_or_comment(l) {
+            continue;
+        }
+        if let Some(v) = line_value_of(l, "provider") {
+            if !v.starts_with("http") {
+                *l = format!("{}provider: {provider}", " ".repeat(line_indent(l)));
+                done_provider = true;
+                continue;
+            }
+        }
+        if let Some(v) = line_value_of(l, "model") {
+            if !v.starts_with("http") {
+                *l = format!(
+                    "{}model: \"{}\"",
+                    " ".repeat(line_indent(l)),
+                    yaml_str(model)
+                );
+                done_model = true;
+                continue;
+            }
+        }
+    }
+    if !done_provider || !done_model {
+        // 补在 config: 行之后（没有 config: 就补在条目末尾）
+        let anchor = lines
+            .iter()
+            .enumerate()
+            .take(end)
+            .skip(i + 1)
+            .find(|(_, l)| l.trim_start().starts_with("config:"))
+            .map(|(n, _)| n);
+        let insert_at = anchor.map(|n| n + 1).unwrap_or(i + 1);
+        let mut extra: Vec<String> = Vec::new();
+        if !done_provider {
+            extra.push(format!("    provider: {provider}"));
+        }
+        if !done_model {
+            extra.push(format!("    model: \"{}\"", yaml_str(model)));
+        }
+        lines.splice(insert_at..insert_at, extra);
+    }
+    Ok(lines.join("\n") + "\n")
+}
+
 #[allow(clippy::too_many_arguments)]
 fn write_template_plan(
     id: &str,
@@ -1703,6 +2000,7 @@ fn write_template_plan(
     openai: &str,
     anthropic: &str,
     all_models: &[String],
+    pin_default: bool,
 ) -> Result<WritePlan, String> {
     let chat = format!("{}/chat/completions", openai.trim_end_matches('/'));
     let display = format!("llm-router / {model}");
@@ -1957,15 +2255,41 @@ fn write_template_plan(
             let block = dsh_provider_block(model, all_models, openai);
             let raw = std::fs::read_to_string(&paths[0]).unwrap_or_default();
             let content = dsh_settings_with_provider(&raw, &block)?;
-            let env = merge_dotenv(&paths[1], &[("LLM_ROUTER_KEY", api_key.to_string())])?;
-            Ok(WritePlan {
-                files: vec![(paths[0].clone(), content), (paths[1].clone(), env)],
-                changed_keys: vec![
-                    "llm-pi-ai.providers.llm-router".into(),
-                    "models[]".into(),
-                    "LLM_ROUTER_KEY".into(),
+            let env = merge_dotenv(
+                &paths[1],
+                &[
+                    ("LLM_ROUTER_KEY", api_key.to_string()),
+                    ("LLMROUTER_API_KEY", api_key.to_string()),
                 ],
-            })
+            )?;
+            let mut files = vec![(paths[0].clone(), content), (paths[1].clone(), env)];
+            let mut changed_keys = vec![
+                "llm-pi-ai.providers.llm-router".to_string(),
+                "models[]".to_string(),
+                "LLM_ROUTER_KEY".to_string(),
+                "LLMROUTER_API_KEY".to_string(),
+            ];
+            // profile patch 层：真正决定 DSH 桌面版模型来源的就是它（Magpie 也是改这里）
+            let patches = dsh_patch_paths();
+            let patch_block = dsh_patch_provider_block(all_models, openai);
+            for p in &patches {
+                let raw = std::fs::read_to_string(p).unwrap_or_default();
+                if raw.trim().is_empty() {
+                    continue;
+                }
+                let mut next = patch_llmrouter_provider(&raw, &patch_block)?;
+                if pin_default {
+                    next = patch_default_model(&next, "llmrouter", model)?;
+                }
+                files.push((p.clone(), next));
+            }
+            if !patches.is_empty() {
+                changed_keys.push("profiles/*/cordis.patch.yml:providers.llmrouter".to_string());
+                if pin_default {
+                    changed_keys.push("agent-default-model".to_string());
+                }
+            }
+            Ok(WritePlan { files, changed_keys })
         }
         _ => Err("该 Agent 暂未适配自动写入".to_string()),
     }
@@ -1984,6 +2308,7 @@ fn write_plan(
     openai: &str,
     anthropic: &str,
     all_models: &[String],
+    pin_default: bool,
 ) -> Result<WritePlan, String> {
     if agent.id == "pi" {
         let models_path = PathBuf::from(&agent.config_path);
@@ -2024,7 +2349,16 @@ fn write_plan(
         });
     }
     if let Some(paths) = template_paths(&agent.id) {
-        return write_template_plan(&agent.id, &paths, model, api_key, openai, anthropic, all_models);
+        return write_template_plan(
+            &agent.id,
+            &paths,
+            model,
+            api_key,
+            openai,
+            anthropic,
+            all_models,
+            pin_default,
+        );
     }
     let (content, changed_keys) = write_agent(
         &agent.id,
@@ -2085,8 +2419,20 @@ pub async fn configure(State(state): State<Arc<AppState>>, Json(p): Json<Value>)
     let openai = openai_base(&base_input);
     let anthropic = anthropic_base(&base_input);
     let dry_run = p.get("dry_run").and_then(|v| v.as_bool()).unwrap_or(false);
+    let pin_default = p
+        .get("pin_default")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
 
-    let plan = match write_plan(&agent, model, &api_key, &openai, &anthropic, &models) {
+    let plan = match write_plan(
+        &agent,
+        model,
+        &api_key,
+        &openai,
+        &anthropic,
+        &models,
+        pin_default,
+    ) {
         Ok(v) => v,
         Err(e) => return bad(&e),
     };
@@ -2128,6 +2474,7 @@ pub async fn configure(State(state): State<Arc<AppState>>, Json(p): Json<Value>)
             "api_key": api_key,
             "config_paths": agent.config_paths,
             "model_hits": hits,
+            "pin_default": pin_default,
             "applied_at": chrono::Utc::now().to_rfc3339(),
         });
         let mut all = load_applied(&state);
@@ -2153,6 +2500,8 @@ pub async fn configure(State(state): State<Arc<AppState>>, Json(p): Json<Value>)
         "backup_paths": backups,
         "changed_keys": plan.changed_keys,
         "dry_run": dry_run,
+        "pin_default": pin_default,
+        "pinned_default": pin_default && id == "dsh-tui" && !dsh_patch_paths().is_empty(),
         "preview": preview,
     }))
 }
@@ -2176,6 +2525,7 @@ pub async fn repair(State(state): State<Arc<AppState>>, Json(p): Json<Value>) ->
         "model": model,
         "api_key": rec.get("api_key").and_then(|v| v.as_str()).unwrap_or("llm-router"),
         "base_url": rec.get("base_url").and_then(|v| v.as_str()).unwrap_or(""),
+        "pin_default": rec.get("pin_default").and_then(|v| v.as_bool()).unwrap_or(false),
         "dry_run": p.get("dry_run").and_then(|v| v.as_bool()).unwrap_or(false),
     });
     configure(State(state), Json(req)).await
@@ -2214,6 +2564,8 @@ pub async fn restore(State(state): State<Arc<AppState>>, Json(p): Json<Value>) -
         if let Err(e) = res {
             return bad(&format!("恢复失败: {e}"));
         }
+        // 恢复成功后备份已完成使命（文件已回到原样），顺手清掉，避免残留一堆 .bak。
+        let _ = std::fs::remove_file(&backup);
         if first_backup.is_empty() {
             first_backup = backup.to_string_lossy().to_string();
         }

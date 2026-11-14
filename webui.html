@@ -272,7 +272,7 @@
   .tkn .hl b{color:var(--ok)}
   .tkn .hl span{color:#6fbf8a}
 
-  /* ---------- 模型编辑弹窗 ---------- */
+  /* ---------- 模型详情面板 ---------- */
   .mask{position:fixed;inset:0;background:rgba(5,8,13,.82);z-index:200;
     display:flex;align-items:flex-start;justify-content:center;padding:28px 16px;
     overflow:auto;backdrop-filter:blur(3px)}
@@ -453,6 +453,327 @@
   #nativeTitlebar .tb-close:hover{background:#e5484d;color:#fff}
   body.native-frame header{top:38px}
   body.native-frame #nativeTitlebar{display:flex}
+
+  /* ================= 图表 / 动效 ================= */
+  @keyframes paneIn{from{opacity:0;transform:translateY(6px)}to{opacity:1;transform:none}}
+  .pane:not([hidden]){animation:paneIn .26s cubic-bezier(.22,1,.36,1) both}
+  @keyframes barGrow{from{transform:scaleX(0);opacity:.35}to{transform:scaleX(1);opacity:1}}
+  @keyframes barGrowY{from{transform:scaleY(0);opacity:.35}to{transform:scaleY(1);opacity:1}}
+  @keyframes lineDraw{to{stroke-dashoffset:0}}
+  @keyframes fadeIn{from{opacity:0}to{opacity:1}}
+  @keyframes dotPop{from{opacity:0;transform:scale(.2)}to{opacity:1;transform:scale(1)}}
+  @keyframes radarGrow{from{opacity:0;transform:scale(.72)}to{opacity:1;transform:scale(1)}}
+  @keyframes pulse{0%,100%{box-shadow:0 0 0 0 rgba(63,185,80,.45)}50%{box-shadow:0 0 0 5px rgba(63,185,80,0)}}
+  @keyframes titleHue{to{background-position:220% 0}}
+  .dot.on{animation:pulse 2.4s ease-in-out infinite}
+  header h1{background:linear-gradient(90deg,#e6edf6,#8fc0ff,#c8b6ff,#e6edf6);background-size:220% 100%;-webkit-background-clip:text;background-clip:text;color:transparent;animation:titleHue 12s linear infinite}
+  .card{transition:border-color .18s ease,box-shadow .18s ease}
+  .up,.mcard{transition:border-color .18s ease,box-shadow .18s ease,transform .18s ease}
+  .up:hover,.mcard:hover{transform:translateY(-1px);box-shadow:0 6px 20px rgba(0,0,0,.22)}
+  .tab{position:relative;overflow:hidden;transition:background .18s,border-color .18s,color .18s}
+  .tab::after{content:"";position:absolute;left:8px;right:8px;bottom:2px;height:2px;border-radius:2px;background:linear-gradient(90deg,var(--accent),#c084fc);transform:scaleX(0);transform-origin:center;transition:transform .22s ease}
+  .tab.active::after{transform:scaleX(1)}
+  #nativeTitlebar .tb-logo{transition:transform .25s ease,box-shadow .25s ease}
+  #nativeTitlebar .tb-logo:hover{transform:rotate(-6deg) scale(1.10);box-shadow:0 0 14px rgba(79,156,249,.5)}
+  .chart-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(290px,1fr));gap:12px}
+  .req-charts{grid-template-columns:1.4fr 1fr}
+  .req-charts .chart-tile:nth-child(3){grid-column:1/-1}
+  @media(max-width:820px){.req-charts{grid-template-columns:1fr}.req-charts .chart-tile:nth-child(3){grid-column:auto}}
+  .chart-tile{align-self:start;background:linear-gradient(180deg,rgba(27,39,56,.55),rgba(18,27,41,.72));border:1px solid rgba(255,255,255,.07);border-radius:9px;padding:10px 12px;min-width:0;overflow:hidden}
+  .chart-tile h3{font-size:12px;margin:0 0 6px;color:var(--dim);font-weight:600;letter-spacing:.3px;display:flex;align-items:center;gap:6px}
+  .chart-svg{width:100%;height:auto;display:block;overflow:visible}
+  .chart-legend{display:flex;flex-wrap:wrap;gap:10px;font-size:11px;color:var(--dim);margin:0 0 2px}
+  .chart-legend span{display:inline-flex;align-items:center;gap:5px}
+  .chart-legend i{width:8px;height:8px;border-radius:2px;display:inline-block}
+  .chart-empty{color:var(--dim);text-align:center;padding:26px 8px;font-size:12px}
+  .chart-bar{transform-origin:left center;animation:barGrow .62s cubic-bezier(.22,1,.36,1) both}
+  .chart-vbar{transform-origin:center bottom;animation:barGrowY .62s cubic-bezier(.22,1,.36,1) both}
+  .chart-line{stroke-dasharray:1800;stroke-dashoffset:1800;animation:lineDraw 1.15s ease forwards}
+  .chart-area{animation:fadeIn .8s .1s ease both}
+  .chart-dot{animation:dotPop .35s ease both}
+  .radar-poly{transform-origin:50% 50%;animation:radarGrow .55s cubic-bezier(.22,1,.36,1) both}
+  .chart-range{font-size:12px;padding:5px 8px}
+  @keyframes cardIn{from{opacity:0;transform:translateY(8px)}to{opacity:1;transform:none}}
+  .pane:not([hidden]) > .card{animation:cardIn .3s ease both}
+  .pane:not([hidden]) > .card:nth-child(2){animation-delay:.04s}
+  .pane:not([hidden]) > .card:nth-child(3){animation-delay:.08s}
+  .pane:not([hidden]) > .card:nth-child(4){animation-delay:.12s}
+  button:active:not(:disabled){transform:translateY(1px) scale(.985)}
+  .hist-bar{transition:y .5s cubic-bezier(.22,1,.36,1),height .5s cubic-bezier(.22,1,.36,1),fill .35s ease}
+  .wf{margin-top:4px}
+  .wf-bar{display:flex;height:24px;border-radius:7px;overflow:hidden;background:rgba(255,255,255,.06);border:1px solid rgba(255,255,255,.05)}
+  .wf-seg{display:flex;align-items:center;justify-content:center;min-width:2px;font-size:10px;color:#06121f;font-weight:650;white-space:nowrap;overflow:hidden;transition:width .4s cubic-bezier(.22,1,.36,1)}
+  .wf-seg.ok{background:#3fb950}.wf-seg.bad{background:#f85149}.wf-seg.wait{background:#4f9cf9}.wf-seg.gen{background:#c084fc}.wf-seg.other{background:#6b7484}
+  .wf-axis{display:flex;justify-content:space-between;font-size:10.5px;color:var(--dim);margin-top:3px}
+  .wf-legend{display:flex;flex-wrap:wrap;gap:12px;font-size:11px;color:var(--dim);margin-top:7px}
+  .wf-legend span{display:inline-flex;align-items:center;gap:5px}
+  .wf-legend i{width:8px;height:8px;border-radius:2px;display:inline-block}
+  @media (prefers-reduced-motion: reduce){*,*::before,*::after{animation-duration:.001ms!important;animation-iteration-count:1!important;transition-duration:.001ms!important}}
+
+  /* ================= 上游来源 / 模型路由：精致卡片 ================= */
+  #pane-up .card,#pane-model .card{
+    background:linear-gradient(180deg,rgba(22,32,47,.94),rgba(12,19,29,.97));
+  }
+  #pane-up .card>h2,#pane-model .card>h2{
+    display:flex;align-items:center;gap:9px;font-size:14px;letter-spacing:1.2px;color:#cfe0f5;
+  }
+  #pane-up .card>h2::before,#pane-model .card>h2::before{
+    content:"";width:4px;height:16px;border-radius:3px;flex:none;
+    background:linear-gradient(180deg,#4f9cf9,#c084fc);box-shadow:0 0 12px rgba(79,156,249,.45);
+  }
+  #pane-up #addForm{
+    padding:14px 14px 12px;border-radius:14px;
+    background:linear-gradient(180deg,rgba(30,43,62,.66),rgba(20,30,45,.58));
+    border:1px solid rgba(255,255,255,.08);box-shadow:inset 0 1px 0 rgba(255,255,255,.045);
+  }
+  #pane-up #addForm .hint{font-size:11px;letter-spacing:.25px}
+  #pane-up #addForm input{height:35px}
+  #pane-up #addForm button.primary{height:35px;padding:0 22px}
+  #pane-up .up-tools,#pane-model .mtools{
+    padding:8px 10px;border-radius:12px;margin-bottom:14px;
+    background:rgba(10,16,26,.5);border:1px solid rgba(255,255,255,.065);
+  }
+  #pane-up .up-tools input,#pane-model .mtools input{background:rgba(7,12,20,.72)}
+  #upstreams{gap:14px}
+  .up{
+    position:relative;overflow:hidden;padding:15px 16px 13px;border-radius:14px;
+    background:linear-gradient(155deg,rgba(31,45,65,.88),rgba(15,23,36,.95));
+    box-shadow:0 8px 26px rgba(0,0,0,.16),inset 0 1px 0 rgba(255,255,255,.04);
+  }
+  .up::before{content:"";position:absolute;left:0;top:0;bottom:0;width:3px;
+    background:linear-gradient(180deg,rgba(79,156,249,.95),rgba(124,108,255,.7))}
+  .up.off::before{background:#5b6778;opacity:.55}
+  .up.cool::before{background:linear-gradient(180deg,#d29922,#f85149)}
+  .up.match-avail::before{background:linear-gradient(180deg,#f59e0b,#fbbf24)}
+  .up.match-sel::before{background:linear-gradient(180deg,#22c55e,#4ade80)}
+  .up::after{content:"";position:absolute;right:-70px;top:-80px;width:230px;height:190px;
+    border-radius:50%;background:radial-gradient(circle,rgba(79,156,249,.14),transparent 68%);
+    pointer-events:none}
+  .up>*{position:relative;z-index:1}
+  .up.match-avail{border-color:rgba(245,158,11,.55);box-shadow:0 0 0 1px rgba(245,158,11,.12),0 8px 26px rgba(0,0,0,.16)}
+  .up.match-sel{border-color:rgba(34,197,94,.5);box-shadow:0 0 0 1px rgba(34,197,94,.12),0 8px 26px rgba(0,0,0,.16)}
+  .up-head{display:flex;align-items:flex-start;gap:11px;flex-wrap:nowrap}
+  .up-avatar{
+    width:38px;height:38px;border-radius:11px;flex:none;display:grid;place-items:center;
+    color:#fff;font-weight:750;font-size:15px;letter-spacing:.3px;
+    border:1px solid rgba(255,255,255,.18);
+    background:linear-gradient(135deg,hsl(var(--h) 72% 47%),hsl(calc(var(--h) + 42) 74% 34%));
+    box-shadow:0 5px 16px rgba(0,0,0,.32);
+  }
+  .up-identity{flex:1;min-width:0}
+  .up-name-row{display:flex;align-items:center;gap:8px;min-width:0;flex-wrap:wrap}
+  .up-name{font-size:15.5px;font-weight:650;letter-spacing:.1px;overflow:hidden;
+    text-overflow:ellipsis;white-space:nowrap;max-width:100%}
+  .up .url{margin-top:4px;font-size:11.5px;color:#8093aa;max-width:100%}
+  .up-badges{display:flex;align-items:center;gap:6px;flex-wrap:wrap;margin-top:10px;
+    padding-top:9px;border-top:1px solid rgba(255,255,255,.065)}
+  .up .badge{font-size:10.5px;padding:2px 8px;background:rgba(8,13,21,.55)}
+  .up .kv{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:6px;margin-top:10px}
+  .up .kv .stat{min-width:0;padding:6px 8px;border-radius:8px;background:rgba(7,12,20,.48);
+    border:1px solid rgba(255,255,255,.055)}
+  .up .kv .stat b{font-size:16px;line-height:1.2}
+  .up .kv .stat span{font-size:10.5px;color:#8093aa;margin-top:1px}
+  .up .bar{margin-top:8px;height:4px}
+  .up .models-wrap{margin-top:9px;padding-top:9px;border-top:1px dashed rgba(255,255,255,.07);max-height:118px}
+  .up .mchip{font-size:10.5px;padding:3px 8px;border-radius:6px;background:rgba(9,14,22,.6)}
+  .up-actions{display:flex;align-items:center;gap:5px;flex-wrap:wrap;margin-top:11px;
+    padding-top:9px;border-top:1px solid rgba(255,255,255,.065);margin-left:0;justify-content:flex-end}
+  .up-actions .mini{padding:4px 8px;font-size:11.5px;background:rgba(31,43,61,.62)}
+  .up-actions .mini.primary{background:linear-gradient(135deg,#4f9cf9,#7c6cff);color:#fff;border:0}
+  .up-actions .mini.danger:hover{border-color:var(--bad);color:var(--bad)}
+  .up.open .pickpanel{border-top-color:rgba(79,156,249,.25)}
+
+  #pane-model .mlist{grid-template-columns:repeat(auto-fill,minmax(292px,1fr));gap:12px}
+  .mcard{
+    position:relative;overflow:hidden;padding:14px 15px 12px;border-radius:14px;
+    background:linear-gradient(155deg,rgba(30,43,62,.86),rgba(15,23,36,.95));
+    box-shadow:0 8px 24px rgba(0,0,0,.14),inset 0 1px 0 rgba(255,255,255,.035);
+  }
+  .mcard::before{content:"";position:absolute;left:0;top:0;right:0;height:2px;
+    background:linear-gradient(90deg,rgba(79,156,249,.9),rgba(124,108,255,.65))}
+  .mcard.configured::before{background:linear-gradient(90deg,#3fb950,#4f9cf9)}
+  .mcard.none::before{background:linear-gradient(90deg,#d29922,#f85149)}
+  .mcard::after{content:"";position:absolute;right:-60px;top:-70px;width:180px;height:150px;
+    border-radius:50%;background:radial-gradient(circle,rgba(124,108,255,.11),transparent 70%);pointer-events:none}
+  .mcard>*{position:relative;z-index:1}
+  .mcard-top{display:flex;align-items:center;gap:10px}
+  .mcard-avatar{width:34px;height:34px;border-radius:10px;flex:none;display:grid;place-items:center;
+    font-size:13px;font-weight:750;color:#fff;border:1px solid rgba(255,255,255,.16);
+    background:linear-gradient(135deg,hsl(var(--h) 70% 48%),hsl(calc(var(--h) + 40) 72% 35%));
+    box-shadow:0 4px 14px rgba(0,0,0,.28)}
+  .mcard-title{flex:1;min-width:0}
+  .mcard-name{font-size:14.5px;font-weight:650;letter-spacing:.1px}
+  .mcard-sub{gap:5px;margin-top:5px}
+  .mcard-sub .badge{font-size:10px;padding:2px 7px}
+  .mcard-route{display:flex;align-items:center;gap:4px;flex-wrap:wrap;margin-top:10px;
+    padding-top:9px;border-top:1px solid rgba(255,255,255,.065);min-height:27px}
+  .route-chip{display:inline-flex;align-items:center;max-width:100%;padding:3px 8px;border-radius:6px;
+    font-size:10.5px;font-family:Consolas,Monaco,monospace;color:#b8c9df;
+    background:rgba(8,13,21,.58);border:1px solid rgba(255,255,255,.08);overflow:hidden;
+    text-overflow:ellipsis;white-space:nowrap}
+  .route-arrow{color:#6f8db3;font-size:11px;flex:none;margin:0 1px}
+  .route-more{color:#7d8da3;font-size:10px;padding:0 2px}
+  .mcard-order{display:none}
+  .mcard-del{right:11px;top:auto;bottom:9px;z-index:3;font-size:11px;padding:3px 7px}
+  .mcard:hover .mcard-del,.mcard-del:focus{opacity:1}
+  .mcard-hint{display:flex;align-items:center;gap:5px;margin-top:10px;font-size:10.5px;color:#71849b;letter-spacing:.15px}
+  .mcard-hint::after{content:"→";color:#4f9cf9;font-size:11px;transition:transform .18s ease}
+  .mcard:hover .mcard-hint::after{transform:translateX(3px)}
+  .mcard:hover{background:linear-gradient(155deg,rgba(37,53,76,.92),rgba(17,27,42,.97))}
+
+/* ================= 模型路由：左侧列表 / 右侧详情 ================= */
+#pane-model .model-split{display:grid;grid-template-columns:minmax(260px,310px) minmax(0,1fr);gap:14px;align-items:start}
+#pane-model .model-side{background:linear-gradient(165deg,rgba(21,29,45,.72),rgba(13,19,30,.62));border:1px solid var(--line);border-radius:14px;padding:12px 10px 10px;box-shadow:0 10px 28px rgba(0,0,0,.18)}
+#pane-model .model-side-head{display:flex;align-items:center;justify-content:space-between;padding:0 4px 9px;border-bottom:1px solid var(--line);margin-bottom:9px;font-size:12px;color:var(--muted);letter-spacing:.03em}
+#pane-model #models{max-height:640px;overflow:auto;padding-right:2px}
+#pane-model #models .mlist{display:flex;flex-direction:column;gap:6px;min-width:0}
+#pane-model #models .mcard{padding:9px 10px;border-radius:10px;cursor:pointer;transition:background .16s,border-color .16s,transform .16s;background:rgba(255,255,255,.022);border:1px solid transparent}
+#pane-model #models .mcard:hover{background:rgba(255,255,255,.06);border-color:rgba(255,255,255,.09);transform:none}
+#pane-model #models .mcard.active{background:linear-gradient(135deg,rgba(62,111,255,.17),rgba(155,89,255,.10));border-color:rgba(102,146,255,.55);box-shadow:inset 3px 0 0 #4f8cff}
+#pane-model #models .mcard-top{gap:8px}
+#pane-model #models .mcard-avatar{width:28px;height:28px;font-size:12px;border-radius:8px}
+#pane-model #models .mcard-name{font-size:12.5px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;max-width:150px}
+#pane-model #models .mcard-sub{gap:3px;margin-top:2px;flex-wrap:wrap}
+#pane-model #models .mcard-sub .badge{font-size:9.5px;padding:1px 5px}
+#pane-model #models .mcard-route,#pane-model #models .mcard-hint,#pane-model #models .mcard-del{display:none}
+#pane-model #models .mcard-count{font-size:10px;min-width:18px;height:18px;border-radius:6px;background:rgba(79,140,255,.14);color:#8fb3ff;display:grid;place-items:center;padding:0 5px;flex:none}
+#pane-model .model-detail-wrap{min-width:0}
+#pane-model .model-empty{min-height:260px;display:grid;place-items:center;text-align:center;color:var(--muted);font-size:13px;border:1px dashed var(--line);border-radius:14px;background:rgba(255,255,255,.015);padding:30px}
+#pane-model .model-detail{border:1px solid var(--line);border-radius:14px;background:linear-gradient(165deg,rgba(23,31,48,.72),rgba(12,18,29,.66));padding:16px 18px 14px;box-shadow:0 12px 34px rgba(0,0,0,.22);animation:paneIn .2s ease}
+#pane-model .model-detail h3{font-size:18px;margin:0}
+#pane-model .model-detail .hint{margin-bottom:8px}
+#pane-model .model-detail .model-picks{max-height:360px;overflow:auto}
+@media(max-width:860px){#pane-model .model-split{grid-template-columns:1fr}#pane-model #models{max-height:260px}}
+
+  /* ================= 会话对账：诊断面板 ================= */
+  #pane-sessions .card{background:linear-gradient(180deg,rgba(22,32,47,.94),rgba(12,19,29,.97))}
+  #pane-sessions .sess-hero{position:relative;overflow:hidden;padding:18px 20px 16px}
+  #pane-sessions .sess-hero::before{content:"";position:absolute;right:-100px;top:-130px;width:420px;height:300px;border-radius:50%;background:radial-gradient(circle,rgba(79,156,249,.14),rgba(124,108,255,.05) 46%,transparent 70%);pointer-events:none}
+  #pane-sessions .sess-hero>*{position:relative;z-index:1}
+  .sess-hero-main{display:flex;align-items:flex-start;gap:14px}
+  .sess-hero-icon{width:44px;height:44px;border-radius:14px;flex:none;display:grid;place-items:center;font-size:24px;color:#c7e1ff;background:linear-gradient(135deg,rgba(79,156,249,.28),rgba(124,108,255,.22));border:1px solid rgba(79,156,249,.34);box-shadow:0 8px 24px rgba(79,156,249,.14),inset 0 1px 0 rgba(255,255,255,.12)}
+  .sess-hero-copy{flex:1;min-width:0}
+  .sess-hero-title{display:flex;align-items:center;gap:9px;flex-wrap:wrap}
+  .sess-hero-title h2{font-size:17px;margin:0;letter-spacing:.35px;color:#e9f2fd;font-weight:650}
+  .sess-pill{font-size:10.5px;padding:3px 9px;border-radius:999px;background:rgba(79,156,249,.11);border:1px solid rgba(79,156,249,.24);color:#a9ccff;white-space:nowrap}
+  .sess-pill.ok{background:rgba(63,185,80,.10);border-color:rgba(63,185,80,.3);color:#7fdc9b}
+  .sess-pill.bad{background:rgba(248,81,73,.10);border-color:rgba(248,81,73,.3);color:#ff9b96}
+  .sess-hero-copy .hint{font-size:12px;line-height:1.7;margin-top:6px;max-width:1080px}
+  .sess-hero-copy .hint code{font-size:11px}
+  .sess-hero-note{display:flex;flex-wrap:wrap;gap:6px;margin-top:9px}
+  .sess-hero-note span{font-size:10.5px;color:#8194aa;background:rgba(8,13,21,.44);border:1px solid rgba(255,255,255,.055);border-radius:999px;padding:3px 9px}
+  .sess-hero-note b{color:#bcd7f8;font-weight:650}
+  .sess-toolbar{display:flex;flex-wrap:wrap;align-items:flex-end;gap:10px;margin-top:15px;padding:10px;border-radius:12px;background:rgba(8,13,21,.50);border:1px solid rgba(255,255,255,.065)}
+  .sess-field{display:flex;flex-direction:column;gap:4px;min-width:0}
+  .sess-field-label{font-size:9.5px;letter-spacing:.7px;color:#72859c;text-transform:uppercase}
+  .sess-select{height:32px;font-size:12px;padding:0 28px 0 10px;border-radius:8px;background:rgba(7,12,20,.85);border:1px solid rgba(255,255,255,.10);color:#dbe7f6}
+  .sess-source-checks{display:flex;gap:5px;flex-wrap:wrap}
+  .sess-check{display:inline-flex;align-items:center;cursor:pointer}
+  .sess-check input{display:none}
+  .sess-check span{display:inline-flex;align-items:center;height:32px;padding:0 10px;border-radius:8px;font-size:11.5px;color:#9aacbf;background:rgba(7,12,20,.6);border:1px solid rgba(255,255,255,.08);transition:all .16s ease}
+  .sess-check input:checked+span{color:#d7e8ff;background:rgba(64,123,255,.16);border-color:rgba(94,148,255,.46);box-shadow:inset 0 0 0 1px rgba(94,148,255,.12)}
+  .sess-check:hover span{border-color:rgba(255,255,255,.16)}
+  .sess-switch{display:inline-flex;align-items:center;gap:7px;height:32px;font-size:11.5px;color:#9aacbf;cursor:pointer;white-space:nowrap}
+  .sess-switch input{display:none}
+  .sess-switch-track{width:32px;height:18px;border-radius:999px;background:#2a3444;border:1px solid rgba(255,255,255,.10);position:relative;transition:background .18s}
+  .sess-switch-track i{position:absolute;left:2px;top:2px;width:12px;height:12px;border-radius:50%;background:#8fa0b5;transition:transform .18s,background .18s}
+  .sess-switch input:checked+.sess-switch-track{background:linear-gradient(135deg,#4f9cf9,#7c6cff)}
+  .sess-switch input:checked+.sess-switch-track i{transform:translateX(13px);background:#fff}
+  .sess-search input{width:210px;height:32px;font-size:11.5px;padding:0 10px;border-radius:8px;background:rgba(7,12,20,.85);border:1px solid rgba(255,255,255,.10);color:#dbe7f6}
+  .sess-search input:focus{outline:none;border-color:rgba(94,148,255,.55);box-shadow:0 0 0 2px rgba(94,148,255,.10)}
+  .sess-refresh{height:32px;padding:0 13px;border-radius:8px;font-size:11.5px;color:#eaf3ff;background:linear-gradient(135deg,rgba(79,156,249,.95),rgba(124,108,255,.88));border:1px solid rgba(255,255,255,.10);box-shadow:0 4px 12px rgba(79,156,249,.15);display:inline-flex;align-items:center;gap:6px}
+  .sess-refresh:hover{filter:brightness(1.08)}
+  .sess-refresh.busy{opacity:.65;pointer-events:none}
+  .sess-refresh.busy span:first-child{display:inline-block;animation:spin .7s linear infinite}
+  @keyframes spin{to{transform:rotate(360deg)}}
+  .sess-toolbar-foot{display:flex;align-items:center;margin-top:8px;min-height:15px}
+  .sess-meta{display:flex;flex-wrap:wrap;gap:5px;font-size:10.5px;color:#7f92a8}
+  .sess-meta span{display:inline-flex;align-items:center;gap:4px;padding:2px 7px;border-radius:5px;background:rgba(255,255,255,.025)}
+  .sess-meta i{font-style:normal;color:#61758b}.sess-meta i::after{content:"："}
+  .sess-meta b{font-weight:600;color:#aebfd2}
+  .sess-stats{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:8px;margin-top:14px}
+  .sess-stat{display:flex;align-items:center;gap:9px;min-width:0;padding:10px 11px;border-radius:10px;background:linear-gradient(145deg,rgba(28,41,59,.68),rgba(15,23,36,.72));border:1px solid rgba(255,255,255,.065);box-shadow:inset 0 1px 0 rgba(255,255,255,.025)}
+  .sess-stat-icon{width:28px;height:28px;border-radius:8px;flex:none;display:grid;place-items:center;font-size:14px;color:#9ec5ff;background:rgba(79,156,249,.11);border:1px solid rgba(79,156,249,.16)}
+  .sess-stat-body{min-width:0;display:flex;flex-direction:column;gap:1px}
+  .sess-stat b{font-size:17px;line-height:1.15;font-weight:650;font-variant-numeric:tabular-nums;color:#e4eefb;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+  .sess-stat span{font-size:10px;color:#7f92a8;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+  .sess-stat small{font-size:9.5px;color:#63778d;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+  .sess-stat.bad .sess-stat-icon{color:#ff9b96;background:rgba(248,81,73,.10);border-color:rgba(248,81,73,.20)}
+  .sess-stat.bad b{color:#ff9b96}
+  .sess-stat.ok .sess-stat-icon{color:#7fdc9b;background:rgba(63,185,80,.10);border-color:rgba(63,185,80,.20)}
+  .sess-stat.ok b{color:#7fdc9b}
+  .sess-stat.accent .sess-stat-icon{color:#c7b4ff;background:rgba(124,108,255,.12);border-color:rgba(124,108,255,.22)}
+  .sess-compare{margin-top:12px;padding:12px 14px;border-radius:11px;background:rgba(10,16,26,.44);border:1px solid rgba(255,255,255,.065)}
+  .sess-compare-top{display:flex;align-items:flex-start;gap:14px;flex-wrap:wrap}
+  .sess-compare-top>b{font-size:12px;color:#dbe8f7;letter-spacing:.2px}
+  .sess-compare-top .hint{font-size:10.5px;line-height:1.6;flex:1;min-width:240px}
+  .sess-compare-legend{display:flex;gap:10px;flex-wrap:wrap;font-size:10.5px;color:#8fa2b7;white-space:nowrap}
+  .sess-compare-legend span{display:inline-flex;align-items:center;gap:5px}
+  .sess-compare-legend i{width:7px;height:7px;border-radius:2px;display:inline-block}
+  .sess-compare-legend i.ok{background:#3fb950}.sess-compare-legend i.bad{background:#f85149}
+  .sess-ratio{display:flex;height:9px;border-radius:999px;overflow:hidden;background:rgba(255,255,255,.06);margin:10px 0 7px;box-shadow:inset 0 1px 2px rgba(0,0,0,.2)}
+  .sess-ratio span{display:block;height:100%;min-width:0;transition:width .5s cubic-bezier(.22,1,.36,1)}
+  .sess-ratio .ok{background:linear-gradient(90deg,#2ea043,#56d364)}
+  .sess-ratio .bad{background:linear-gradient(90deg,#f85149,#d29922)}
+  .sess-compare-foot{display:flex;justify-content:space-between;gap:10px;font-size:10px;color:#72859a}
+  .sess-compare-foot b{color:#c9d8e8;font-weight:600}
+  .sess-compare-note{margin-top:7px;font-size:10.5px;color:#7f92a8;display:flex;flex-wrap:wrap;gap:5px;align-items:center}
+  .sess-compare-note code{font-size:10px;color:#b4c8de;background:rgba(255,255,255,.04);border-radius:4px;padding:1px 5px}
+  .sess-source-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(205px,1fr));gap:8px;margin-top:10px}
+  .sess-source{padding:10px 11px;border-radius:9px;background:rgba(255,255,255,.022);border:1px solid rgba(255,255,255,.06);min-width:0}
+  .sess-source.off{opacity:.55}
+  .sess-source-top{display:flex;align-items:center;gap:7px;min-width:0}
+  .sess-source-top b{font-size:11.5px;color:#c7d7e9;font-weight:600;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  .sess-source-rounds{margin-left:auto;font-size:11px;color:#a9c9f5;font-variant-numeric:tabular-nums;white-space:nowrap}
+  .sess-source-meta{font-size:10px;color:#7f92a8;margin-top:6px;white-space:normal;line-height:1.45}
+  .sess-source-path{font-size:9.5px;color:#5e7188;font-family:Consolas,Monaco,monospace;margin-top:4px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+  .sess-section-head{display:flex;align-items:flex-start;justify-content:space-between;gap:12px;margin-bottom:11px}
+  .sess-section-head h2{font-size:13.5px;margin:0;color:#cfe0f5;letter-spacing:.5px;font-weight:600;display:flex;align-items:center;gap:8px}
+  .sess-section-head h2::before{content:"";width:3px;height:14px;border-radius:2px;background:linear-gradient(180deg,#4f9cf9,#c084fc);box-shadow:0 0 8px rgba(79,156,249,.35)}
+  .sess-section-sub{font-size:10.5px;color:#71859c;margin-top:4px;line-height:1.5}
+  .sess-count{font-size:10.5px;color:#8ca2bb;background:rgba(255,255,255,.035);border:1px solid rgba(255,255,255,.06);border-radius:999px;padding:3px 9px;white-space:nowrap;margin-top:1px}
+  .sess-table-wrap{overflow:auto;border:1px solid rgba(255,255,255,.065);border-radius:10px;background:rgba(7,12,20,.18)}
+  .sess-table{width:100%;min-width:980px;border-collapse:collapse;font-size:11px}
+  .sess-table th{position:sticky;top:0;z-index:1;background:#121d2b;color:#8fa2b7;font-weight:600;font-size:9.5px;letter-spacing:.55px;text-transform:uppercase;text-align:left;padding:9px 8px;border-bottom:1px solid rgba(255,255,255,.09);white-space:nowrap}
+  .sess-table th.num{text-align:right}
+  .sess-table td{padding:8px 8px;border-bottom:1px solid rgba(255,255,255,.04);vertical-align:middle;white-space:nowrap}
+  .sess-table tbody tr:last-child td{border-bottom:0}
+  .sess-table tbody tr{transition:background .14s}
+  .sess-table tbody tr:hover{background:rgba(79,156,249,.055)}
+  .sess-table td.num{text-align:right;font-variant-numeric:tabular-nums;color:#c5d4e6}
+  .sess-timecell{font-size:9.5px;line-height:1.5;color:#8ca0b8}
+  .sess-timecell span{display:block;white-space:nowrap}
+  .sess-src{display:inline-flex;align-items:center;gap:6px;min-width:0;max-width:130px}
+  .sess-src-dot{width:21px;height:21px;border-radius:6px;flex:none;display:grid;place-items:center;font-size:9.5px;font-weight:750;color:#fff;border:1px solid rgba(255,255,255,.15);background:linear-gradient(135deg,hsl(var(--h) 68% 46%),hsl(calc(var(--h) + 40) 70% 34%));box-shadow:0 2px 8px rgba(0,0,0,.22)}
+  .sess-src b{font-size:11px;color:#c6d6e8;font-weight:600;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  .sess-code{display:inline-block;max-width:170px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-family:Consolas,Monaco,monospace;font-size:10.5px;color:#b9c9dc;background:rgba(255,255,255,.035);border-radius:4px;padding:2px 6px;vertical-align:middle}
+  .sess-code.provider{color:#b8a8ff;background:rgba(124,108,255,.09)}
+  .sess-url{display:inline-block;max-width:145px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-family:Consolas,Monaco,monospace;font-size:10px;color:#7f93a9;vertical-align:middle}
+  .sess-route{display:inline-flex;align-items:center;gap:5px;font-size:10px;padding:2px 8px;border-radius:999px;border:1px solid transparent;white-space:nowrap}
+  .sess-route i{width:5px;height:5px;border-radius:50%;background:currentColor;flex:none}
+  .sess-route.ok{color:#7fdc9b;background:rgba(63,185,80,.09);border-color:rgba(63,185,80,.2)}
+  .sess-route.bad{color:#ff9b96;background:rgba(248,81,73,.09);border-color:rgba(248,81,73,.2)}
+  .sess-empty{padding:26px 12px;text-align:center;color:#7d90a6;font-size:12px}
+  .sess-list{display:flex;flex-direction:column;gap:9px}
+  .sess-item{position:relative;overflow:hidden;padding:13px 15px 11px 18px;border-radius:11px;background:linear-gradient(145deg,rgba(28,40,58,.72),rgba(14,22,34,.88));border:1px solid rgba(255,255,255,.065);transition:border-color .16s,transform .16s}
+  .sess-item:hover{border-color:rgba(255,255,255,.13);transform:translateY(-1px)}
+  .sess-item::before{content:"";position:absolute;left:0;top:0;bottom:0;width:3px;background:#3fb950}
+  .sess-item.bad::before{background:linear-gradient(180deg,#f85149,#d29922)}
+  .sess-item-head{display:flex;align-items:center;gap:7px;flex-wrap:wrap;min-width:0}
+  .sess-item-head b{font-size:12.5px;color:#d9e7f7;font-weight:600}
+  .sess-item-time{margin-left:auto;font-size:10px;color:#71859b;white-space:nowrap}
+  .sess-item-stats{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:6px;margin-top:9px}
+  .sess-item-stat{padding:6px 8px;border-radius:7px;background:rgba(7,12,20,.42);border:1px solid rgba(255,255,255,.045);min-width:0}
+  .sess-item-stat b{display:block;font-size:13px;color:#dbe8f6;font-weight:650;font-variant-numeric:tabular-nums;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  .sess-item-stat span{font-size:9.5px;color:#71859c}
+  .sess-item-stat.ok b{color:#7fdc9b}.sess-item-stat.bad b{color:#ff9b96}
+  .sess-item-models{display:flex;align-items:center;gap:5px;flex-wrap:wrap;margin-top:8px}
+  .sess-model-chip{font-size:9.5px;color:#a9bdd4;background:rgba(255,255,255,.035);border:1px solid rgba(255,255,255,.055);border-radius:5px;padding:2px 6px;font-family:Consolas,Monaco,monospace;max-width:280px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  .sess-path{margin-top:8px;padding-top:7px;border-top:1px dashed rgba(255,255,255,.06);display:grid;gap:2px;font-size:9.5px;color:#5f7288;font-family:Consolas,Monaco,monospace}
+  .sess-path span{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  @media(max-width:900px){.sess-hero-main{gap:10px}.sess-hero-icon{width:36px;height:36px;font-size:19px}.sess-search input{width:170px}.sess-stats{grid-template-columns:repeat(2,minmax(0,1fr))}.sess-item-stats{grid-template-columns:repeat(2,minmax(0,1fr))}}
+  @media(max-width:560px){.sess-toolbar{align-items:stretch}.sess-field,.sess-search input{width:100%}.sess-refresh{width:100%;justify-content:center}}
+
 </style>
 </head>
 <body>
@@ -494,8 +815,14 @@
     <button class="tab" data-tab="health" role="tab" aria-selected="false">
       <span>健康看板</span><span class="n" id="tabN-health" title="异常上游数"></span>
     </button>
+    <button class="tab" data-tab="sessions" role="tab" aria-selected="false">
+      <span>会话对账</span><span class="n" id="tabN-sessions" title="窗口内没走本机路由的调用轮数"></span>
+    </button>
+    <button class="tab" data-tab="tools" role="tab" aria-selected="false">
+      <span>MCP 工具</span><span class="n" id="tabN-tools" title="工具调用次数"></span>
+    </button>
     <button class="tab" data-tab="agent" role="tab" aria-selected="false">
-      <span>本机 Agent</span><span class="n" id="tabN-agent" title="已识别的本机 Agent 数"></span>
+      <span>Agent</span><span class="n" id="tabN-agent" title="已识别的 Agent 数"></span>
     </button>
     <button class="tab" data-tab="ck" role="tab" aria-selected="false">
       <span>签到</span><span class="n" id="tabN-ck" title="今天已签到的上游数"></span>
@@ -537,6 +864,26 @@
         </select>
         <button class="mini" id="snapBtn" title="查看/回退配置快照">配置快照</button>
         <button class="mini" id="sideRefresh" title="立即刷新">↻ 刷新</button>
+      </div>
+      <div class="card" id="reqChartCard">
+        <div class="row" style="align-items:center;gap:10px;margin-bottom:10px">
+          <h2 style="margin:0">趋势与分布</h2>
+          <span class="hint" id="reqChartMeta"></span>
+          <div class="grow"></div>
+          <select id="reqChartRange" class="chart-range" title="图表统计时间窗口">
+            <option value="today" selected>今天（当天 00:00 起）</option>
+            <option value="24">最近 24 小时</option>
+            <option value="72">最近 3 天</option>
+            <option value="168">最近 7 天</option>
+            <option value="0">全部（尾部缓存）</option>
+          </select>
+          <button class="mini" id="reqChartRefresh" title="重新计算图表">↻ 重算</button>
+        </div>
+        <div class="chart-grid req-charts">
+          <div class="chart-tile"><h3>请求趋势</h3><div id="reqTrendChart" class="chart-host"></div></div>
+          <div class="chart-tile"><h3>延迟分布</h3><div id="reqHistChart" class="chart-host"></div></div>
+          <div class="chart-tile"><h3>模型调用量 Top 8</h3><div id="reqModelChart" class="chart-host"></div></div>
+        </div>
       </div>
       <div class="reqgrid two" id="reqGrid">
         <div class="card" id="cardStats">
@@ -605,7 +952,7 @@
       <div class="card">
         <h2>模型路由</h2>
         <div class="hint" style="margin:-6px 0 12px">
-          这里只显示你在上游里<b>勾选过的模型</b>。点模型可以调整多个上游之间的调用顺序。
+          左侧是模型分组，右侧直接显示这个分组的调用方式、上游顺序和额度。改动即时保存，不用再开弹窗。
         </div>
 
         <div class="mtools">
@@ -621,14 +968,71 @@
           <button id="autoBtn">按上游顺序自动配好</button>
         </div>
 
-        <div id="models"></div>
+        <div class="model-split">
+          <aside class="model-side">
+            <div class="model-side-head"><span>模型分组</span><span class="muted" id="mSideCount"></span></div>
+            <div id="models"></div>
+          </aside>
+          <div class="model-detail-wrap">
+            <div class="model-empty" id="modelEmpty">左边选中一个模型分组，这里直接显示它的上游、调用顺序和额度。改动即时保存，不用再开弹窗。</div>
+            <div class="model-detail" id="modelDetail" hidden>
+              <div class="row" style="align-items:flex-start">
+                <div style="flex:1;min-width:0">
+                  <h3 id="mTitle">模型</h3>
+                  <div class="hint" id="mSubtitle"></div>
+                </div>
+                <button class="mini" id="mRename" title="改客户端调用的名字；各上游那边的真实模型名不受影响">改调用名</button>
+              </div>
+
+              <div style="margin:16px 0 6px" class="hint">调用方式</div>
+              <div class="row" style="margin-bottom:4px">
+                <div class="seg" id="mStrategy">
+                  <button data-s="priority">按顺序依次调用</button>
+                  <button data-s="round_robin">轮流轮询</button>
+                  <button data-s="random">随机挑一个</button>
+                </div>
+              </div>
+              <div class="hint" id="mStrategyHint" style="margin-bottom:16px"></div>
+
+              <div class="row" style="margin-bottom:8px">
+                <div class="hint" style="flex:1">上游与调用顺序（拖动左侧 ⋮⋮ 或点箭头调整）</div>
+                <select id="mAddUpstream" class="mini" style="max-width:190px"></select><button class="mini" id="mAddBtn">添加</button>
+              </div>
+              <div class="model-picks" id="mPicks"></div>
+              <div class="hint" id="mPreview" style="margin-top:10px"></div>
+              <div class="hint" id="mQuotaHint"></div>
+
+              <div style="margin-top:14px" class="hint">命名的排序</div>
+              <div class="row" style="margin-top:6px">
+                <select id="mSortSel" style="min-width:160px"></select>
+                <button class="mini" id="mSortApply">应用</button>
+                <button class="mini" id="mSortBySpeed">按测速排序</button>
+                <button class="mini" id="mSortSave">存为当前顺序</button>
+                <button class="mini" id="mSortDelete">删除</button>
+              </div>
+              <div class="hint" id="mSortHint" style="margin-top:5px"></div>
+              <div class="row" id="mSortNew" hidden style="margin-top:6px">
+                <input id="mSortName" placeholder="排序名字，例如：按测速" style="min-width:160px">
+                <button class="mini" id="mSortSaveNew">保存</button>
+                <button class="mini" id="mSortCancelNew">取消</button>
+              </div>
+
+              <div class="row" style="margin-top:18px;border-top:1px solid var(--line);padding-top:14px">
+                <button class="primary" id="mSave">保存</button>
+                <button class="mini danger" id="mDelete">删除路由</button>
+                <div class="grow"></div>
+                <span class="hint" id="mStatus"></span>
+              </div>
+            </div>
+          </div>
+        </div>
       </div>
     </section>
 
     <!-- ============ 本机 Agent 接入 ============ -->
     <section class="pane" id="pane-agent" role="tabpanel" hidden>
       <div class="card">
-        <h2>本机 Agent 接入</h2>
+        <h2>Agent 接入</h2>
         <div class="hint" style="margin:-6px 0 12px">
           扫描这台电脑上已安装的编码 Agent：内置规则 + npm 全局包目录（读 <code>package.json</code> 的 bin/keywords）+ 开始菜单 / 常见配置目录。
           选中一个当前路由里的模型，一键写入它的配置文件；Pi 会同时写 <code>models.json</code> 与 <code>settings.json</code>。
@@ -651,6 +1055,10 @@
           </label>
           <label class="hint" style="display:flex;gap:6px;align-items:center;padding-bottom:6px">
             <input type="checkbox" id="agentDryRun"> 只预览，不写文件
+          </label>
+          <label class="hint" style="display:flex;gap:6px;align-items:center;padding-bottom:6px"
+            title="DeepSeek Harness 专有：除了加 provider，还把 ~/.dsh/profiles/*/cordis.patch.yml 里的 agent-default-model 钉到 LLM Router，让 DSH 默认就用路由模型（被 Magpie 之类改回去时，卡片会标「默认模型已被改回」，点一键修回即可）">
+            <input type="checkbox" id="agentPinDefault"> 同时切默认模型
           </label>
           <label class="hint" style="display:flex;gap:6px;align-items:center;padding-bottom:6px">
             <input type="checkbox" id="agentOnlyDetected" checked> 只看已识别
@@ -677,7 +1085,8 @@
         <h2>上游健康看板</h2>
         <div class="hint" style="margin:-6px 0 12px">
           按落盘流水聚合：成功率 = 成功尝试 / 全部尝试；P50/P95 是尝试耗时分位数；
-          <b>首字 P50</b> 是流式请求首个内容块到达时间。熔断阈值连续
+          <b>首字 P50</b> 是流式请求首个内容块到达时间，缓存读 / 缓存写只算在最后一次成功的尝试上。
+          熔断阈值连续
           <code id="healthThreshold">3</code> 次失败，冷却 <code id="healthCooldown">60</code> 秒。
           历史流水由旧版本写入、没有首字字段时会显示「—」。
           每个上游卡片默认只显示汇总；点「展开模型明细」把这个上游的数据按模型拆开，
@@ -685,9 +1094,10 @@
         </div>
         <div class="row" style="flex-wrap:wrap;gap:8px;align-items:center">
           <select id="healthHours" style="font-size:12px;padding:5px 8px" title="统计时间窗口">
+            <option value="today" selected>今天（当天 00:00 起）</option>
             <option value="1">最近 1 小时</option>
             <option value="6">最近 6 小时</option>
-            <option value="24" selected>最近 24 小时</option>
+            <option value="24">最近 24 小时</option>
             <option value="72">最近 3 天</option>
             <option value="168">最近 7 天</option>
             <option value="0">全部（尾部缓存）</option>
@@ -702,7 +1112,148 @@
           <span class="hint" id="healthMeta"></span>
         </div>
         <div id="healthTotals" style="margin-top:10px"></div>
+        <div class="chart-grid" style="margin-top:12px">
+          <div class="chart-tile">
+            <h3>上游成功率（调用量 Top 10）</h3>
+            <div id="healthBarChart" class="chart-host"></div>
+          </div>
+          <div class="chart-tile">
+            <div class="row" style="gap:8px;margin-bottom:4px">
+              <h3 style="margin:0;flex:1">能力雷达</h3>
+              <select id="healthRadarUp" class="chart-range" title="选择要对比的上游"></select>
+            </div>
+            <div id="healthRadarChart" class="chart-host"></div>
+          </div>
+        </div>
         <div id="healthList" style="margin-top:10px"></div>
+      </div>
+    </section>
+
+    <!-- ============ 会话对账 ============ -->
+    <section class="pane" id="pane-sessions" role="tabpanel" hidden>
+      <div class="card sess-hero">
+        <div class="sess-hero-main">
+          <div class="sess-hero-icon">◎</div>
+          <div class="sess-hero-copy">
+            <div class="sess-hero-title">
+              <h2>会话对账</h2>
+              <span class="sess-pill">只读诊断</span>
+              <span class="sess-pill" id="sessHealth">未扫描</span>
+            </div>
+            <div class="hint">
+              直接读各家 Agent 自己的会话记录：DSH <code>~/.dsh/sessions/*/*/session.v4.jsonl.zstd</code>、
+              Claude Code <code>~/.claude/projects/*/*.jsonl</code>、Pi <code>~/.pi/agent/sessions/*/*.jsonl</code>、
+              Codex <code>~/.codex/sessions/*/*/*/rollout-*.jsonl</code>。按 <b>provider / 模型</b> 汇总后，
+              与本机 <code>8010</code> 落盘流水对照：标「未走路由」的就是绕过 llm-router 直连别处的调用。
+            </div>
+            <div class="sess-hero-note">
+              <span>页面只读，不改任何配置</span>
+              <span>上游地址取自各 Agent 的 baseURL</span>
+              <span>页面可见时每 <b id="sessAutoHint">5</b> 秒自动重扫</span>
+            </div>
+          </div>
+        </div>
+        <div class="sess-toolbar">
+          <label class="sess-field">
+            <span class="sess-field-label">时间窗口</span>
+            <select id="sessHours" class="sess-select" title="统计时间窗口">
+              <option value="today" selected>今天（当天 00:00 起）</option>
+              <option value="24">最近 24 小时</option>
+              <option value="72">最近 3 天</option>
+              <option value="168">最近 7 天</option>
+              <option value="720">最近 30 天</option>
+              <option value="0">全部</option>
+            </select>
+          </label>
+          <div class="sess-field">
+            <span class="sess-field-label">数据源</span>
+            <div class="sess-source-checks">
+              <label class="sess-check"><input type="checkbox" id="sessSrcDsh" checked><span>DSH</span></label>
+              <label class="sess-check"><input type="checkbox" id="sessSrcClaude" checked><span>Claude Code</span></label>
+              <label class="sess-check"><input type="checkbox" id="sessSrcPi" checked><span>Pi</span></label>
+              <label class="sess-check"><input type="checkbox" id="sessSrcCodex" checked><span>Codex</span></label>
+            </div>
+          </div>
+          <label class="sess-switch" title="只显示没走本机路由的记录">
+            <input type="checkbox" id="sessOnlyExternal">
+            <span class="sess-switch-track"><i></i></span>
+            <span>只看未走路由</span>
+          </label>
+          <label class="sess-field sess-search">
+            <span class="sess-field-label">筛选</span>
+            <input id="sessSearch" type="search" placeholder="provider / 模型 / 地址">
+          </label>
+          <button class="sess-refresh" id="sessReload"><span>↻</span>重新扫描</button>
+        </div>
+        <div class="sess-toolbar-foot"><span id="sessMeta" class="sess-meta">正在读取会话记录…</span></div>
+        <div id="sessTotals" class="sess-stats"></div>
+        <div id="sessCompare" class="sess-compare"></div>
+        <div id="sessSources" class="sess-source-grid"></div>
+      </div>
+
+      <div class="card sess-table-card" style="margin-top:14px">
+        <div class="sess-section-head">
+          <div>
+            <h2>按 provider / 模型</h2>
+            <div class="sess-section-sub">每一行是一个 provider + 模型的调用汇总，标明是否经过本机路由</div>
+          </div>
+          <span class="sess-count" id="sessRowsMeta"></span>
+        </div>
+        <div class="sess-table-wrap">
+          <table class="sess-table">
+            <thead><tr>
+              <th>来源</th><th>Provider</th><th>模型</th><th>接口地址</th><th>路由</th>
+              <th class="num">轮数</th><th class="num">输入</th><th class="num">输出</th><th class="num">缓存读</th><th class="num">缓存写</th>
+              <th>首次 / 最近</th>
+            </tr></thead>
+            <tbody id="sessRows"></tbody>
+          </table>
+        </div>
+      </div>
+
+      <div class="card sess-detail-card" style="margin-top:14px">
+        <div class="sess-section-head">
+          <div>
+            <h2>会话明细</h2>
+            <div class="sess-section-sub">按会话展示轮数、路由覆盖与外部调用模型</div>
+          </div>
+          <span class="sess-count" id="sessListMeta"></span>
+        </div>
+        <div id="sessList" class="sess-list"></div>
+      </div>
+    </section>
+
+    <!-- ============ MCP / 工具调用排行榜 ============ -->
+    <section class="pane" id="pane-tools" role="tabpanel" hidden>
+      <div class="card" id="sessToolCard">
+        <div class="row" style="align-items:center;gap:10px;flex-wrap:wrap">
+          <h2 style="margin:0">MCP / 工具调用排行榜</h2>
+          <span class="hint" id="sessToolMeta"></span>
+          <div class="grow"></div>
+          <select id="toolHours" class="chart-range" title="统计时间窗口">
+            <option value="today" selected>今天（当天 00:00 起）</option>
+            <option value="24">最近 24 小时</option>
+            <option value="72">最近 3 天</option>
+            <option value="168">最近 7 天</option>
+            <option value="0">全部</option>
+          </select>
+          <label class="hint"><input type="checkbox" id="toolSrcDsh" checked> DSH</label>
+          <label class="hint"><input type="checkbox" id="toolSrcClaude" checked> Claude Code</label>
+          <button class="mini" id="toolReload">↻ 重新统计</button>
+        </div>
+        <div class="hint" style="margin:4px 0 10px">从 DSH 的 <code>tool/call</code> / <code>tool/result</code> 与 Claude Code 的 <code>tool_use</code> / <code>tool_result</code> 配对统计；只读会话文件，不改任何配置。</div>
+        <div class="chart-grid">
+          <div class="chart-tile"><h3>调用次数 Top 10</h3><div id="sessToolChart" class="chart-host"></div></div>
+          <div class="chart-tile"><h3>平均耗时 Top 10</h3><div id="sessToolChart2" class="chart-host"></div></div>
+        </div>
+        <div style="overflow-x:auto;margin-top:12px">
+          <table class="mono" style="width:100%;font-size:12px;border-collapse:collapse">
+            <thead><tr style="text-align:left;color:var(--dim)">
+              <th>工具</th><th>来源</th><th>调用</th><th>失败</th><th>成功率</th><th>会话</th><th>平均耗时</th><th>P50</th><th>P95</th><th>最近使用</th><th>常见错误</th>
+            </tr></thead>
+            <tbody id="sessToolRows"></tbody>
+          </table>
+        </div>
       </div>
     </section>
 
@@ -823,17 +1374,21 @@
       <div class="card" style="margin-top:14px" id="refreshCard">
         <h2>界面刷新</h2>
         <div class="hint" style="margin:-6px 0 12px">
-          控制台每隔多少秒拉一次状态和请求记录。默认 5 秒；手机走 Tailscale / 中继时建议 5–10 秒。
+          两个间隔分开设置，互不影响：请求记录走长连接推送、定时轮询只做兜底；会话对账每次都要重新扫描各家 Agent 的会话文件，节奏可以更慢。默认都是 5 秒。
         </div>
         <div class="row" style="gap:10px;align-items:flex-end;flex-wrap:wrap">
-          <label class="cap-cell" style="max-width:200px">
-            <span class="cap-k">刷新间隔(秒)</span>
+          <label class="cap-cell" style="max-width:210px">
+            <span class="cap-k">请求记录刷新间隔(秒)</span>
             <input type="number" min="1" max="120" step="1" id="refreshInterval" placeholder="5">
+          </label>
+          <label class="cap-cell" style="max-width:210px">
+            <span class="cap-k">会话对账刷新间隔(秒)</span>
+            <input type="number" min="2" max="600" step="1" id="sessRefreshInterval" placeholder="5">
           </label>
           <button class="primary" id="refreshIntervalSave">保存</button>
           <span class="hint" id="refreshIntervalStatus"></span>
         </div>
-        <div class="hint" style="margin-top:8px">只影响当前设备 / 浏览器，桌面和手机可以分别设置。</div>
+        <div class="hint" style="margin-top:8px">只影响当前设备 / 浏览器，桌面和手机可以分别设置；会话对账要扫多个会话文件，建议不低于 5 秒。</div>
       </div>
 
       <div class="card" style="margin-top:14px" id="relayCard" hidden>
@@ -1015,73 +1570,7 @@
   </div>
 </div>
 
-<!-- ============ 模型编辑弹窗 ============ -->
-<div class="mask" id="modal" hidden>
-  <div class="modal">
-    <div class="row" style="align-items:flex-start">
-      <div style="flex:1;min-width:0">
-        <h3 id="mTitle">模型</h3>
-        <div class="hint" id="mSubtitle"></div>
-      </div>
-      <button class="mini" id="mRename" title="改客户端调用的名字；各上游那边的真实模型名不受影响">改调用名</button>
-      <button class="mini" id="mClose">关闭</button>
-    </div>
 
-    <div style="margin:16px 0 6px" class="hint">调用方式</div>
-    <div class="row" style="margin-bottom:4px">
-      <div class="seg" id="mStrategy">
-        <button data-s="priority">按顺序依次调用</button>
-        <button data-s="round_robin">轮流轮询</button>
-        <button data-s="random">随机挑一个</button>
-      </div>
-    </div>
-    <div class="hint" id="mStrategyHint" style="margin-bottom:16px"></div>
-
-    <div class="row" style="margin-bottom:8px">
-      <span class="hint" style="flex:1">参与的上游与顺序（拖 <span class="mono">⠿</span> 调整，手机上长按整行也能拖，或用行里的 <span class="mono">↑↓</span>）；最右列是调用额度（留空 = 不限量，0 = 不调用）</span>
-    </div>
-    <div id="mPicks"></div>
-    <div class="hint" id="mQuotaHint" style="margin-top:6px"></div>
-
-    <div class="preview" id="mPreview"></div>
-
-    <!-- 具名排序（默认折叠） -->
-    <div class="collapsible">
-      <button class="collapsible-btn" onclick="toggleCollapsible(this)" aria-expanded="false">
-        <span>具名排序（多套都存着，切来切去不丢原始顺序）</span>
-        <span class="arrow">▶</span>
-      </button>
-      <div class="collapsible-body" hidden>
-        <div class="sort-row">
-          <select id="mSortSel" title="切换排序，只换顺序不改额度"></select>
-          <button class="mini" id="mSortSave">保存当前顺序为…</button>
-          <button class="mini" id="mSortApply">用这套排序</button>
-          <button class="mini danger" id="mSortDelete">删除</button>
-          <button class="mini primary" id="mSortBySpeed">⚡ 按测速重排并保存</button>
-        </div>
-        <div class="sort-new" id="mSortNew" hidden>
-          <input id="mSortName" class="mono" placeholder="给这套排序起个名字，如：按测速"
-                 maxlength="40" style="flex:1;min-width:160px">
-          <button class="mini primary" id="mSortSaveNew">保存</button>
-          <button class="mini" id="mSortCancelNew">取消</button>
-        </div>
-        <div class="hint" id="mSortHint" style="margin-top:8px"></div>
-      </div>
-    </div>
-
-    <div class="row" style="margin-top:14px">
-      <select id="mAddUpstream" style="flex:1;min-width:180px"></select>
-      <button id="mAddBtn" class="mini">加一个上游</button>
-    </div>
-
-    <div class="row" style="margin-top:18px">
-      <button class="primary" id="mSave">保存</button>
-      <button class="danger" id="mDelete">删除这个模型的路由</button>
-      <div class="grow"></div>
-      <span class="hint" id="mStatus"></span>
-    </div>
-  </div>
-</div>
 
 <div class="mask" id="editModal" hidden>
   <div class="modal" style="width:min(520px,100%)">
@@ -1450,6 +1939,16 @@ function netExitBadge(u) {
          `${esc(label)}${src === "none" ? "" : " ⇄"}</span>`;
 }
 
+function hueOf(s) {
+  let h = 0;
+  for (const ch of String(s == null ? "" : s)) h = (h * 31 + ch.codePointAt(0)) % 360;
+  return h;
+}
+function initialOf(s) {
+  const t = String(s == null ? "" : s).trim();
+  return (Array.from(t)[0] || "?").toUpperCase();
+}
+
 function renderUpstreams() {
   const ups = state.upstreams || [];
   // 用户正在分组输入框里操作（或下拉开着）时不要重建 DOM，
@@ -1537,17 +2036,25 @@ function renderUpstreams() {
     const lat = u.avg_latency_seconds;
     const maxLat = Math.max(...ups.map(x => x.avg_latency_seconds || 0), 0.001);
     const open = expanded[u.id];
+    const hue = hueOf(u.name);
+    const statusBadge = u.enabled
+      ? (cooling ? `<span class="badge warn">冷却中 ${u.cooldown_remaining_seconds}s</span>`
+                 : `<span class="badge ok">● 启用</span>`)
+      : `<span class="badge bad">已停用</span>`;
 
     return `
-    <div class="${cls}" data-id="${esc(u.id)}">
+    <div class="${cls}" data-id="${esc(u.id)}" style="--h:${hue}">
       <div class="up-head">
-        <span class="up-name">${esc(u.name)}</span>
-        ${mt === "available" ? `<span class="badge" style="background:#fef3c7;color:#b45309;font-weight:600">支持但未选 ✦</span>` : ""}
-        ${mt === "selected" ? `<span class="badge" style="background:#dcfce7;color:#16a34a;font-weight:600">已选 ✓</span>` : ""}
-        ${u.enabled
-          ? (cooling ? `<span class="badge warn">冷却中 ${u.cooldown_remaining_seconds}s</span>`
-                     : `<span class="badge ok">启用</span>`)
-          : `<span class="badge bad">已停用</span>`}
+        <span class="up-avatar" aria-hidden="true">${esc(initialOf(u.name))}</span>
+        <div class="up-identity">
+          <div class="up-name-row"><span class="up-name" title="${esc(u.name)}">${esc(u.name)}</span></div>
+          <div class="url" title="${esc(u.base_url)}">${esc(u.base_url)}</div>
+        </div>
+      </div>
+      <div class="up-badges">
+        ${statusBadge}
+        ${mt === "available" ? `<span class="badge" style="color:#fbbf24;border-color:rgba(245,158,11,.45);font-weight:600">支持但未选 ✦</span>` : ""}
+        ${mt === "selected" ? `<span class="badge" style="color:#4ade80;border-color:rgba(34,197,94,.4);font-weight:600">已选 ✓</span>` : ""}
         ${keyBadge(u)}
         ${netExitBadge(u)}
         ${u.api_mode === "responses"
@@ -1558,20 +2065,7 @@ function renderUpstreams() {
           : `<span class="badge warn">还没拉取模型</span>`}
         ${balanceBadge(u)}
         ${u.models_fetched_at ? `<span class="badge">${whenText(u.models_fetched_at)}拉取</span>` : ""}
-        <div class="up-actions">
-          <button class="mini primary" data-act="models" ${nAvail ? "" : "disabled"}>
-            ${open ? "收起模型" : "选模型"}${nAvail ? ` (${nSel}/${nAvail})` : ""}
-          </button>
-          <button class="mini" data-act="fetch">拉取模型</button>
-          <button class="mini" data-act="test">测速</button>
-          <button class="mini" data-act="balance">查余额</button>
-          <button class="mini" data-act="edit">编辑</button>
-          <button class="mini" data-act="toggle">${u.enabled ? "停用" : "启用"}</button>
-          <button class="mini danger" data-act="del">删除</button>
-        </div>
       </div>
-      <div class="url" style="margin-top:8px">${esc(u.base_url)}</div>
-      ${renderMirrors(u)}
       <div class="kv">
         <div class="stat"><b>${u.requests}</b><span>请求</span></div>
         <div class="stat"><b style="color:var(--ok)">${u.successes}</b><span>成功</span></div>
@@ -1580,9 +2074,21 @@ function renderUpstreams() {
       </div>
       ${lat ? `<div class="bar"><i style="width:${Math.max(4, Math.round(lat / maxLat * 100))}%;
               background:${latColor(lat)}"></i></div>` : ""}
+      ${renderMirrors(u)}
       ${u.models_error ? `<div class="hint" style="color:var(--bad)">拉取失败：${esc(u.models_error)}</div>` : ""}
       ${u.last_error && !u.models_error ? `<div class="hint">最近错误：${esc(u.last_error)}</div>` : ""}
       ${renderCheckResults(u)}
+      <div class="up-actions">
+        <button class="mini primary" data-act="models" ${nAvail ? "" : "disabled"}>
+          ${open ? "收起模型" : "选模型"}${nAvail ? ` (${nSel}/${nAvail})` : ""}
+        </button>
+        <button class="mini" data-act="fetch">拉取模型</button>
+        <button class="mini" data-act="test">测速</button>
+        <button class="mini" data-act="balance">查余额</button>
+        <button class="mini" data-act="edit">编辑</button>
+        <button class="mini" data-act="toggle">${u.enabled ? "停用" : "启用"}</button>
+        <button class="mini danger" data-act="del">删除</button>
+      </div>
       ${open ? renderPickPanel(u) : ""}
     </div>`;
   }).join("");
@@ -1877,6 +2383,7 @@ function bindDelegatedEvents() {
 
 /* ================= 渲染：模型 ================= */
 let modelLimit = 200;
+let selectedModel = null;
 
 function renderModels() {
   const cat = state.catalog || [];
@@ -1934,6 +2441,11 @@ function renderModels() {
       anyOffered
         ? "还没有选用任何模型。<br>切到左侧「上游来源」标签页，点上游卡片上的<b>选模型</b>，勾上你要用的。"
         : "还没有模型信息。先添加上游，然后点「拉取全部模型」。"}</div>`);
+    if (!editing) {
+      const d = $("#modelDetail"), e = $("#modelEmpty");
+      if (d) d.hidden = true;
+      if (e) e.hidden = false;
+    }
     return;
   }
 
@@ -1949,38 +2461,67 @@ function renderModels() {
     const nSkip = members.filter(x => x.quota === 0).length;
     const nLimited = members.filter(x => x.quota != null && x.quota > 0).length;
     // 展示每个上游用的真实名字，这样「同名分组、各家不同名」一眼可见
-    const order = m.upstream_names
-      ? m.upstream_names.map((n, i) => {
+    const routeNames = m.upstream_names || (m.ups || []).map(u => u.name);
+    const order = routeNames.length
+      ? routeNames.map((n, i) => {
           const real = (m.real_models || [])[i];
           return real && real !== m.name ? `${n}(${real})` : n;
         }).join(" → ")
-      : (m.ups.length ? m.ups.map(u => u.name).join(" · ") : "（没有上游选用它）");
+      : "（没有上游选用它）";
+    const routeChips = routeNames.slice(0, 4).map((n, i) => {
+      const real = (m.real_models || [])[i];
+      const title = real && real !== m.name ? `${n}（${real}）` : n;
+      return `<span class="route-chip" title="${esc(title)}">${esc(n)}</span>`;
+    }).join('<span class="route-arrow">→</span>');
+    const routeExtra = routeNames.length > 4
+      ? `<span class="route-more">+${routeNames.length - 4}</span>` : "";
+    const hue = hueOf(m.name);
     return `
-    <div class="mcard ${cls}" data-name="${esc(m.name)}">
-      <div class="mcard-name">${esc(m.name)}</div>
-      <div class="mcard-sub">
-        ${m.configured
-          ? `<span class="badge ok">已配置 · ${STRAT[m.strategy] || m.strategy}</span>`
-          : `<span class="badge">未配置</span>`}
-        ${m.ups.length ? `<span class="badge blue">${m.ups.length} 个上游选用</span>`
-                       : `<span class="badge warn">无上游选用</span>`}
-        ${m.aliased ? `<span class="badge purple">各家名字不同</span>` : ""}
-        ${m.configured && c.active_ordering
-          ? `<span class="badge purple" title="当前生效的具名排序">排序：${esc(c.active_ordering)}</span>`
-          : ""}
-        ${nSkip ? `<span class="badge bad" title="额度为 0，调用时会跳过">${nSkip} 个不调用</span>` : ""}
-        ${nLimited ? `<span class="badge warn" title="设了调用额度上限">${nLimited} 个限额度</span>` : ""}
-        ${m.ups.length > has && m.configured ? `<span class="badge warn">${m.ups.length - has} 个已停用</span>` : ""}
+    <div class="mcard ${cls}${selectedModel === m.name ? " active" : ""}" data-name="${esc(m.name)}" style="--h:${hue}">
+      <div class="mcard-top">
+        <span class="mcard-avatar" aria-hidden="true">${esc(initialOf(m.name))}</span>
+        <div class="mcard-title">
+          <div class="mcard-name" title="${esc(m.name)}">${esc(m.name)}</div>
+          <div class="mcard-sub">
+            ${m.configured
+              ? `<span class="badge ok">已配置 · ${STRAT[m.strategy] || m.strategy}</span>`
+              : `<span class="badge">未配置</span>`}
+            ${m.ups.length ? `<span class="badge blue">${m.ups.length} 个上游选用</span>`
+                           : `<span class="badge warn">无上游选用</span>`}
+            ${m.aliased ? `<span class="badge purple">各家名字不同</span>` : ""}
+            ${m.configured && c.active_ordering
+              ? `<span class="badge purple" title="当前生效的具名排序">排序：${esc(c.active_ordering)}</span>`
+              : ""}
+            ${nSkip ? `<span class="badge bad" title="额度为 0，调用时会跳过">${nSkip} 个不调用</span>` : ""}
+            ${nLimited ? `<span class="badge warn" title="设了调用额度上限">${nLimited} 个限额度</span>` : ""}
+            ${m.ups.length > has && m.configured ? `<span class="badge warn">${m.ups.length - has} 个已停用</span>` : ""}
+          </div>
+        </div>
+        <span class="mcard-count" title="参与这个分组的模型数量">${m.ups.length}</span>
       </div>
-      <div class="mcard-order" title="${esc(order)}">${esc(order)}</div>
+      <div class="mcard-route" title="${esc(order)}">${routeChips || `<span class="route-more">（没有上游选用它）</span>`}${routeExtra}</div>
+      <div class="mcard-hint">${m.configured ? "点击调整上游顺序" : "点击配置路由"}</div>
       ${m.configured
         ? `<button class="mini danger mcard-del" data-del="${esc(m.name)}"
              title="删除这个模型的路由配置(删除后会退回自动模式)">删除路由</button>`
         : ""}
     </div>`;
   }).join("") + more + `</div>`);
+  const sideCount = $("#mSideCount");
+  if (sideCount) sideCount.textContent = `${total} 个`;
   const moreBtn = $("#modelsMore");
   if (moreBtn) moreBtn.onclick = () => { modelLimit += 200; renderModels(); };
+  if (!editing && page.length) openModel(page[0].name);
+  else paintModelSelection();
+}
+
+function paintModelSelection() {
+  document.querySelectorAll("#models .mcard").forEach(el => {
+    el.classList.toggle("active", el.dataset.name === selectedModel);
+  });
+  const detail = $("#modelDetail"), empty = $("#modelEmpty");
+  if (detail) detail.hidden = !editing;
+  if (empty) empty.hidden = !!editing;
 }
 
 /* ================= 模型编辑 ================= */
@@ -1991,6 +2532,7 @@ const STRAT_HINT = {
 };
 
 function openModel(name) {
+  selectedModel = name;
   const cfg = (state.models || {})[name];
   const catEntry = (state.catalog || []).find(e => e.name === name);
   const catalogUps = catEntry ? catEntry.upstreams : [];
@@ -2027,7 +2569,10 @@ function openModel(name) {
     sortLabel: "",
   };
   renderModal();
-  $("#modal").hidden = false;
+  paintModelSelection();
+  const detail = $("#modelDetail"), empty = $("#modelEmpty");
+  if (detail) detail.hidden = false;
+  if (empty) empty.hidden = true;
 }
 
 function toggleCollapsible(btn) {
@@ -2506,7 +3051,7 @@ let pickSwallowClickUntil = 0;
 // 只管弹窗遮罩和这几行里的 click，别处（比如「保存」）照旧。
 document.addEventListener("click", e => {
   if (Date.now() > pickSwallowClickUntil) return;
-  if (e.target !== $("#modal") && !e.target.closest("#mPicks")) return;
+  if (!e.target.closest("#mPicks")) return;
   e.stopPropagation();
   e.preventDefault();
 }, true);
@@ -2515,11 +3060,11 @@ document.addEventListener("click", e => {
         「这一串移动归我」，所以触屏这条路不用 pointer。
         监听挂在弹窗上而不是 document 上：非 passive 的 touchmove 会让浏览器
         每次滚动都等 JS 一句话，只让弹窗里的滚动付这个代价。---- */
-const pickModal = document.getElementById("modal");
+const pickModal = document.getElementById("modelDetail");
 
 pickModal.addEventListener("touchstart", e => {
   if (!editing || pickDrag || e.touches.length !== 1) return;
-  if ($("#modal").hidden) return;
+  if (!editing) return;
   const el = pickRowAt(e.target);
   if (!el || pickIsControl(e.target)) return;
   const t = e.touches[0];
@@ -2569,7 +3114,7 @@ document.addEventListener("pointerdown", e => {
   if (!editing || pickDrag) return;
   if (e.pointerType === "touch") return;       // 触屏归上面那套管
   if (e.button !== 0) return;
-  if ($("#modal").hidden) return;
+  if (!editing) return;
   const el = pickRowAt(e.target);
   if (!el || pickIsControl(e.target)) return;
   pickDrag = { mode: "armed", el, startX: e.clientX, startY: e.clientY,
@@ -3194,14 +3739,15 @@ async function saveModel() {
     toast("所有参与的上游额度都是 0，这个分组就没人能调了。至少留一个不限量或大于 0 的。", "bad");
     return;
   }
+  const name = editing.name;
   $("#mSave").disabled = true; $("#mStatus").textContent = "保存中…";
   try {
     await api("/admin/model/save", {
       name: editing.name, strategy: editing.strategy, entries,
     });
-    $("#modal").hidden = true;
-    toast(`已保存「${editing.name}」的路由`, "ok");
+    toast(`已保存「${name}」的路由`, "ok");
     await refresh();
+    openModel(name);
   } catch (e) { toast("保存失败：" + e.message, "bad"); }
   $("#mSave").disabled = false; $("#mStatus").textContent = "";
 }
@@ -3354,8 +3900,14 @@ async function deleteModel() {
   if (!editing) return;
   const name = editing.name;
   if (await deleteModelByName(name)) {
-    $("#modal").hidden = true;
     editing = null;
+    selectedModel = null;
+    await refresh();
+    if (!editing) {
+      const d = $("#modelDetail"), e = $("#modelEmpty");
+      if (d) d.hidden = true;
+      if (e) e.hidden = false;
+    }
   }
 }
 
@@ -3789,6 +4341,10 @@ function renderSide() {
           </div>
         </div>
         <div class="req-sec">
+          <h5>请求瀑布</h5>
+          ${waterfallChart(h)}
+        </div>
+        <div class="req-sec">
           <h5>详情</h5>
           <div class="hint" style="line-height:1.8">
             实际发往上游的模型：<code>${esc(h.effective_model || "-")}</code><br>
@@ -3858,13 +4414,13 @@ async function ensureEntryText(at, upstream) {
 }
 
 /* ================= 左侧 tab：请求记录 / 上游来源 / 模型路由 ================= */
-const TABS = ["req", "up", "model", "health", "agent", "ck", "set", "log"];
-const TAB_LABEL = { req: "请求记录", up: "上游来源", model: "模型路由", health: "健康看板", agent: "本机 Agent", ck: "签到", set: "设置", log: "日志" };
+const TABS = ["req", "up", "model", "health", "sessions", "tools", "agent", "ck", "set", "log"];
+const TAB_LABEL = { req: "请求记录", up: "上游来源", model: "模型路由", health: "健康看板", sessions: "会话对账", tools: "MCP 工具", agent: "Agent", ck: "签到", set: "设置", log: "日志" };
 let curTab = null;
 
 function setTab(name) {
-  // 中继页面没有本地 /agents、/health/upstreams 接口，回退到请求记录
-  if ((name === "agent" || name === "health") && !AGENT_LOCAL) name = "req";
+  // 中继页面没有本地 /agents、/health/upstreams、/sessions 接口，回退到请求记录
+  if ((name === "agent" || name === "health" || name === "sessions" || name === "tools") && !AGENT_LOCAL) name = "req";
   const tab = TABS.includes(name) ? name : "req";
   TABS.forEach(t => {
     const btn = document.querySelector(`#tabs .tab[data-tab="${t}"]`);
@@ -3886,6 +4442,10 @@ function setTab(name) {
   if (tab === "agent") loadAgents();
   // 切到健康看板：拉一次按上游聚合的指标
   if (tab === "health") loadHealth();
+  // 切到会话对账：读各家 Agent 会话记录，找没经过本机路由的调用
+  if (tab === "sessions") loadSessions();
+  // 切到 MCP 工具：单独读工具调用记录
+  if (tab === "tools") loadTools();
   // 换 tab 时回到顶部，免得带着上一屏的滚动位置落进新内容中间
   if (curTab !== null && curTab !== tab) window.scrollTo(0, 0);
   curTab = tab;
@@ -4517,6 +5077,7 @@ async function refresh() {
         renderSide();
       }
     }
+    if (curTab === "req") loadReqCharts();
     renderTabNums();
     refreshDelay = refreshSeconds() * 1000;
   } catch (e) {
@@ -4718,7 +5279,6 @@ $("#copyBtn").onclick = async () => {
 
 $("#mFilter").addEventListener("input", () => { modelLimit = 200; renderModels(); });
 $("#mFilterMode").addEventListener("change", () => { modelLimit = 200; renderModels(); });
-$("#mClose").onclick = () => { $("#modal").hidden = true; editing = null; };
 $("#mRename").onclick = async () => {
   if (!editing) return;
   const from = editing.name;
@@ -4728,15 +5288,13 @@ $("#mRename").onclick = async () => {
   if (!to || to === from) return;
   try {
     const r = await api("/admin/rename-group", { from, to });
-    $("#modal").hidden = true;
     editing = null;
+    selectedModel = to;
     toast(`分组已改名为「${to}」，涉及 ${r.entries} 个上游模型`, "ok");
     await refresh();
+    openModel(to);
   } catch (e) { toast("改名失败：" + e.message, "bad"); }
 };
-$("#modal").addEventListener("click", e => {
-  if (e.target === $("#modal")) { $("#modal").hidden = true; editing = null; }
-});
 $("#eClose").onclick = () => { $("#editModal").hidden = true; editId = null; };
 $("#editModal").addEventListener("click", e => {
   if (e.target === $("#editModal")) { $("#editModal").hidden = true; editId = null; }
@@ -4750,7 +5308,6 @@ document.addEventListener("keydown", e => {
   if (!document.getElementById("groupMenu").hidden) { closeGroupMenu(); return; }
   if (!$("#accessModal").hidden) { $("#accessModal").hidden = true; return; }
   if (!$("#historyModal").hidden) { $("#historyModal").hidden = true; return; }
-  if (!$("#modal").hidden) { $("#modal").hidden = true; editing = null; }
   if (!$("#editModal").hidden) { $("#editModal").hidden = true; editId = null; }
 });
 // 点别处、改窗口大小都收起分组下拉
@@ -5087,6 +5644,7 @@ $("#ckAutoSave").onclick = saveCkSettings;
 
 /* ================= 界面刷新间隔 ================= */
 const REFRESH_KEY = "llm-router-refresh-seconds";
+const SESS_REFRESH_KEY = "llm-router-sess-refresh-seconds";
 let refreshTimer = null;
 let refreshDelay = 5000;
 let refreshing = false;
@@ -5094,6 +5652,11 @@ let refreshing = false;
 function refreshSeconds() {
   const raw = Number(localStorage.getItem(REFRESH_KEY));
   return Number.isFinite(raw) && raw >= 1 && raw <= 120 ? Math.round(raw) : 5;
+}
+
+function sessRefreshSeconds() {
+  const raw = Number(localStorage.getItem(SESS_REFRESH_KEY));
+  return Number.isFinite(raw) && raw >= 2 && raw <= 600 ? Math.round(raw) : 5;
 }
 
 function scheduleRefresh(delay) {
@@ -5117,6 +5680,8 @@ function applyRefreshInterval() {
   const secs = refreshSeconds();
   const input = $("#refreshInterval");
   if (input && document.activeElement !== input) input.value = String(secs);
+  const sessInput = $("#sessRefreshInterval");
+  if (sessInput && document.activeElement !== sessInput) sessInput.value = String(sessRefreshSeconds());
   refreshDelay = secs * 1000;
   scheduleRefresh(refreshDelay);
 }
@@ -5125,13 +5690,22 @@ function saveRefreshInterval() {
   const input = $("#refreshInterval");
   const n = Math.round(Number((input.value || "").trim()));
   if (!Number.isFinite(n) || n < 1 || n > 120) {
-    $("#refreshIntervalStatus").textContent = "请输入 1–120 之间的整数";
+    $("#refreshIntervalStatus").textContent = "请求记录间隔请输入 1–120 之间的整数";
+    return;
+  }
+  const sessInput = $("#sessRefreshInterval");
+  const sn = Math.round(Number((sessInput.value || "").trim()));
+  if (!Number.isFinite(sn) || sn < 2 || sn > 600) {
+    $("#refreshIntervalStatus").textContent = "会话对账间隔请输入 2–600 之间的整数";
     return;
   }
   localStorage.setItem(REFRESH_KEY, String(n));
+  localStorage.setItem(SESS_REFRESH_KEY, String(sn));
   applyRefreshInterval();
-  $("#refreshIntervalStatus").textContent = `已保存，每 ${n} 秒刷新`;
-  toast(`刷新间隔已改为 ${n} 秒`, "ok");
+  if (typeof applySessAuto === "function") applySessAuto();
+  if (typeof applyToolsAuto === "function") applyToolsAuto();
+  $("#refreshIntervalStatus").textContent = `已保存：请求记录每 ${n} 秒，会话对账每 ${sn} 秒`;
+  toast(`刷新间隔已保存（请求记录 ${n}s / 会话对账 ${sn}s）`, "ok");
 }
 $("#refreshIntervalSave").onclick = saveRefreshInterval;
 
@@ -5235,7 +5809,7 @@ async function loadAgents() {
   const list = $("#agentList");
   if (!list) return;
   agentLoading = true;
-  agentResultHtml('<div class="hint muted">正在扫描本机 Agent…</div>');
+  agentResultHtml('<div class="hint muted">正在扫描 Agent…</div>');
   try {
     const data = await api("/agents", undefined, "GET");
     agentData = data;
@@ -5259,7 +5833,7 @@ async function loadAgents() {
     const n = all.filter(a => a.detected).length;
     const auto = all.filter(a => (a.source || "").includes("npm 全局包")).length;
     const canWrite = all.filter(a => a.detected && a.configurable).length;
-    setTabNum("agent", n, false, `识别到 ${n} 个本机 Agent`);
+    setTabNum("agent", n, false, `识别到 ${n} 个 Agent`);
     agentResultHtml(`<div class="hint muted">扫描于 ${esc(data.scan_at || "")} · 本机端口 ${esc(data.port || "")} · 当前路由 ${models.length} 个模型 · 共 ${all.length} 个候选（npm 包动态发现 ${auto} 个）· 已识别且可一键导入 ${canWrite} 个</div>`);
   } catch (e) {
     agentResultHtml(`<div class="hint" style="color:var(--bad)">扫描失败：${esc(e.message || e)}</div>`);
@@ -5303,6 +5877,10 @@ function renderAgents() {
     if (a.current_model) cur.push(`模型 <code>${esc(a.current_model)}</code>`);
     if (a.current_base) cur.push(`地址 <code>${esc(a.current_base)}</code>`);
     if (a.connected) cur.push('<span style="color:var(--ok)">已指向 llm-router</span>');
+    if (a.default_provider || a.default_model) {
+      const routed = a.default_provider === "llmrouter";
+      cur.push(`默认模型 <code style="${routed ? "color:var(--ok)" : "color:var(--bad)"}">${esc((a.default_provider || "?") + "/" + (a.default_model || "?"))}</code>${routed ? "" : "（没走本机路由）"}`);
+    }
     if (a.expected_model) cur.push(`上次导入 <code>${esc(a.expected_model)}</code>`);
     if (a.applied_at) cur.push(`<span class="muted">${esc(a.applied_at)}</span>`);
     const notes = a.notes ? `<div class="hint muted" style="margin-top:4px">${esc(a.notes)}</div>` : "";
@@ -5337,10 +5915,11 @@ async function importAgent(id, dryRun) {
   if (!model) { toast("请先在当前路由里配置模型", "bad"); return; }
   const apiKey = (($("#agentApiKey") && $("#agentApiKey").value) || "llm-router").trim() || "llm-router";
   const baseUrl = (($("#agentBaseUrl") && $("#agentBaseUrl").value) || "").trim();
+  const pinDefault = !!($("#agentPinDefault") && $("#agentPinDefault").checked);
   agentImporting = true;
   try {
     const r = await api("/agents/configure", {
-      agent_id: id, model, api_key: apiKey, base_url: baseUrl, dry_run: !!dryRun
+      agent_id: id, model, api_key: apiKey, base_url: baseUrl, dry_run: !!dryRun, pin_default: pinDefault
     }, "POST");
     const keys = (r.changed_keys || []).map(k => `<code>${esc(k)}</code>`).join("、");
     const targetPaths = (r.config_paths && r.config_paths.length) ? r.config_paths : [r.config_path];
@@ -5358,6 +5937,7 @@ async function importAgent(id, dryRun) {
       </div>
       <div class="hint" style="margin-top:6px">写入位置：<code>${targetPaths.map(esc).join("</code>、<code>")}</code></div>
       ${keys ? `<div class="hint" style="margin-top:4px">写入键：${keys}</div>` : ""}
+      ${r.pinned_default ? `<div class="hint" style="margin-top:4px">已把 DSH 默认模型钉到 <code>llmrouter/${esc(r.model)}</code>（改的是 ~/.dsh/profiles/*/cordis.patch.yml 的 agent-default-model），重启 DeepSeek Harness 后生效。</div>` : ""}
       ${backup}
       ${preview}
     </div>`);
@@ -5633,6 +6213,376 @@ if (!AGENT_LOCAL) {
   if (card) card.style.display = "none";
 }
 
+/* ================= 图表：纯 SVG，无第三方依赖 ================= */
+const CHART_COLORS = { blue: "#4f9cf9", purple: "#c084fc", green: "#3fb950", warn: "#d29922", red: "#f85149", cyan: "#38bdf8" };
+let reqChartAt = 0;
+let reqChartBusy = false;
+
+function chartEmpty(host, msg) {
+  if (!host) return;
+  host.innerHTML = `<div class="chart-empty">${esc(msg || "没有数据")}</div>`;
+}
+function chartAxis(v) {
+  const n = Number(v) || 0;
+  if (n >= 1000000) return (n / 1000000).toFixed(n % 1000000 ? 1 : 0) + "M";
+  if (n >= 1000) return (n / 1000).toFixed(n % 1000 ? 1 : 0) + "k";
+  return String(Math.round(n * 10) / 10);
+}
+function chartMax(values) {
+  const max = Math.max(0, ...values.map(v => Number(v) || 0));
+  if (!max) return 1;
+  const p = Math.pow(10, Math.floor(Math.log10(max)));
+  const n = max / p;
+  const m = n <= 1 ? 1 : n <= 2 ? 2 : n <= 5 ? 5 : 10;
+  return m * p;
+}
+function chartMs(ms) {
+  const v = Number(ms);
+  if (!Number.isFinite(v) || v <= 0) return "—";
+  return v < 1000 ? Math.round(v) + "ms" : (v / 1000).toFixed(2) + "s";
+}
+function shortLabel(s, n) {
+  const t = String(s == null ? "" : s);
+  return t.length > n ? t.slice(0, n - 1) + "…" : t;
+}
+function chartLegend(series) {
+  return `<div class="chart-legend">${series.map(s => `<span><i style="background:${s.color}"></i>${esc(s.name)}</span>`).join("")}</div>`;
+}
+
+function lineChart(host, labels, series, opts = {}) {
+  if (!host) return;
+  const n = labels.length;
+  if (!n || !series.length) { chartEmpty(host); return; }
+  const W = 640, H = opts.height || 190;
+  const pad = { l: 44, r: 12, t: 12, b: 24 };
+  const iw = W - pad.l - pad.r, ih = H - pad.t - pad.b;
+  const max = chartMax(series.flatMap(s => s.values));
+  const x = i => n === 1 ? pad.l + iw / 2 : pad.l + (i * iw) / (n - 1);
+  const y = v => pad.t + ih - (Math.max(0, Number(v) || 0) / max) * ih;
+  let grid = "";
+  for (let g = 0; g <= 4; g++) {
+    const gy = pad.t + (ih * g) / 4;
+    grid += `<line x1="${pad.l}" x2="${W - pad.r}" y1="${gy}" y2="${gy}" stroke="rgba(255,255,255,.07)" stroke-width="1"/>`;
+    grid += `<text x="${pad.l - 6}" y="${gy + 3}" font-size="9" fill="#8b9bb0" text-anchor="end">${chartAxis(max - (max * g) / 4)}</text>`;
+  }
+  let paths = "";
+  series.forEach((s, si) => {
+    const color = s.color || CHART_COLORS.blue;
+    const pts = s.values.map((v, i) => `${x(i).toFixed(1)},${y(v).toFixed(1)}`);
+    if (!pts.length) return;
+    if (si === 0) {
+      const area = `M ${x(0).toFixed(1)} ${(pad.t + ih).toFixed(1)} L ${pts.join(" L ")} L ${x(n - 1).toFixed(1)} ${(pad.t + ih).toFixed(1)} Z`;
+      paths += `<path d="${area}" fill="${color}" fill-opacity=".10" class="chart-area"/>`;
+    }
+    paths += `<path d="M ${pts.join(" L ")}" fill="none" stroke="${color}" stroke-width="2" stroke-linejoin="round" stroke-linecap="round" class="chart-line" style="animation-delay:${si * 120}ms"/>`;
+    s.values.forEach((v, i) => {
+      paths += `<circle cx="${x(i).toFixed(1)}" cy="${y(v).toFixed(1)}" r="2.5" fill="${color}" class="chart-dot" style="animation-delay:${Math.min(700, 90 + i * 16)}ms"><title>${esc(labels[i])} · ${esc(s.name)}: ${chartAxis(v)}</title></circle>`;
+    });
+  });
+  let xl = "";
+  const step = Math.max(1, Math.ceil(n / 8));
+  labels.forEach((lab, i) => {
+    if (i % step !== 0 && i !== n - 1) return;
+    xl += `<text x="${x(i)}" y="${H - 6}" font-size="9" fill="#8b9bb0" text-anchor="middle">${esc(lab)}</text>`;
+  });
+  host.innerHTML = chartLegend(series) + `<svg class="chart-svg" viewBox="0 0 ${W} ${H}" role="img">${grid}${paths}${xl}</svg>`;
+}
+
+function waterfallChart(h) {
+  const total = Number(h && h.elapsed_seconds) || 0;
+  if (!(total > 0)) return `<div class="hint">这条请求没有耗时记录。</div>`;
+  const trail = Array.isArray(h.trail) ? h.trail.filter(Boolean) : [];
+  let segs = [];
+  if (trail.length) {
+    let used = 0;
+    trail.forEach((s, i) => {
+      const d = Number(s.elapsed_seconds) || 0;
+      used += d;
+      segs.push({
+        label: `${i + 1}. ${s.upstream || "-"}${s.model ? " · " + s.model : ""}`,
+        sec: d,
+        cls: s.ok ? "ok" : "bad",
+        status: s.status,
+        error: s.reason || s.error,
+      });
+    });
+    if (total > used + 0.02) segs.push({ label: "排队 / 收尾", sec: total - used, cls: "other" });
+    if (!used) segs = [];
+  }
+  if (!segs.length) {
+    const first = Number(h.first_chunk_seconds);
+    if (first > 0 && first < total - 0.02) {
+      segs = [{ label: "首字等待", sec: first, cls: "wait" }, { label: "生成", sec: total - first, cls: "gen" }];
+    } else {
+      segs = [{ label: "总耗时", sec: total, cls: h.ok ? "ok" : "bad" }];
+    }
+  }
+  const sum = segs.reduce((a, s) => a + (Number(s.sec) || 0), 0) || total;
+  const bars = segs.map(s => {
+    const pct = Math.max(0, (Number(s.sec) || 0) / sum * 100);
+    const tip = `${s.label} · ${fmtLat(s.sec)}${s.status != null ? " · " + s.status : ""}${s.error ? " · " + explainHttpError(s.error, s.status) : ""}`;
+    return `<span class="wf-seg ${s.cls}" style="width:${pct.toFixed(2)}%" title="${esc(tip)}">${pct >= 9 ? esc(shortLabel(s.label, 20)) : ""}</span>`;
+  }).join("");
+  const legend = segs.map(s => `<span><i style="background:${s.cls === "ok" ? "#3fb950" : s.cls === "bad" ? "#f85149" : s.cls === "wait" ? "#4f9cf9" : s.cls === "gen" ? "#c084fc" : "#6b7484"}"></i>${esc(shortLabel(s.label, 24))} ${fmtLat(s.sec)}</span>`).join("");
+  return `<div class="wf"><div class="wf-bar">${bars}</div><div class="wf-axis"><span>0</span><span>总耗时 ${fmtLat(total)}</span></div><div class="wf-legend">${legend}</div></div>`;
+}
+
+function histogramChart(host, bins) {
+  if (!host) return;
+  if (!bins || !bins.length) { chartEmpty(host); return; }
+  const W = 640, H = 190, pad = { l: 40, r: 8, t: 20, b: 26 };
+  const iw = W - pad.l - pad.r, ih = H - pad.t - pad.b;
+  const key = bins.map(b => String(b.label)).join("\u0001");
+  let svg = host.querySelector("svg.chart-svg");
+  // 结构不变时只更新每根柱子的几何属性，让浏览器做过渡，避免每次刷新整块重绘闪一下。
+  if (!svg || host._histKey !== key) {
+    host._histKey = key;
+    let grid = "";
+    for (let g = 0; g <= 4; g++) {
+      const gy = pad.t + (ih * g) / 4;
+      grid += `<line x1="${pad.l}" x2="${W - pad.r}" y1="${gy}" y2="${gy}" stroke="rgba(255,255,255,.07)" stroke-width="1"/>`;
+      grid += `<text class="hist-grid-label" data-g="${g}" x="${pad.l - 6}" y="${gy + 3}" font-size="9" fill="#8b9bb0" text-anchor="end"></text>`;
+    }
+    const bw0 = iw / bins.length;
+    let body = "";
+    bins.forEach((b, i) => {
+      const x = pad.l + i * bw0 + bw0 * 0.18;
+      const w = bw0 * 0.64;
+      body += `<rect class="chart-vbar hist-bar" data-i="${i}" x="${x.toFixed(1)}" y="${(pad.t + ih).toFixed(1)}" width="${w.toFixed(1)}" height="0.5" rx="3" fill="rgba(255,255,255,.12)"><title></title></rect>`;
+      body += `<text class="hist-count" data-i="${i}" font-size="9" fill="#8b9bb0" text-anchor="middle"></text>`;
+      body += `<text x="${(x + w / 2).toFixed(1)}" y="${H - 6}" font-size="8.5" fill="#8b9bb0" text-anchor="middle">${esc(b.label)}</text>`;
+    });
+    host.innerHTML = `<svg class="chart-svg" viewBox="0 0 ${W} ${H}" role="img">${grid}${body}</svg>`;
+    svg = host.querySelector("svg");
+  }
+  const max = chartMax(bins.map(b => b.count));
+  svg.querySelectorAll(".hist-grid-label").forEach((el, g) => {
+    el.textContent = chartAxis(max - (max * g) / 4);
+  });
+  const bw = iw / bins.length;
+  bins.forEach((b, i) => {
+    const v = Number(b.count) || 0;
+    const h = (v / max) * ih;
+    const x = pad.l + i * bw + bw * 0.18;
+    const w = bw * 0.64;
+    const y = pad.t + ih - h;
+    const rect = svg.querySelector(`rect.hist-bar[data-i="${i}"]`);
+    if (!rect) return;
+    rect.setAttribute("x", x.toFixed(1));
+    rect.setAttribute("y", Math.max(0, y).toFixed(1));
+    rect.setAttribute("width", w.toFixed(1));
+    rect.setAttribute("height", Math.max(0.5, h).toFixed(1));
+    rect.setAttribute("fill", v ? CHART_COLORS.cyan : "rgba(255,255,255,.12)");
+    let title = rect.querySelector("title");
+    if (!title) { title = document.createElementNS("http://www.w3.org/2000/svg", "title"); rect.appendChild(title); }
+    title.textContent = `${b.label}: ${fmtCount(v)}`;
+    const cnt = svg.querySelector(`.hist-count[data-i="${i}"]`);
+    if (cnt) {
+      cnt.setAttribute("x", (x + w / 2).toFixed(1));
+      cnt.setAttribute("y", Math.max(8, y - 4).toFixed(1));
+      cnt.textContent = v ? chartAxis(v) : "";
+    }
+  });
+}
+
+function barChart(host, rows, opts = {}) {
+  if (!host) return;
+  if (!rows || !rows.length) { chartEmpty(host, opts.empty || "没有数据"); return; }
+  const W = 640, rowH = opts.rowH || 22, labelW = opts.labelW || 138, valueW = 62;
+  const H = rows.length * rowH + 4;
+  const max = opts.max || chartMax(rows.map(r => r.value));
+  let body = "";
+  rows.forEach((r, i) => {
+    const cy = 4 + i * rowH + rowH / 2;
+    const bw = Math.max(0, (Number(r.value) || 0) / max * (W - labelW - valueW));
+    body += `<text x="${labelW - 8}" y="${cy + 3.5}" font-size="10.5" fill="#c7d3e2" text-anchor="end">${esc(shortLabel(r.label, opts.labelChars || 18))}</text>`;
+    body += `<rect x="${labelW}" y="${cy - 6}" width="${Math.max(1, bw).toFixed(1)}" height="12" rx="3" fill="${r.color || CHART_COLORS.blue}" class="chart-bar" style="animation-delay:${i * 38}ms"><title>${esc(r.title || r.label)}</title></rect>`;
+    body += `<text x="${(labelW + Math.max(1, bw) + 6).toFixed(1)}" y="${cy + 3.5}" font-size="10" fill="#8b9bb0">${esc(r.display == null ? chartAxis(r.value) : r.display)}</text>`;
+  });
+  host.innerHTML = `<svg class="chart-svg" viewBox="0 0 ${W} ${H}" role="img">${body}</svg>`;
+}
+
+function radarChart(host, axes, series) {
+  if (!host) return;
+  const n = axes.length;
+  if (!n || !series.length) { chartEmpty(host); return; }
+  const W = 640, H = 300, cx = 320, cy = 150, R = 96;
+  const pt = (i, r) => {
+    const a = -Math.PI / 2 + i * 2 * Math.PI / n;
+    return [cx + Math.cos(a) * r, cy + Math.sin(a) * r];
+  };
+  let g = "";
+  [0.25, 0.5, 0.75, 1].forEach(k => {
+    const pts = axes.map((_, i) => pt(i, R * k).map(v => v.toFixed(1)).join(",")).join(" ");
+    g += `<polygon points="${pts}" fill="none" stroke="rgba(255,255,255,.09)" stroke-width="1"/>`;
+  });
+  axes.forEach((ax, i) => {
+    const [x, y] = pt(i, R);
+    g += `<line x1="${cx}" y1="${cy}" x2="${x.toFixed(1)}" y2="${y.toFixed(1)}" stroke="rgba(255,255,255,.08)"/>`;
+    const [lx, ly] = pt(i, R + 22);
+    g += `<text x="${lx.toFixed(1)}" y="${(ly + 4).toFixed(1)}" font-size="10.5" fill="#8b9bb0" text-anchor="middle">${esc(ax)}</text>`;
+  });
+  series.forEach((s, si) => {
+    const pts = s.values.map((v, i) => pt(i, Math.max(2, R * Math.max(0, Math.min(100, Number(v) || 0)) / 100)).map(x => x.toFixed(1)).join(",")).join(" ");
+    g += `<polygon points="${pts}" fill="${s.color}" fill-opacity="${si ? 0.07 : 0.16}" stroke="${s.color}" stroke-width="1.8" class="radar-poly" style="animation-delay:${si * 110}ms"/>`;
+    s.values.forEach((v, i) => {
+      const [px, py] = pt(i, R * Math.max(0, Math.min(100, Number(v) || 0)) / 100);
+      g += `<circle cx="${px.toFixed(1)}" cy="${py.toFixed(1)}" r="2.5" fill="${s.color}"><title>${esc(axes[i])}: ${Math.round(v)}</title></circle>`;
+    });
+  });
+  host.innerHTML = chartLegend(series) + `<svg class="chart-svg" viewBox="0 0 ${W} ${H}" role="img">${g}</svg>`;
+}
+
+function reqRangeLabel(r) {
+  return r === "today" ? "今天 00:00 起" : r === "all" ? "全部（尾部缓存）" : String(r || "");
+}
+async function loadReqCharts(force) {
+  const host = $("#reqTrendChart");
+  if (!host || reqChartBusy) return;
+  if (!force && Date.now() - reqChartAt < 20000) return;
+  reqChartBusy = true;
+  try {
+    const range = $("#reqChartRange") ? $("#reqChartRange").value : "today";
+    const qs = range === "today" ? "range=today" : (range === "all" || range === "0" ? "range=all" : "hours=" + encodeURIComponent(range));
+    const d = await api("/stats/series?" + qs);
+    reqChartAt = Date.now();
+    renderReqCharts(d);
+  } catch (e) {
+    chartEmpty($("#reqTrendChart"), "图表加载失败：" + (e.message || e));
+  } finally {
+    reqChartBusy = false;
+  }
+}
+function renderReqCharts(d) {
+  const t = d.totals || {};
+  let buckets = d.buckets || [];
+  const firstIdx = buckets.findIndex(b => (b.calls || 0) > 0);
+  if (firstIdx > 2) buckets = buckets.slice(firstIdx - 2);
+  $("#reqChartMeta").textContent = `窗口 ${reqRangeLabel(d.range)} · ${fmtCount(t.calls)} 次调用 · 成功率 ${t.success_rate == null ? "—" : t.success_rate + "%"} · P50 ${chartMs(t.p50_ms)} · 首字 P50 ${chartMs(t.first_p50_ms)}`;
+  lineChart($("#reqTrendChart"), buckets.map(b => b.label), [
+    { name: "调用", values: buckets.map(b => b.calls || 0), color: CHART_COLORS.blue },
+    { name: "失败", values: buckets.map(b => b.failed || 0), color: CHART_COLORS.red },
+  ]);
+  histogramChart($("#reqHistChart"), d.histogram || []);
+  const models = (d.models || []).slice(0, 8).map(m => ({
+    label: m.model,
+    value: m.calls || 0,
+    display: fmtCount(m.calls),
+    title: `${m.model} · ${fmtCount(m.calls)} 次 · 输入 ${fmtNum(m.input)} / 输出 ${fmtNum(m.output)} · 平均 ${chartMs(m.avg_ms)}`,
+    color: CHART_COLORS.blue,
+  }));
+  barChart($("#reqModelChart"), models, { labelChars: 28, labelW: 210, rowH: 22 });
+}
+if ($("#reqChartRange")) $("#reqChartRange").onchange = () => loadReqCharts(true);
+if ($("#reqChartRefresh")) $("#reqChartRefresh").onclick = () => loadReqCharts(true);
+
+function healthSpeedScore(sec) {
+  const s = Number(sec);
+  if (!Number.isFinite(s) || s <= 0) return 0;
+  const lo = 0.3, hi = 20;
+  const v = (Math.log10(hi) - Math.log10(Math.max(lo, Math.min(hi, s)))) / (Math.log10(hi) - Math.log10(lo));
+  return Math.max(0, Math.min(100, v * 100));
+}
+function healthFirstScore(sec) {
+  const s = Number(sec);
+  if (!Number.isFinite(s) || s <= 0) return 0;
+  const lo = 0.2, hi = 10;
+  const v = (Math.log10(hi) - Math.log10(Math.max(lo, Math.min(hi, s)))) / (Math.log10(hi) - Math.log10(lo));
+  return Math.max(0, Math.min(100, v * 100));
+}
+function healthAxes(r) {
+  const p50 = Number(r.p50_seconds) || 0;
+  const p95 = Number(r.p95_seconds) || 0;
+  const stable = p50 > 0 && p95 > 0 ? Math.max(0, Math.min(100, 100 - (p95 / p50 - 1) * 28)) : (p50 > 0 ? 55 : 0);
+  const input = Number(r.input) || 0, cr = Number(r.cache_read) || 0, cw = Number(r.cache_write) || 0;
+  const cache = cr + cw + input > 0 ? Math.max(0, Math.min(100, cr / (cr + cw + input) * 100)) : 0;
+  return [Number(r.success_rate) || 0, healthSpeedScore(r.p50_seconds), healthFirstScore(r.first_chunk_p50_seconds), stable, cache];
+}
+function renderHealthCharts(d) {
+  const rows = (d.upstreams || []).filter(r => (r.calls || 0) > 0);
+  const barRows = rows.slice(0, 10).map(r => {
+    const rate = Number(r.success_rate) || 0;
+    return {
+      label: r.upstream || "(未命名)",
+      value: rate,
+      display: rate.toFixed(1) + "%",
+      title: `${r.upstream} · ${fmtCount(r.calls)} 次尝试 · 成功 ${fmtCount(r.ok)} / 失败 ${fmtCount(r.failed)} · P50 ${chartMs((r.p50_seconds || 0) * 1000)}`,
+      color: rate >= 95 ? CHART_COLORS.green : rate >= 80 ? CHART_COLORS.warn : CHART_COLORS.red,
+    };
+  });
+  barChart($("#healthBarChart"), barRows, { max: 100, labelChars: 16, empty: "这一窗口没有上游调用" });
+
+  const sel = $("#healthRadarUp");
+  if (!sel) return;
+  if (!rows.length) {
+    sel.innerHTML = "";
+    chartEmpty($("#healthRadarChart"), "这一窗口没有上游调用");
+    return;
+  }
+  const prev = sel.value;
+  sel.innerHTML = rows.map(r => `<option value="${esc(r.upstream || "")}">${esc(r.upstream || "(未命名)")}</option>`).join("");
+  if (prev && rows.some(r => (r.upstream || "") === prev)) sel.value = prev;
+  const chosen = rows.find(r => (r.upstream || "") === sel.value) || rows[0];
+  const axes = ["成功率", "响应速度", "首字速度", "稳定性", "缓存复用"];
+  const avg = [0, 0, 0, 0, 0];
+  rows.forEach(r => healthAxes(r).forEach((v, i) => { avg[i] += v / rows.length; }));
+  radarChart($("#healthRadarChart"), axes, [
+    { name: chosen.upstream || "(未命名)", values: healthAxes(chosen), color: CHART_COLORS.blue },
+    { name: "全部平均", values: avg, color: CHART_COLORS.purple },
+  ]);
+}
+if ($("#healthRadarUp")) $("#healthRadarUp").onchange = () => { if (healthData) renderHealthCharts(healthData); };
+
+let sessTools = null;
+let sessToolsSig = "";
+let toolsBusy = false;
+function renderTools() {
+  const meta = $("#sessToolMeta");
+  if (!meta) return;
+  if (!sessTools) { meta.textContent = "工具统计加载失败"; return; }
+  const t = sessTools;
+  const tot = t.totals || {};
+  const rows = t.rows || [];
+  meta.textContent = `窗口 ${reqRangeLabel(t.range)} · ${fmtCount(tot.calls)} 次工具调用 · ${fmtCount(tot.tools)} 个工具 · 成功率 ${tot.success_rate == null ? "—" : tot.success_rate + "%"} · 平均耗时 ${chartMs(tot.avg_ms)}`;
+  setTabNum("tools", tot.calls || 0, false, "工具调用次数");
+  const sig = JSON.stringify(rows.slice(0, 12).map(r => [r.name, r.calls, r.failed, r.avg_ms]));
+  if (sig !== sessToolsSig) {
+    sessToolsSig = sig;
+    barChart($("#sessToolChart"), rows.slice(0, 10).map(r => ({
+      label: r.name,
+      value: r.calls || 0,
+      display: fmtCount(r.calls),
+      title: `${r.name} · ${fmtCount(r.calls)} 次 · 失败 ${fmtCount(r.failed)} · 平均 ${chartMs(r.avg_ms)}`,
+      color: (r.failed || 0) > 0 ? CHART_COLORS.warn : CHART_COLORS.cyan,
+    })), { labelChars: 22, empty: "这一窗口没有工具调用" });
+    const byMs = rows.filter(r => (r.avg_ms || 0) > 0).slice().sort((a, b) => (b.avg_ms || 0) - (a.avg_ms || 0)).slice(0, 10);
+    barChart($("#sessToolChart2"), byMs.map(r => ({
+      label: r.name,
+      value: r.avg_ms || 0,
+      display: chartMs(r.avg_ms),
+      title: `${r.name} · 平均 ${chartMs(r.avg_ms)} · P50 ${chartMs(r.p50_ms)} / P95 ${chartMs(r.p95_ms)}`,
+      color: CHART_COLORS.purple,
+    })), { labelChars: 22, empty: "没有耗时数据" });
+  }
+  $("#sessToolRows").innerHTML = rows.length ? rows.map(r => {
+    const src = Object.entries(r.by_source || {}).map(([k, v]) => `<span class="badge">${k === "dsh" ? "DSH" : k === "claude" ? "Claude" : esc(k)} ${fmtCount(v)}</span>`).join(" ");
+    const errs = (r.errors || []).map(e => `${esc(e.message)}${e.count > 1 ? ` ×${e.count}` : ""}`).join("<br>");
+    return `<tr>
+      <td style="color:var(--fg)">${esc(r.name)}</td>
+      <td>${src || "—"}</td>
+      <td>${fmtCount(r.calls)}</td>
+      <td style="color:${r.failed ? "var(--bad)" : "var(--dim)"}">${fmtCount(r.failed)}</td>
+      <td>${r.success_rate == null ? "—" : r.success_rate + "%"}</td>
+      <td>${fmtCount(r.sessions)}</td>
+      <td>${chartMs(r.avg_ms)}</td>
+      <td>${chartMs(r.p50_ms)}</td>
+      <td>${chartMs(r.p95_ms)}</td>
+      <td style="color:var(--dim)">${sessAt(r.last_at)}</td>
+      <td style="color:var(--dim);max-width:280px;white-space:normal">${errs || "—"}</td>
+    </tr>`;
+  }).join("") : `<tr><td colspan="11" class="hint">这一窗口没有读到工具调用记录。</td></tr>`;
+}
+
 /* ================= 健康看板：按上游聚合成功率 / 分位延迟 / 冷却 ================= */
 let healthData = null;
 let healthBusy = false;
@@ -5655,14 +6605,18 @@ function renderHealth() {
   const t = d.totals || {};
   $("#healthThreshold").textContent = d.threshold ?? 3;
   $("#healthCooldown").textContent = d.cooldown_seconds ?? 60;
-  $("#healthMeta").textContent = `窗口 ${d.hours === 0 ? "全部" : d.hours + "h"} · 扫描 ${fmtCount(d.scanned)} 条 · 采用 ${fmtCount(d.kept)} 条 · ${d.generated_at || ""}`;
+  $("#healthMeta").textContent = `窗口 ${d.range === "today" ? "今天 00:00 起" : d.range === "all" || d.hours === 0 ? "全部" : d.hours + "h"} · 扫描 ${fmtCount(d.scanned)} 条 · 采用 ${fmtCount(d.kept)} 条 · ${d.generated_at || ""}`;
+  renderHealthCharts(d);
   $("#healthTotals").innerHTML = `<div class="tkn">
     ${healthCell("总尝试", fmtCount(t.calls))}
     ${healthCell("成功", fmtCount(t.ok), "var(--ok)")}
     ${healthCell("失败", fmtCount(t.failed), t.failed ? "var(--bad)" : "")}
     ${healthCell("成功率", healthPct(t.success_rate), "var(--accent)")}
+    ${healthCell("首字 P50", healthLat(t.first_chunk_p50_seconds))}
     ${healthCell("缓存读", fmtNum(t.cache_read))}
     ${healthCell("缓存写", fmtNum(t.cache_write))}
+    ${healthCell("输入", fmtNum(t.input))}
+    ${healthCell("输出", fmtNum(t.output))}
   </div>`;
 
   const onlyBad = $("#healthOnlyBad").value === "1";
@@ -5698,6 +6652,8 @@ function renderHealth() {
       <td>${healthLat(m.p50_seconds)}</td>
       <td>${healthLat(m.p95_seconds)}</td>
       <td>${healthLat(m.first_chunk_p50_seconds)}</td>
+      <td>${fmtNum(m.cache_read)}</td>
+      <td>${fmtNum(m.cache_write)}</td>
     </tr>`).join("");
     return `<div class="card" style="margin-top:10px;padding:12px">
       <div class="row" style="flex-wrap:wrap;gap:8px;align-items:center">
@@ -5726,9 +6682,9 @@ function renderHealth() {
       ${open ? `<div style="margin-top:10px;overflow-x:auto">
         <table class="mono" style="width:100%;font-size:12px;border-collapse:collapse">
           <thead><tr style="text-align:left;color:var(--dim)">
-            <th>模型</th><th>尝试</th><th>成功</th><th>失败</th><th>成功率</th><th>P50</th><th>P95</th><th>首字 P50</th>
+            <th>模型</th><th>尝试</th><th>成功</th><th>失败</th><th>成功率</th><th>P50</th><th>P95</th><th>首字 P50</th><th>缓存读</th><th>缓存写</th>
           </tr></thead>
-          <tbody>${modelRows || `<tr><td colspan="8" class="hint">该窗口没有按模型的记录</td></tr>`}</tbody>
+          <tbody>${modelRows || `<tr><td colspan="10" class="hint">该窗口没有按模型的记录</td></tr>`}</tbody>
         </table>
       </div>` : ""}
     </div>`;
@@ -5739,8 +6695,9 @@ async function loadHealth() {
   if (healthBusy) return;
   healthBusy = true;
   try {
-    const hours = $("#healthHours") ? $("#healthHours").value : "24";
-    const d = await api("/health/upstreams?hours=" + encodeURIComponent(hours));
+    const hours = $("#healthHours") ? $("#healthHours").value : "today";
+    const qs = hours === "today" ? "range=today" : "hours=" + encodeURIComponent(hours);
+    const d = await api("/health/upstreams?" + qs);
     healthData = d;
     renderHealth();
   } catch (e) {
@@ -5782,6 +6739,315 @@ $("#healthList").addEventListener("click", e => {
 if (!AGENT_LOCAL) {
   const hb = document.querySelector('#tabs .tab[data-tab="health"]');
   if (hb) hb.style.display = "none";
+}
+
+/* ================= 会话对账：读各家 Agent 会话记录，找没走本机路由的调用 ================= */
+let sessData = null;
+let sessBusy = false;
+
+function sessAt(ms) {
+  if (!ms) return "—";
+  const d = new Date(ms);
+  return Number.isNaN(d.getTime()) ? "—" : d.toLocaleString("zh-CN", { hour12: false });
+}
+function sessSourceMeta(source) {
+  const map = {
+    dsh: { label: "DeepSeek Harness", letter: "D", hue: 214 },
+    claude: { label: "Claude Code", letter: "C", hue: 276 },
+    pi: { label: "Pi", letter: "P", hue: 146 },
+    codex: { label: "Codex", letter: "X", hue: 28 },
+  };
+  return map[source] || { label: source || "未知", letter: String(source || "?").slice(0, 1).toUpperCase(), hue: 210 };
+}
+function sessDuration(ms) {
+  if (!ms || ms < 0) return "—";
+  const sec = Math.round(ms / 1000);
+  if (sec < 60) return sec + "s";
+  const min = Math.round(sec / 60);
+  if (min < 60) return min + "m";
+  const h = Math.floor(min / 60), m = min % 60;
+  return h + "h" + (m ? " " + m + "m" : "");
+}
+function sessStat(label, value, sub, tone, icon) {
+  return `<div class="sess-stat ${tone || ""}">
+    <span class="sess-stat-icon">${icon || "•"}</span>
+    <div class="sess-stat-body"><b>${value == null ? "—" : value}</b><span>${label}</span>${sub ? `<small>${sub}</small>` : ""}</div>
+  </div>`;
+}
+function sessSources() {
+  const ids = [];
+  if ($("#sessSrcDsh") && $("#sessSrcDsh").checked) ids.push("dsh");
+  if ($("#sessSrcClaude") && $("#sessSrcClaude").checked) ids.push("claude");
+  if ($("#sessSrcPi") && $("#sessSrcPi").checked) ids.push("pi");
+  if ($("#sessSrcCodex") && $("#sessSrcCodex").checked) ids.push("codex");
+  return ids;
+}
+function sessRow(r) {
+  const meta = sessSourceMeta(r.source);
+  const routed = r.routed
+    ? `<span class="sess-route ok"><i></i>走路由</span>`
+    : `<span class="sess-route bad"><i></i>未走路由</span>`;
+  return `<tr>
+    <td><span class="sess-src"><span class="sess-src-dot" style="--h:${meta.hue}">${meta.letter}</span><b title="${esc(r.agent || meta.label)}">${esc(r.agent || meta.label)}</b></span></td>
+    <td><code class="sess-code provider" title="${esc(r.provider || "-")}">${esc(r.provider || "-")}</code></td>
+    <td><code class="sess-code" title="${esc(r.model || "-")}">${esc(r.model || "-")}</code></td>
+    <td><span class="sess-url" title="${esc(r.base_url || "")}">${r.base_url ? esc(r.base_url) : `<span class="hint">未知</span>`}</span></td>
+    <td>${routed}</td>
+    <td class="num">${fmtCount(r.rounds)}</td>
+    <td class="num">${fmtNum(r.input)}</td>
+    <td class="num">${fmtNum(r.output)}</td>
+    <td class="num">${fmtNum(r.cache_read)}</td>
+    <td class="num">${fmtNum(r.cache_write)}</td>
+    <td class="sess-timecell"><span title="首次 ${esc(sessAt(r.first_ms))}">${sessAt(r.first_ms)}</span><span title="最近 ${esc(sessAt(r.last_ms))}">${sessAt(r.last_ms)}</span></td>
+  </tr>`;
+}
+
+function sessItem(s) {
+  const meta = sessSourceMeta(s.source);
+  const total = s.rounds || 0, ext = s.external_rounds || 0, routed = s.routed_rounds || 0;
+  const pct = total ? (routed / total) * 100 : 0;
+  const dur = sessDuration((s.ended_ms || 0) - (s.started_ms || 0));
+  const models = (s.external_models || []).slice(0, 6).map(m =>
+    `<span class="sess-model-chip" title="${esc(m.label)} · ${fmtCount(m.rounds)} 轮">${esc(m.label)} · ${fmtCount(m.rounds)}</span>`
+  ).join("");
+  const paths = (s.cwd || s.path) ? `<div class="sess-path">
+    ${s.cwd ? `<span title="${esc(s.cwd)}">${esc(s.cwd)}</span>` : ""}
+    ${s.path ? `<span title="${esc(s.path)}">${esc(s.path)}</span>` : ""}
+  </div>` : "";
+  return `<div class="sess-item ${ext ? "bad" : "ok"}">
+    <div class="sess-item-head">
+      <span class="sess-src-dot" style="--h:${meta.hue}">${meta.letter}</span>
+      <b>${esc(s.agent || meta.label)}</b>
+      <span class="badge blue">${esc(s.project || "(未知项目)")}</span>
+      ${ext ? `<span class="sess-route bad"><i></i>未走路由 ${fmtCount(ext)} 轮</span>` : `<span class="sess-route ok"><i></i>全部走路由</span>`}
+      <span class="sess-item-time">最近 ${sessAt(s.ended_ms)}</span>
+    </div>
+    <div class="sess-item-stats">
+      <div class="sess-item-stat"><b>${fmtCount(total)}</b><span>总轮数</span></div>
+      <div class="sess-item-stat ok"><b>${pct.toFixed(1)}%</b><span>路由覆盖</span></div>
+      <div class="sess-item-stat ${ext ? "bad" : ""}"><b>${fmtCount(ext)}</b><span>未走路由</span></div>
+      <div class="sess-item-stat"><b>${dur}</b><span>会话时长</span></div>
+    </div>
+    ${models ? `<div class="sess-item-models"><span class="hint" style="font-size:9.5px">外部模型</span>${models}</div>` : ""}
+    ${paths}
+  </div>`;
+}
+
+function renderSessions() {
+  if (!sessData) return;
+  const d = sessData;
+  const t = d.totals || {};
+  const e = d.external_totals || {};
+  const j = d.journal || {};
+  const total = Number(t.rounds) || 0;
+  const ext = Number(e.rounds) || 0;
+  const routed = Math.max(0, total - ext);
+  const coverage = total ? (routed / total) * 100 : 0;
+  const extPct = total ? (ext / total) * 100 : 0;
+  const sessRange = d.range === "today" ? "今天 00:00 起" : (d.range === "all" || d.window_hours <= 0 ? "全部" : d.window_hours + "h");
+  const auto = sessRefreshSeconds();
+  const autoHint = $("#sessAutoHint");
+  if (autoHint) autoHint.textContent = String(auto);
+
+  $("#sessMeta").innerHTML = [
+    ["窗口", sessRange],
+    ["Provider/模型", fmtCount(d.rows_total) + " 个"],
+    ["会话", fmtCount(d.sessions_total) + " 个"],
+    ["用时", (d.elapsed_ms || 0) + "ms"],
+    ["扫描于", sessAt(d.generated_at)],
+    ["自动刷新", auto + "s"],
+  ].map(([k, v]) => `<span><i>${k}</i><b>${esc(v)}</b></span>`).join("");
+
+  const health = $("#sessHealth");
+  if (health) {
+    health.className = "sess-pill " + (ext ? "bad" : "ok");
+    health.textContent = total ? (ext ? `外部 ${fmtCount(ext)} 轮 · ${extPct.toFixed(1)}%` : "全部走路由") : "暂无记录";
+  }
+
+  $("#sessTotals").innerHTML = [
+    sessStat("会话调用轮数", fmtCount(total), "所有数据源合计", "accent", "◷"),
+    sessStat("未走路由", fmtCount(ext), total ? `占 ${extPct.toFixed(1)}%` : "—", ext ? "bad" : "ok", "⇄"),
+    sessStat("路由覆盖", total ? coverage.toFixed(1) + "%" : "—", `走路由 ${fmtCount(routed)} 轮`, "ok", "✓"),
+    sessStat("输入 tokens", fmtNum(t.input), "会话记录累计", "", "↓"),
+    sessStat("输出 tokens", fmtNum(t.output), "会话记录累计", "", "↑"),
+    sessStat("缓存读", fmtNum(t.cache_read), "prompt cache hit", "", "◈"),
+    sessStat("缓存写", fmtNum(t.cache_write), "prompt cache write", "", "▣"),
+    sessStat("本机流水轮数", fmtCount(j.rounds), j.rounds ? `输入 ${fmtNum(j.input)}` : "窗口内无流水", "accent", "⌁"),
+  ].join("");
+
+  const gap = total - (j.rounds || 0);
+  const jLine = j.rounds
+    ? `本机 8010 流水 ${fmtCount(j.rounds)} 轮（输入 ${fmtNum(j.input)} / 输出 ${fmtNum(j.output)}）`
+    : `本机 8010 流水这一窗口没有记录（${esc(j.path || "config.history.jsonl")}）`;
+  const byModel = (j.by_model || []).slice(0, 5).map(m =>
+    `<code>${esc(m.model)} · ${fmtCount(m.rounds)} 轮</code>`
+  ).join("");
+  $("#sessCompare").innerHTML = `
+    <div class="sess-compare-top">
+      <b>路由覆盖</b>
+      <span class="hint">会话记录 ${fmtCount(total)} 轮 · ${jLine}${gap > 0 ? ` · 相差 ${fmtCount(gap)} 轮` : ""}</span>
+      <div class="sess-compare-legend">
+        <span><i class="ok"></i>走路由 ${fmtCount(routed)} 轮</span>
+        <span><i class="bad"></i>未走路由 ${fmtCount(ext)} 轮</span>
+      </div>
+    </div>
+    <div class="sess-ratio">
+      <span class="ok" style="width:${coverage.toFixed(2)}%"></span>
+      <span class="bad" style="width:${(100 - coverage).toFixed(2)}%"></span>
+    </div>
+    <div class="sess-compare-foot"><span><b>${coverage.toFixed(1)}%</b> 经过本机路由</span><span><b>${extPct.toFixed(1)}%</b> 绕过</span></div>
+    ${byModel ? `<div class="sess-compare-note"><span>流水模型 Top</span>${byModel}</div>` : ""}`;
+
+  const srcs = d.sources || [];
+  $("#sessSources").innerHTML = srcs.length
+    ? srcs.map(s => {
+        const meta = sessSourceMeta(s.id);
+        const active = (s.rounds || 0) > 0;
+        const skipped = s.skipped_old ? ` · 跳过 ${fmtCount(s.skipped_old)} 个旧文件` : "";
+        return `<div class="sess-source ${active ? "" : "off"}">
+          <div class="sess-source-top"><span class="sess-src-dot" style="--h:${meta.hue}">${meta.letter}</span><b>${esc(s.name || meta.label)}</b><span class="sess-source-rounds">${fmtCount(s.rounds)} 轮</span></div>
+          <div class="sess-source-meta">${fmtCount(s.files)} 文件 · ${fmtCount(s.sessions)} 会话 · ${fmtBytes(s.bytes || 0)} · ${fmtCount(s.ms || 0)}ms${s.truncated ? " · 只读尾部" : ""}${skipped}</div>
+          <div class="sess-source-path" title="${esc(s.root || "")}">${esc(s.root || "")}${s.note ? ` · ${esc(s.note)}` : ""}</div>
+        </div>`;
+      }).join("")
+    : `<div class="sess-empty">没有启用的数据源。</div>`;
+
+  setTabNum("sessions", ext, ext > 0, "窗口内没走本机路由的调用轮数");
+
+  const onlyExt = $("#sessOnlyExternal") && $("#sessOnlyExternal").checked;
+  const needle = ($("#sessSearch") && $("#sessSearch").value || "").trim().toLowerCase();
+  let rows = (d.rows || []).slice();
+  if (onlyExt) rows = rows.filter(r => !r.routed);
+  if (needle) rows = rows.filter(r => [r.agent, r.source, r.provider, r.model, r.base_url].join(" ").toLowerCase().includes(needle));
+  $("#sessRowsMeta").textContent = `${fmtCount(rows.length)} / ${fmtCount(d.rows_total || 0)} 行`;
+  $("#sessRows").innerHTML = rows.length
+    ? rows.map(sessRow).join("")
+    : `<tr><td colspan="11" class="sess-empty">没有匹配的记录，试试换个筛选条件。</td></tr>`;
+
+  let sess = (d.sessions || []).slice();
+  if (onlyExt) sess = sess.filter(s => (s.external_rounds || 0) > 0);
+  if (needle) sess = sess.filter(s => [s.agent, s.source, s.project, s.cwd, s.path].concat((s.external_models || []).map(m => m.label)).join(" ").toLowerCase().includes(needle));
+  $("#sessListMeta").textContent = `${fmtCount(sess.length)} / ${fmtCount(d.sessions_total || 0)} 个`;
+  $("#sessList").innerHTML = sess.length
+    ? sess.map(sessItem).join("")
+    : `<div class="sess-empty">这一筛选下没有会话记录。</div>`;
+}
+
+async function loadSessions() {
+  if (sessBusy) return;
+  sessBusy = true;
+  const btn = $("#sessReload");
+  if (btn) btn.classList.add("busy");
+  const meta = $("#sessMeta");
+  if (meta) meta.textContent = "正在扫描会话记录…";
+  try {
+    const win = $("#sessHours") ? $("#sessHours").value : "today";
+    const src = sessSources();
+    if (!src.length) {
+      $("#sessRows").innerHTML = `<tr><td colspan="11" class="sess-empty">至少要勾一个数据源。</td></tr>`;
+      $("#sessList").innerHTML = `<div class="sess-empty">至少要勾一个数据源。</div>`;
+      $("#sessTotals").innerHTML = "";
+      $("#sessCompare").innerHTML = "";
+      $("#sessSources").innerHTML = "";
+      return;
+    }
+    const qs = new URLSearchParams({ sources: src.join(","), limit: "200" });
+    if (win === "today") qs.set("range", "today");
+    else qs.set("hours", win);
+    const d = await api("/sessions/scan?" + qs.toString());
+    sessData = d;
+    renderSessions();
+  } catch (e) {
+    $("#sessRows").innerHTML = `<tr><td colspan="11" class="sess-empty" style="color:var(--bad)">会话扫描失败：${esc(e.message || e)}</td></tr>`;
+    if (meta) meta.textContent = "会话扫描失败：" + (e.message || e);
+  } finally {
+    sessBusy = false;
+    if (btn) btn.classList.remove("busy");
+  }
+}
+
+function toolSources() {
+  const ids = [];
+  if ($("#toolSrcDsh") && $("#toolSrcDsh").checked) ids.push("dsh");
+  if ($("#toolSrcClaude") && $("#toolSrcClaude").checked) ids.push("claude");
+  return ids;
+}
+async function loadTools() {
+  if (toolsBusy) return;
+  toolsBusy = true;
+  const meta = $("#sessToolMeta");
+  const win = $("#toolHours") ? $("#toolHours").value : "today";
+  const src = toolSources();
+  if (!src.length) {
+    if (meta) meta.textContent = "至少要勾一个数据源。";
+    toolsBusy = false;
+    return;
+  }
+  if (meta) meta.textContent = "正在统计工具调用…";
+  try {
+    const qs = new URLSearchParams({ sources: src.join(","), limit: "200" });
+    if (win === "today") qs.set("range", "today");
+    else qs.set("hours", win);
+    sessTools = await api("/sessions/tools?" + qs.toString());
+    renderTools();
+  } catch (e) {
+    if (meta) meta.textContent = "工具统计加载失败：" + (e.message || e);
+  } finally {
+    toolsBusy = false;
+  }
+}
+if ($("#toolReload")) $("#toolReload").onclick = () => loadTools();
+if ($("#toolHours")) $("#toolHours").onchange = () => loadTools();
+["toolSrcDsh", "toolSrcClaude"].forEach(id => {
+  const el = document.getElementById(id);
+  if (el) el.onchange = () => loadTools();
+});
+
+if ($("#sessReload")) $("#sessReload").onclick = () => loadSessions();
+if ($("#sessHours")) $("#sessHours").onchange = () => loadSessions();
+["sessSrcDsh", "sessSrcClaude", "sessSrcPi", "sessSrcCodex"].forEach(id => {
+  const el = document.getElementById(id);
+  if (el) el.onchange = () => loadSessions();
+});
+if ($("#sessOnlyExternal")) $("#sessOnlyExternal").onchange = () => renderSessions();
+if ($("#sessSearch")) $("#sessSearch").oninput = () => renderSessions();
+
+// 自动刷新：跟随「设置 → 界面刷新 → 会话对账刷新间隔」（默认 5 秒）；只在本页可见且没有正在扫描时执行。
+let sessTimer = null;
+function applySessAuto() {
+  if (sessTimer) { clearInterval(sessTimer); sessTimer = null; }
+  if (!AGENT_LOCAL) return;
+  const hint = $("#sessAutoHint");
+  if (hint) hint.textContent = String(sessRefreshSeconds());
+  const ms = Math.max(1000, sessRefreshSeconds() * 1000);
+  sessTimer = setInterval(() => {
+    if (document.hidden || sessBusy) return;
+    const pane = document.getElementById("pane-sessions");
+    if (!pane || pane.hidden) return;
+    loadSessions();
+  }, ms);
+}
+applySessAuto();
+
+// MCP 工具页也按会话对账的间隔自动刷新（它同样只是只读统计文件）。
+let toolsTimer = null;
+function applyToolsAuto() {
+  if (toolsTimer) { clearInterval(toolsTimer); toolsTimer = null; }
+  if (!AGENT_LOCAL) return;
+  const ms = Math.max(1000, sessRefreshSeconds() * 1000);
+  toolsTimer = setInterval(() => {
+    if (document.hidden || toolsBusy) return;
+    const pane = document.getElementById("pane-tools");
+    if (!pane || pane.hidden) return;
+    loadTools();
+  }, ms);
+}
+applyToolsAuto();
+if (!AGENT_LOCAL) {
+  ["sessions", "tools"].forEach(t => {
+    const sb = document.querySelector('#tabs .tab[data-tab="' + t + '"]');
+    if (sb) sb.style.display = "none";
+  });
 }
 
 (async function boot() {

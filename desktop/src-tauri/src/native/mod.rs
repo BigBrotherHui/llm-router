@@ -3,10 +3,12 @@ pub mod agents;
 pub mod anthropic;
 pub mod checkin;
 pub mod health;
+pub mod insights;
 pub mod journal;
 pub mod proxy;
 pub mod relay;
 pub mod scheduler;
+pub mod sessions;
 pub mod state;
 pub mod stats;
 pub mod transfer;
@@ -165,8 +167,12 @@ pub async fn serve(state: Arc<AppState>, port: u16) -> Result<(), String> {
         .route("/data/summary", get(transfer::summary))
         .route("/data/export", post(transfer::export_data))
         .route("/data/import", post(transfer::import_data))
+        .route("/stats/series", get(insights::series))
         .route("/health/upstreams", get(health::report))
         .route("/health/upstreams/clear", post(health::clear))
+        .route("/sessions/scan", get(sessions::scan))
+        .route("/sessions/bases", get(sessions::bases))
+        .route("/sessions/tools", get(sessions::tools))
         .layer(DefaultBodyLimit::max(64 * 1024 * 1024))
         .layer(CompressionLayer::new().compress_when(
             DefaultPredicate::new().and(NotForContentType::new("text/event-stream")),

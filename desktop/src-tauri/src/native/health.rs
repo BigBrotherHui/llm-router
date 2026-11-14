@@ -8,6 +8,7 @@ use axum::extract::{Query, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::Json;
+use chrono::Timelike;
 use serde_json::{json, Value};
 
 use super::state::AppState;
@@ -59,6 +60,24 @@ struct Agg {
 }
 
 impl Agg {
+    /// 把另一个聚合的计数与分位样本并进来（用于总览）。
+    fn merge(&mut self, o: &Agg) {
+        self.calls += o.calls;
+        self.ok += o.ok;
+        self.failed += o.failed;
+        self.attempts += o.attempts;
+        self.stream += o.stream;
+        self.cache_read += o.cache_read;
+        self.cache_write += o.cache_write;
+        self.input += o.input;
+        self.output += o.output;
+        self.latencies.extend_from_slice(&o.latencies);
+        self.first_chunks.extend_from_slice(&o.first_chunks);
+        if o.last_at > self.last_at {
+            self.last_at = o.last_at;
+        }
+    }
+
     fn add(&mut self, e: &Value, model: &str) {
         self.calls += 1;
         if e.get("ok").and_then(|v| v.as_bool()).unwrap_or(false) {
@@ -176,15 +195,37 @@ pub async fn report(
         .and_then(|s| s.parse::<f64>().ok())
         .unwrap_or(24.0)
         .max(0.0);
+    let has_hours = q.contains_key("hours");
+    let mut range = q
+        .get("range")
+        .map(|s| s.trim().to_ascii_lowercase())
+        .unwrap_or_default();
+    // 默认看「今天」：既没传 range 也没传 hours 时按本机时区当天 00:00 起算。
+    if range.is_empty() && !has_hours {
+        range = "today".to_string();
+    }
     let limit: usize = q
         .get("limit")
         .and_then(|s| s.parse::<usize>().ok())
         .unwrap_or(4000)
         .min(20000);
-    let cutoff = if hours > 0.0 {
-        chrono::Utc::now().timestamp() as f64 - hours * 3600.0
-    } else {
-        0.0
+    // range=today 按本机时区当天 00:00 起算；range=all 不按时间过滤；否则用滚动小时窗。
+    let (cutoff, range_label) = match range.as_str() {
+        "today" => {
+            let now = chrono::Local::now();
+            let secs = now.time().num_seconds_from_midnight() as f64
+                + now.time().nanosecond() as f64 / 1_000_000_000.0;
+            (now.timestamp() as f64 - secs, "today".to_string())
+        }
+        "all" => (0.0, "all".to_string()),
+        _ => (
+            if hours > 0.0 {
+                chrono::Utc::now().timestamp() as f64 - hours * 3600.0
+            } else {
+                0.0
+            },
+            format!("{hours}h"),
+        ),
     };
 
     let entries = super::journal::recent(&state);
@@ -205,7 +246,15 @@ pub async fn report(
         // 每次尝试都算一次上游调用：trail 里逐条聚合，成功率按尝试粒度更真实。
         if let Some(trail) = e.get("trail").and_then(|v| v.as_array()) {
             if !trail.is_empty() {
-                for t in trail {
+                // 整条请求的 usage / 首字只属于「真正把这次请求服务完」的那次尝试（最后一次成功，
+                // 全失败时取最后一次），否则按尝试平摊会把缓存读写算丢。
+                let mut served = trail.len() - 1;
+                for (i, t) in trail.iter().enumerate() {
+                    if t.get("ok").and_then(|v| v.as_bool()).unwrap_or(false) {
+                        served = i;
+                    }
+                }
+                for (i, t) in trail.iter().enumerate() {
                     let name = t
                         .get("upstream")
                         .and_then(|v| v.as_str())
@@ -225,6 +274,14 @@ pub async fn report(
                     if t.get("status").and_then(|v| v.as_u64()).unwrap_or(200) >= 400 {
                         one["ok"] = json!(false);
                     }
+                    if i == served {
+                        one["usage"] = e.get("usage").cloned().unwrap_or(Value::Null);
+                        one["first_chunk_seconds"] = e
+                            .get("first_chunk_seconds")
+                            .cloned()
+                            .unwrap_or(Value::Null);
+                        one["stream"] = e.get("stream").cloned().unwrap_or(Value::Null);
+                    }
                     by_upstream.entry(name.clone()).or_default().add(&one, model);
                 }
                 continue;
@@ -237,6 +294,12 @@ pub async fn report(
             .to_string();
         let model = e.get("model").and_then(|v| v.as_str()).unwrap_or("");
         by_upstream.entry(name).or_default().add(e, model);
+    }
+
+    // 总览用合并后的聚合（分位数要基于原始样本，不能从每行的 P50 再平均）。
+    let mut total_agg = Agg::default();
+    for a in by_upstream.values() {
+        total_agg.merge(a);
     }
 
     let file = state.file.read().unwrap();
@@ -283,31 +346,15 @@ pub async fn report(
         })
     });
 
-    let totals = rows.iter().fold(Agg::default(), |mut acc, r| {
-        acc.calls += r.get("calls").and_then(|v| v.as_i64()).unwrap_or(0);
-        acc.ok += r.get("ok").and_then(|v| v.as_i64()).unwrap_or(0);
-        acc.failed += r.get("failed").and_then(|v| v.as_i64()).unwrap_or(0);
-        acc.attempts += r.get("attempts").and_then(|v| v.as_i64()).unwrap_or(0);
-        acc.cache_read += r.get("cache_read").and_then(|v| v.as_i64()).unwrap_or(0);
-        acc.cache_write += r.get("cache_write").and_then(|v| v.as_i64()).unwrap_or(0);
-        acc
-    });
-
     ok(json!({
         "ok": true,
         "hours": hours,
+        "range": range_label,
+        "since": if cutoff > 0.0 { json!(cutoff) } else { Value::Null },
         "scanned": scanned,
         "kept": kept,
-        "generated_at": chrono::Utc::now().to_rfc3339(),
-        "totals": {
-            "calls": totals.calls,
-            "ok": totals.ok,
-            "failed": totals.failed,
-            "attempts": totals.attempts,
-            "success_rate": if totals.calls > 0 { Some(round3(totals.ok as f64 / totals.calls as f64 * 100.0)) } else { None },
-            "cache_read": totals.cache_read,
-            "cache_write": totals.cache_write,
-        },
+        "generated_at": chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string(),
+        "totals": total_agg.json(),
         "threshold": super::state::FAILURE_THRESHOLD,
         "cooldown_seconds": super::state::COOLDOWN_SECONDS,
         "upstreams": rows,
