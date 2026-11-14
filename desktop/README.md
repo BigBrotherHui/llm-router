@@ -11,10 +11,14 @@
 - `GET /v1/models`
 - `POST /v1/chat/completions`：按 priority / round_robin / random 路由，失败自动换下一家，
   非流式与 SSE 流式都支持，响应里的 `model` 会改回客户端请求的名字
+- `POST /v1/messages`：Anthropic 协议适配，Claude Code 等 Agent 直接把
+  `ANTHROPIC_BASE_URL` 指到本服务即可（非流式 + SSE 事件流）
 - `GET /health`
 - `GET /stats`：复用现有 webui.html 的统计结构（读取 `config.stats.json`）
 - 管理接口：上游增删改、拉取模型、勾选模型、分组映射、模型路由保存/删除/排序/额度、
   默认参数、测速、请求流水查询
+- 本机 Agent 扫描与一键接入：`GET /agents`、`GET /agents/scan`、
+  `POST /agents/configure`、`POST /agents/restore`（内置规则 + npm 全局包动态发现，Pi 双文件写入）
 - 启动页 / 移动端「服务地址」连接
 
 ## 目录
@@ -25,7 +29,7 @@ desktop/
 └─ src-tauri/
    ├─ src/main.rs                # 入口
    ├─ src/lib.rs                 # Tauri 生命周期 + 内嵌 HTTP 服务启动
-   ├─ src/native/                # Rust 原生后端（state / proxy / admin / stats / journal）
+   ├─ src/native/                # Rust 原生后端（state / proxy / admin / agents / anthropic / stats / journal）
    ├─ tauri.conf.json
    └─ capabilities/default.json
 ```
@@ -48,6 +52,46 @@ npm run build
 ```powershell
 npm run dev
 ```
+
+## 本机 Agent 接入
+
+控制台左侧「本机 Agent」页（只在 `127.0.0.1` / `localhost` / 桌面壳 `?native=1` 下显示，
+中继页面不显示）扫描 PATH、常见安装目录、配置目录、VS Code 扩展、开始菜单快捷方式，
+**并且动态遍历 npm 全局包目录**（`%APPDATA%\npm\node_modules` 等，读每个 `package.json` 的
+`name` / `version` / `bin` / `keywords`）——所以 Pi、Amp、Droid、Crush、Kilo Code、
+CodeBuddy、Auggie、Copilot CLI、Command Code、OpenClaw 这类后来才装的 CLI 不用改代码也能被列出来。
+已登记的 npm 包会与内置规则合并成一张卡片，未登记但像 coding agent 的包按「自动发现」列出：
+
+| Agent | 写入位置 | 协议 |
+| --- | --- | --- |
+| Claude Code | `~/.claude/settings.json` 的 `env.ANTHROPIC_*` | Anthropic `/v1/messages` |
+| Codex CLI | `~/.codex/config.toml` 的 `model_providers.llm-router` | OpenAI `/v1/chat/completions` |
+| Aider | `~/.aider.conf.yml` | OpenAI |
+| Qwen Code | `~/.qwen/settings.json` 的 `env.OPENAI_*` | OpenAI |
+| OpenCode | `opencode.json` 的 `provider.llm-router` | OpenAI |
+| Continue | `~/.continue/config.json` 的 `models[0]` | OpenAI |
+| Cline / Roo Code | VS Code `settings.json` 的 `cline.*` / `roo-cline.*` | OpenAI |
+| **Pi (Coding Agent)** | `~/.pi/agent/models.json` 的 `providers.llm-router` + `settings.json` 的 `defaultProvider` / `defaultModel` | OpenAI `openai-completions` |
+| Gemini CLI / Cursor / Windsurf / Trae / Goose / ZCode / Kimi Code / 其它 npm CLI | 只识别，不自动写入 | 用「复制通用配置」手动填 |
+
+Pi 的一键导入会同时改两个文件（可用 `PI_CODING_AGENT_DIR` 改配置目录）：
+`models.json` 里新增 `api: "openai-completions"` 的 `llm-router` provider，`baseUrl` 带 `/v1`；
+`settings.json` 把默认模型切到当前路由里选中的那个。两个文件各自备份，恢复时一起还原。
+
+用法：
+
+1. 打开「本机 Agent」→「重新扫描」，列表里会标出识别依据（`npm 全局包 …@版本` / `命令 …` /
+   `可执行文件 …` / `配置 …` / `开始菜单 …`）和当前配置；可用「只看已识别」与搜索框过滤。
+2. 在「导入模型」里选一个当前 `/v1/models` 里的模型（和「模型路由」页同源）。
+3. 点某个 Agent 的「一键导入此 Agent」，或先选中再点右上角「一键导入选中 Agent」。
+   勾「只预览，不写文件」可先看生成内容；正式写入前每个文件都会在同目录生成
+   `<原文件名>.llmrouter.bak`，点「恢复原配置」即可还原（Pi 会还原两个文件）。
+4. 「复制通用配置」把 `OPENAI_*` / `ANTHROPIC_*` 环境变量复制到剪贴板，给未适配自动写入的 Agent 用。
+
+路由 `/v1/*` 不校验客户端 API Key，配置里用占位 Key `llm-router` 即可；
+真正的上游 Key 仍在状态文件里由服务端管理。Claude Code 走 Anthropic 协议，
+所以 `ANTHROPIC_BASE_URL` 要填不带 `/v1` 的地址（`http://127.0.0.1:8010`），
+其余 OpenAI 兼容 Agent 填带 `/v1` 的地址（`http://127.0.0.1:8010/v1`）。
 
 ## 窗口行为
 
@@ -81,6 +125,7 @@ npm run dev
 已实现：上游增删改 / 拉取模型 / 勾选与分组 / 模型路由保存、排序、额度 / 默认参数 /
 测速（短请求）/ `/stats` 统计读取 / 请求流水查询 / `/v1/models` /
 `/v1/chat/completions`（priority、round_robin、random，流式 + 失败切换 + 模型名回写）/
+`/v1/messages`（Anthropic 适配 + SSE）/ 本机 Agent 扫描、一键导入、备份恢复 /
 签到页配置读取与保存 + New API / One API 常见签到路径 + 每日自动签到调度
 （基准时刻 + 随机窗口，服务重启后当天未签会补签）。
 

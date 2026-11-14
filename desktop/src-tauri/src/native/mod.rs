@@ -1,4 +1,6 @@
 pub mod admin;
+pub mod agents;
+pub mod anthropic;
 pub mod checkin;
 pub mod journal;
 pub mod proxy;
@@ -152,6 +154,11 @@ pub async fn serve(state: Arc<AppState>, port: u16) -> Result<(), String> {
         .route("/admin/history", get(admin::journal_query))
         .route("/v1/models", get(proxy::list_models))
         .route("/v1/chat/completions", post(proxy::chat_completions))
+        .route("/v1/messages", post(anthropic::messages))
+        .route("/agents", get(agents::list))
+        .route("/agents/scan", get(agents::list))
+        .route("/agents/configure", post(agents::configure))
+        .route("/agents/restore", post(agents::restore))
         .layer(DefaultBodyLimit::max(64 * 1024 * 1024))
         .layer(CompressionLayer::new().compress_when(
             DefaultPredicate::new().and(NotForContentType::new("text/event-stream")),

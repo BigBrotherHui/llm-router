@@ -491,6 +491,9 @@
     <button class="tab" data-tab="model" role="tab" aria-selected="false">
       <span>模型路由</span><span class="n" id="tabN-model" title="已配置路由的模型个数"></span>
     </button>
+    <button class="tab" data-tab="agent" role="tab" aria-selected="false">
+      <span>本机 Agent</span><span class="n" id="tabN-agent" title="已识别的本机 Agent 数"></span>
+    </button>
     <button class="tab" data-tab="ck" role="tab" aria-selected="false">
       <span>签到</span><span class="n" id="tabN-ck" title="今天已签到的上游数"></span>
     </button>
@@ -616,6 +619,52 @@
         </div>
 
         <div id="models"></div>
+      </div>
+    </section>
+
+    <!-- ============ 本机 Agent 接入 ============ -->
+    <section class="pane" id="pane-agent" role="tabpanel" hidden>
+      <div class="card">
+        <h2>本机 Agent 接入</h2>
+        <div class="hint" style="margin:-6px 0 12px">
+          扫描这台电脑上已安装的编码 Agent：内置规则 + npm 全局包目录（读 <code>package.json</code> 的 bin/keywords）+ 开始菜单 / 常见配置目录。
+          选中一个当前路由里的模型，一键写入它的配置文件；Pi 会同时写 <code>models.json</code> 与 <code>settings.json</code>。
+          写入前每个文件都会生成 <code>.llmrouter.bak</code> 备份，随时可以点「恢复原配置」还原。
+          路由不校验客户端 Key，下面的 Key 只作占位。
+        </div>
+
+        <div class="row" style="flex-wrap:wrap;gap:8px;align-items:flex-end">
+          <label class="hint" style="display:flex;flex-direction:column;gap:4px">
+            Base URL
+            <input id="agentBaseUrl" class="mono" style="min-width:260px" placeholder="http://127.0.0.1:8010/v1">
+          </label>
+          <label class="hint" style="display:flex;flex-direction:column;gap:4px">
+            占位 API Key
+            <input id="agentApiKey" class="mono" style="min-width:160px" value="llm-router">
+          </label>
+          <label class="hint" style="display:flex;flex-direction:column;gap:4px">
+            导入模型
+            <select id="agentModel" class="mono" style="min-width:220px"></select>
+          </label>
+          <label class="hint" style="display:flex;gap:6px;align-items:center;padding-bottom:6px">
+            <input type="checkbox" id="agentDryRun"> 只预览，不写文件
+          </label>
+          <label class="hint" style="display:flex;gap:6px;align-items:center;padding-bottom:6px">
+            <input type="checkbox" id="agentOnlyDetected" checked> 只看已识别
+          </label>
+          <label class="hint" style="display:flex;flex-direction:column;gap:4px">
+            搜索 Agent
+            <input id="agentSearch" class="mono" style="min-width:170px" placeholder="Pi / amp / claude …">
+          </label>
+          <div class="grow"></div>
+          <button id="agentRescan">重新扫描</button>
+          <button id="agentImport" class="primary">一键导入选中 Agent</button>
+          <button id="agentCopy">复制通用配置</button>
+          <button id="agentRestore">恢复原配置</button>
+        </div>
+
+        <div id="agentResult" style="margin-top:10px"></div>
+        <div id="agentList" style="margin-top:10px"></div>
       </div>
     </section>
 
@@ -1051,6 +1100,9 @@
 const $ = s => document.querySelector(s);
 // 手机链路挂在 opencode-web 的 /llm/ 反代下时，API 走同一前缀（同源才能复用推送）
 const apiBase = location.pathname.startsWith("/llm") ? "/llm" : "";
+// 本机 / 桌面控制台才显示「本机 Agent」页：中继页没有这些本地接口。
+const AGENT_LOCAL = ["127.0.0.1", "localhost", "[::1]", "::1"].includes(location.hostname)
+  || new URLSearchParams(location.search).has("native");
 let state = null;
 let pageVersion = null;  // 服务端版本号，变了就自动重载（避免旧 JS 配新后端）
 let editing = null;      // { name, strategy, picks:[{id,name,hasModel,model,enabled}] }
@@ -3674,14 +3726,17 @@ async function ensureEntryText(at, upstream) {
 }
 
 /* ================= 左侧 tab：请求记录 / 上游来源 / 模型路由 ================= */
-const TABS = ["req", "up", "model", "ck", "set", "log"];
-const TAB_LABEL = { req: "请求记录", up: "上游来源", model: "模型路由", ck: "签到", set: "设置", log: "日志" };
+const TABS = ["req", "up", "model", "agent", "ck", "set", "log"];
+const TAB_LABEL = { req: "请求记录", up: "上游来源", model: "模型路由", agent: "本机 Agent", ck: "签到", set: "设置", log: "日志" };
 let curTab = null;
 
 function setTab(name) {
+  // 中继页面没有本地 /agents 接口，回退到请求记录
+  if (name === "agent" && !AGENT_LOCAL) name = "req";
   const tab = TABS.includes(name) ? name : "req";
   TABS.forEach(t => {
     const btn = document.querySelector(`#tabs .tab[data-tab="${t}"]`);
+    if (!btn) return;
     const on = t === tab;
     btn.classList.toggle("active", on);
     btn.setAttribute("aria-selected", on ? "true" : "false");
@@ -3695,6 +3750,8 @@ function setTab(name) {
   }
   // 切到签到：立刻拉一次表格（不靠 2.5 秒轮询等）
   if (tab === "ck") loadCheckin();
+  // 切到本机 Agent：扫一次本机安装情况
+  if (tab === "agent") loadAgents();
   // 换 tab 时回到顶部，免得带着上一屏的滚动位置落进新内容中间
   if (curTab !== null && curTab !== tab) window.scrollTo(0, 0);
   curTab = tab;
@@ -5025,6 +5082,235 @@ function applyJournalDelta(entry) {
   lastSideHash = "";
   renderSide();
   renderTabNums();
+}
+
+/* ================= 本机 Agent 接入 ================= */
+let agentData = null;
+let agentSelected = null;
+let agentLoading = false;
+let agentImporting = false;
+
+function agentResultHtml(inner) {
+  const box = $("#agentResult");
+  if (box) box.innerHTML = inner;
+}
+
+async function loadAgents() {
+  if (!AGENT_LOCAL || agentLoading) return;
+  const list = $("#agentList");
+  if (!list) return;
+  agentLoading = true;
+  agentResultHtml('<div class="hint muted">正在扫描本机 Agent…</div>');
+  try {
+    const data = await api("/agents", undefined, "GET");
+    agentData = data;
+    const models = data.models || [];
+    const sel = $("#agentModel");
+    const prev = sel.value;
+    sel.innerHTML = models.map(m => `<option value="${esc(m)}">${esc(m)}</option>`).join("");
+    if (prev && models.includes(prev)) sel.value = prev;
+    else if (models.length) sel.value = models[0];
+    const base = $("#agentBaseUrl");
+    if (base && !base.dataset.touched) base.value = data.base_url || "";
+    const key = $("#agentApiKey");
+    if (key && !key.dataset.touched && !key.value) key.value = "llm-router";
+    if (!agentSelected) {
+      const first = (data.agents || []).find(a => a.detected && a.configurable)
+                 || (data.agents || []).find(a => a.configurable);
+      if (first) agentSelected = first.id;
+    }
+    renderAgents();
+    const all = data.agents || [];
+    const n = all.filter(a => a.detected).length;
+    const auto = all.filter(a => (a.source || "").includes("npm 全局包")).length;
+    const canWrite = all.filter(a => a.detected && a.configurable).length;
+    setTabNum("agent", n, false, `识别到 ${n} 个本机 Agent`);
+    agentResultHtml(`<div class="hint muted">扫描于 ${esc(data.scan_at || "")} · 本机端口 ${esc(data.port || "")} · 当前路由 ${models.length} 个模型 · 共 ${all.length} 个候选（npm 包动态发现 ${auto} 个）· 已识别且可一键导入 ${canWrite} 个</div>`);
+  } catch (e) {
+    agentResultHtml(`<div class="hint" style="color:var(--bad)">扫描失败：${esc(e.message || e)}</div>`);
+  } finally {
+    agentLoading = false;
+  }
+}
+
+function renderAgents() {
+  const list = $("#agentList");
+  if (!list || !agentData) return;
+  const q = (($("#agentSearch") && $("#agentSearch").value) || "").trim().toLowerCase();
+  const onlyDetected = !$("#agentOnlyDetected") || $("#agentOnlyDetected").checked;
+  const all = agentData.agents || [];
+  const agents = all.filter(a => {
+    if (onlyDetected && !a.detected) return false;
+    if (!q) return true;
+    const hay = [a.id, a.name, a.kind, a.pkg, a.version, a.bin, a.source, a.config_path,
+                 (a.config_paths || []).join(" "), (a.detected_by || []).join(" ")]
+                .filter(Boolean).join(" ").toLowerCase();
+    return hay.includes(q);
+  });
+  if (!agents.length) {
+    list.innerHTML = `<div class="hint muted">没有匹配的 Agent（共扫描 ${all.length} 个）。试试清空搜索或取消「只看已识别」。</div>`;
+    return;
+  }
+  list.innerHTML = agents.map(a => {
+    const detected = !!a.detected;
+    const sel = agentSelected === a.id;
+    const badges = [
+      a.source ? `<span class="badge">${esc(a.source)}</span>` : "",
+      a.pkg ? `<span class="badge mono">${esc(a.pkg)}${a.version ? "@" + esc(a.version) : ""}</span>` : "",
+      a.bin ? `<span class="badge mono">${esc(a.bin)}</span>` : "",
+    ].concat((a.detected_by || []).map(x => `<span class="badge">${esc(x)}</span>`)).filter(Boolean).join(" ");
+    const paths = (a.config_paths && a.config_paths.length > 1) ? a.config_paths : [a.config_path];
+    const cur = [];
+    if (a.current_model) cur.push(`模型 <code>${esc(a.current_model)}</code>`);
+    if (a.current_base) cur.push(`地址 <code>${esc(a.current_base)}</code>`);
+    if (a.connected) cur.push('<span style="color:var(--ok)">已指向 llm-router</span>');
+    const notes = a.notes ? `<div class="hint muted" style="margin-top:4px">${esc(a.notes)}</div>` : "";
+    const actions = a.configurable
+      ? `<div class="row" style="gap:8px;align-items:center;margin-top:8px">
+           <label class="hint" style="display:flex;gap:6px;align-items:center">
+             <input type="radio" name="agentPick" data-act="pick" data-id="${esc(a.id)}" ${sel ? "checked" : ""}> 选中
+           </label>
+           <button data-act="import" data-id="${esc(a.id)}" ${detected ? "" : "disabled"} title="${detected ? "一键写入该 Agent 配置" : "未检测到安装"}">一键导入此 Agent</button>
+         </div>`
+      : '<div class="hint muted" style="margin-top:8px">仅识别，请用「复制通用配置」手动填写</div>';
+    return `<div class="card" data-agent="${esc(a.id)}" style="margin:0 0 10px;${sel ? "border-color:var(--accent)" : ""}">
+      <div class="row" style="gap:8px;align-items:center">
+        <strong>${esc(a.name)}</strong>
+        <span class="badge" style="${detected ? "color:var(--ok)" : ""}">${detected ? "已识别" : "未检测到"}</span>
+        <span class="badge">${esc(a.kind)}</span>
+        <div class="grow"></div>
+        ${badges}
+      </div>
+      <div class="hint mono" style="margin-top:6px">${paths.map(p => esc(p)).join("<br>")}</div>
+      ${cur.length ? `<div class="hint" style="margin-top:4px">${cur.join(" · ")}</div>` : ""}
+      ${notes}
+      ${actions}
+    </div>`;
+  }).join("");
+}
+
+async function importAgent(id, dryRun) {
+  if (!AGENT_LOCAL || agentImporting) return;
+  const model = $("#agentModel") && $("#agentModel").value;
+  if (!model) { toast("请先在当前路由里配置模型", "bad"); return; }
+  const apiKey = (($("#agentApiKey") && $("#agentApiKey").value) || "llm-router").trim() || "llm-router";
+  const baseUrl = (($("#agentBaseUrl") && $("#agentBaseUrl").value) || "").trim();
+  agentImporting = true;
+  try {
+    const r = await api("/agents/configure", {
+      agent_id: id, model, api_key: apiKey, base_url: baseUrl, dry_run: !!dryRun
+    }, "POST");
+    const keys = (r.changed_keys || []).map(k => `<code>${esc(k)}</code>`).join("、");
+    const targetPaths = (r.config_paths && r.config_paths.length) ? r.config_paths : [r.config_path];
+    const backupPaths = (r.backup_paths && r.backup_paths.length)
+      ? r.backup_paths : (r.backup_path ? [r.backup_path] : []);
+    const backup = backupPaths.length
+      ? `<div class="hint" style="margin-top:4px">备份：<code>${backupPaths.map(esc).join("</code>、<code>")}</code></div>` : "";
+    const preview = r.preview != null
+      ? `<pre class="mono" style="max-height:260px;overflow:auto;background:var(--bg);padding:8px;border:1px solid var(--line);border-radius:6px;white-space:pre-wrap">${esc(r.preview)}</pre>` : "";
+    agentResultHtml(`<div class="card" style="margin:0">
+      <div class="row" style="gap:8px;align-items:center">
+        <strong>${esc(r.name || id)}</strong>
+        <span class="badge" style="color:${r.dry_run ? "var(--accent)" : "var(--ok)"}">${r.dry_run ? "预览（未写文件）" : "已写入"}</span>
+        <span class="badge">${esc(r.model)}</span>
+      </div>
+      <div class="hint" style="margin-top:6px">写入位置：<code>${targetPaths.map(esc).join("</code>、<code>")}</code></div>
+      ${keys ? `<div class="hint" style="margin-top:4px">写入键：${keys}</div>` : ""}
+      ${backup}
+      ${preview}
+    </div>`);
+    toast(r.dry_run ? "已生成预览（未写入）" : "配置已写入，可用「恢复原配置」还原", r.dry_run ? "" : "ok");
+    if (!r.dry_run) await loadAgents();
+  } catch (e) {
+    agentResultHtml(`<div class="hint" style="color:var(--bad)">导入失败：${esc(e.message || e)}</div>`);
+    toast("导入失败：" + (e.message || e), "bad");
+  } finally {
+    agentImporting = false;
+  }
+}
+
+$("#agentRescan").onclick = () => loadAgents();
+$("#agentBaseUrl").addEventListener("input", e => { e.target.dataset.touched = "1"; });
+$("#agentApiKey").addEventListener("input", e => { e.target.dataset.touched = "1"; });
+$("#agentModel").addEventListener("change", () => renderAgents());
+$("#agentSearch").addEventListener("input", () => renderAgents());
+$("#agentOnlyDetected").addEventListener("change", () => renderAgents());
+$("#agentImport").onclick = () => {
+  const fallback = agentData && (agentData.agents || []).find(a => a.detected && a.configurable);
+  const id = agentSelected || (fallback && fallback.id);
+  if (!id) { toast("请先选中一个可配置的 Agent", "bad"); return; }
+  importAgent(id, $("#agentDryRun").checked);
+};
+$("#agentList").addEventListener("click", ev => {
+  const el = ev.target.closest("[data-act]");
+  if (!el) {
+    const card = ev.target.closest("[data-agent]");
+    if (!card) return;
+    const radio = card.querySelector('input[data-act="pick"]');
+    if (radio) {
+      radio.checked = true;
+      agentSelected = radio.dataset.id;
+      renderAgents();
+    }
+    return;
+  }
+  const id = el.dataset.id;
+  if (!id) return;
+  if (el.dataset.act === "pick") {
+    agentSelected = id;
+    renderAgents();
+  } else if (el.dataset.act === "import") {
+    agentSelected = id;
+    importAgent(id, $("#agentDryRun").checked);
+  }
+});
+$("#agentCopy").onclick = async () => {
+  const model = $("#agentModel").value || (agentData && agentData.models && agentData.models[0]) || "";
+  const key = (($("#agentApiKey").value || "llm-router").trim()) || "llm-router";
+  let base = (($("#agentBaseUrl").value || (agentData && agentData.base_url) || "http://127.0.0.1:8010/v1").trim());
+  while (base.endsWith("/")) base = base.slice(0, -1);
+  const origin = base.endsWith("/v1") ? base.slice(0, -3) : base;
+  const openaiBase = base.endsWith("/v1") ? base : base + "/v1";
+  const text = [
+    "# OpenAI 兼容 Agent",
+    `export OPENAI_BASE_URL="${openaiBase}"`,
+    `export OPENAI_API_KEY="${key}"`,
+    `export OPENAI_MODEL="${model}"`,
+    "",
+    "# Claude Code / Anthropic 协议 Agent",
+    `export ANTHROPIC_BASE_URL="${origin}"`,
+    `export ANTHROPIC_AUTH_TOKEN="${key}"`,
+    `export ANTHROPIC_MODEL="${model}"`,
+    `export ANTHROPIC_SMALL_FAST_MODEL="${model}"`,
+  ].join("\n");
+  try {
+    await navigator.clipboard.writeText(text);
+    toast("通用配置已复制到剪贴板", "ok");
+  } catch (e) {
+    agentResultHtml(`<pre class="mono" style="background:var(--bg);padding:8px;border:1px solid var(--line);border-radius:6px;white-space:pre-wrap">${esc(text)}</pre>`);
+    toast("剪贴板不可用，已显示在结果区", "bad");
+  }
+};
+$("#agentRestore").onclick = async () => {
+  if (!agentSelected) { toast("请先选中一个 Agent", "bad"); return; }
+  try {
+    const r = await api("/agents/restore", { agent_id: agentSelected }, "POST");
+    const restored = (r.restored_files && r.restored_files.length) ? r.restored_files : [r.config_path];
+    agentResultHtml(`<div class="card" style="margin:0">
+      <div class="row" style="gap:8px"><strong>${esc(r.agent_id)}</strong>
+        <span class="badge" style="color:var(--ok)">已恢复 ${restored.length} 个文件</span></div>
+      <div class="hint" style="margin-top:6px">从 <code>${esc(r.restored_from)}</code> 还原：<code>${restored.map(esc).join("</code>、<code>")}</code></div>
+    </div>`);
+    toast("原配置已恢复", "ok");
+    await loadAgents();
+  } catch (e) {
+    agentResultHtml(`<div class="hint" style="color:var(--bad)">恢复失败：${esc(e.message || e)}</div>`);
+    toast("恢复失败：" + (e.message || e), "bad");
+  }
+};
+if (!AGENT_LOCAL) {
+  const b = document.querySelector('#tabs .tab[data-tab="agent"]');
+  if (b) b.style.display = "none";
 }
 
 (async function boot() {
