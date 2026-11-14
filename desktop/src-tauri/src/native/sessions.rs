@@ -36,6 +36,137 @@ const SESSION_LIMIT: usize = 60;
 static TODAY_CACHE: OnceLock<Mutex<Option<(Instant, TodayTotals)>>> = OnceLock::new();
 static LAST_ROUND_CACHE: OnceLock<Mutex<Option<(Instant, Value)>>> = OnceLock::new();
 
+/// Magpie 网关自报的每轮实测值（ttft_ms / ms），按「输入 + 输出 + 缓存读」指纹索引。
+/// 我们的会话记录里没有「网关收包」时刻，只能靠它把 magpie 口径对齐到面板上的数。
+struct MagpieSnap {
+    at: Instant,
+    map: HashMap<String, (f64, f64)>,
+}
+static MAGPIE_SNAP: OnceLock<Mutex<Option<MagpieSnap>>> = OnceLock::new();
+static MAGPIE_BUSY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+fn magpie_key(input: u64, output: u64, cache_read: u64) -> String {
+    format!("{input}|{output}|{cache_read}")
+}
+
+fn refresh_magpie() {
+    let client = match reqwest::blocking::Client::builder()
+        .timeout(Duration::from_secs(8))
+        .build()
+    {
+        Ok(c) => c,
+        Err(_) => return,
+    };
+    // 单页最多 500 条，用 offset 往回翻；最多翻 8 页（4000 条）够覆盖一两天的量。
+    const PAGE: usize = 500;
+    const MAX_PAGES: usize = 8;
+    let mut all: Vec<Value> = Vec::new();
+    for page in 0..MAX_PAGES {
+        let url = format!(
+            "http://127.0.0.1:3425/v1/magpie/usage/requests?limit={PAGE}&offset={}",
+            page * PAGE
+        );
+        let resp = match client
+            .get(&url)
+            .header("Authorization", "Bearer magpie")
+            .header("Accept-Encoding", "identity")
+            .send()
+        {
+            Ok(r) => r,
+            Err(_) => break,
+        };
+        if !resp.status().is_success() {
+            break;
+        }
+        let text = match resp.text() {
+            Ok(t) => t,
+            Err(_) => break,
+        };
+        let v: Value = match serde_json::from_str(&text) {
+            Ok(v) => v,
+            Err(_) => break,
+        };
+        let rows = match v.get("rows").and_then(|r| r.as_array()) {
+            Some(r) => r,
+            None => break,
+        };
+        let empty = rows.is_empty();
+        let short = rows.len() < PAGE;
+        all.extend(rows.iter().cloned());
+        if empty || short {
+            break;
+        }
+        if let Some(total) = v.get("total").and_then(|t| t.as_u64()) {
+            if all.len() as u64 >= total {
+                break;
+            }
+        }
+    }
+    if all.is_empty() {
+        return;
+    }
+    let mut map: HashMap<String, (f64, f64)> = HashMap::new();
+    for r in all.iter() {
+        let input = r.get("in").and_then(|x| x.as_u64());
+        let output = r.get("out").and_then(|x| x.as_u64());
+        let cache_read = r.get("cache_read").and_then(|x| x.as_u64()).unwrap_or(0);
+        let ttft = r.get("ttft_ms").and_then(|x| x.as_f64());
+        let ms = r.get("ms").and_then(|x| x.as_f64());
+        if let (Some(i), Some(o), Some(t), Some(m)) = (input, output, ttft, ms) {
+            if o > 0 {
+                map.insert(magpie_key(i, o, cache_read), (t, m));
+                if let Some(sid) = r.get("session").and_then(|x| x.as_str()) {
+                    map.insert(format!("{sid}|{}", magpie_key(i, o, cache_read)), (t, m));
+                }
+            }
+        }
+    }
+    if let Some(cell) = MAGPIE_SNAP.get() {
+        if let Ok(mut g) = cell.lock() {
+            *g = Some(MagpieSnap {
+                at: Instant::now(),
+                map,
+            });
+        }
+    }
+}
+
+/// 返回 Magpie 实测值快照；过期就在后台线程刷一次（本机网关没开时返回空表，不报错）。
+pub fn magpie_offsets() -> HashMap<String, (f64, f64)> {
+    let cell = MAGPIE_SNAP.get_or_init(|| Mutex::new(None));
+    let stale = {
+        match cell.lock() {
+            Ok(g) => match g.as_ref() {
+                Some(s) => s.at.elapsed().as_secs() >= 30,
+                None => true,
+            },
+            Err(_) => false,
+        }
+    };
+    if stale {
+        let cold = {
+            match cell.lock() {
+                Ok(g) => g.is_none(),
+                Err(_) => false,
+            }
+        };
+        if cold {
+            // 冷启动（进程刚起来 / 还没任何快照）：同步拉一次，否则第一次扫描会全部退回 step 口径。
+            // 一次 HTTP 到本机 3425，几十毫秒，可以接受。
+            refresh_magpie();
+        } else if !MAGPIE_BUSY.swap(true, std::sync::atomic::Ordering::SeqCst) {
+            std::thread::spawn(|| {
+                refresh_magpie();
+                MAGPIE_BUSY.store(false, std::sync::atomic::Ordering::SeqCst);
+            });
+        }
+    }
+    match cell.lock() {
+        Ok(g) => g.as_ref().map(|s| s.map.clone()).unwrap_or_default(),
+        Err(_) => HashMap::new(),
+    }
+}
+
 fn ok(v: Value) -> Response {
     Json(v).into_response()
 }
@@ -87,6 +218,16 @@ pub struct ScanQuery {
     pub sources: Option<String>,
     /// 明细行上限
     pub limit: Option<usize>,
+    /// 路由范围：all（默认）/ routed（只走过本机路由）/ external（只未走本机路由）
+    pub route: Option<String>,
+    pub day: Option<String>,
+    pub month: Option<String>,
+    pub group: Option<String>,
+    pub upstream: Option<String>,
+    pub model: Option<String>,
+    pub offset: Option<usize>,
+    /// 首字 / 耗时口径：happycoding（默认）/ magpie / dsh
+    pub metric: Option<String>,
 }
 
 /// HUD 用的“今日全部流量”快照：包含所有 Agent 会话，不只是经过 llm-router 的部分。
@@ -477,8 +618,31 @@ struct Ctx<'a> {
     bases: &'a HashMap<String, String>,
     port: u16,
     since_ms: i64,
+    route_filter: u8,
+    metric: u8,
+    /// magpie 口径用：网关实测值快照，每次扫描只取一次
+    magpie: HashMap<String, (f64, f64)>,
     aggs: &'a mut AggMap,
     sessions: &'a mut SessList,
+    records: Option<&'a mut Vec<Value>>,
+}
+
+/// 0 = 全部，1 = 只走过本机路由，2 = 只未走本机路由。
+pub fn route_filter(v: Option<&str>) -> u8 {
+    match v.unwrap_or("").trim().to_ascii_lowercase().as_str() {
+        "routed" | "router" | "llmrouter" | "yes" | "true" => 1,
+        "external" | "unrouted" | "direct" | "no" | "false" => 2,
+        _ => 0,
+    }
+}
+
+/// 首字 / 耗时口径：0 = happycoding（默认），1 = magpie，2 = dsh（当前方案）
+pub fn metric_mode(v: Option<&str>) -> u8 {
+    match v.unwrap_or("").trim().to_ascii_lowercase().as_str() {
+        "magpie" => 1,
+        "dsh" | "step" | "native" | "current" => 2,
+        _ => 0,
+    }
 }
 
 impl<'a> Ctx<'a> {
@@ -493,7 +657,38 @@ impl<'a> Ctx<'a> {
         at_ms: i64,
         usage: [u64; 5],
         duration_ms: Option<f64>,
+        first_chunk_ms: Option<f64>,
+        header_ms: Option<f64>,
     ) {
+        // magpie 口径：会话记录里没有「网关收包」时刻，但 Magpie 自己的用量日志有。
+        // 走 Magpie 的请求按 token 指纹（输入 / 输出 / 缓存读）对账，对上就直接用网关实测值。
+        let mut duration_ms = duration_ms;
+        let mut first_chunk_ms = first_chunk_ms;
+        let mut metric_source = "step";
+        if self.metric == 1 && source == "dsh" {
+            if let Some(h) = header_ms {
+                metric_source = "header";
+                if let Some(d) = duration_ms.as_mut() {
+                    *d = (*d - h).max(0.0);
+                }
+                if let Some(f) = first_chunk_ms.as_mut() {
+                    *f = (*f - h).max(0.0);
+                }
+            }
+            if usage[1] > 0 {
+                let key = magpie_key(usage[0], usage[1], usage[2]);
+                let hit = self
+                    .magpie
+                    .get(&format!("{}|{key}", sess.id))
+                    .or_else(|| self.magpie.get(&key))
+                    .copied();
+                if let Some((ttft, ms)) = hit {
+                    first_chunk_ms = Some(ttft);
+                    duration_ms = Some(ms);
+                    metric_source = "magpie";
+                }
+            }
+        }
         let provider = if provider.trim().is_empty() {
             "(未记录)"
         } else {
@@ -512,6 +707,9 @@ impl<'a> Ctx<'a> {
             .unwrap_or_default();
         let routed = is_router_name(provider)
             || (!base.is_empty() && is_router_url(&base, self.port));
+        if (self.route_filter == 1 && !routed) || (self.route_filter == 2 && routed) {
+            return;
+        }
         let key = format!("{source}\u{1}{provider}\u{1}{model}");
         let label = format!("{provider}/{model}");
         bump(
@@ -552,6 +750,39 @@ impl<'a> Ctx<'a> {
                 sess.ended_ms = at_ms;
             }
         }
+        if let Some(records) = self.records.as_deref_mut() {
+            let time = chrono::Local
+                .timestamp_millis_opt(at_ms)
+                .single()
+                .map(|t| t.format("%Y-%m-%d %H:%M:%S").to_string())
+                .unwrap_or_default();
+            let secs = duration_ms.map(|ms| ms / 1000.0).unwrap_or(0.0);
+            records.push(json!({
+                "at": at_ms as f64 / 1000.0,
+                "time": time,
+                "model": model,
+                "effective_model": model,
+                "upstream": provider,
+                "upstream_id": base,
+                "ok": true,
+                "status": 200,
+                "elapsed_seconds": if duration_ms.is_some() { json!(secs) } else { Value::Null },
+                "first_chunk_seconds": first_chunk_ms.map(|ms| json!(ms / 1000.0)).unwrap_or(Value::Null),
+                "request_header_seconds": header_ms.map(|ms| json!(ms / 1000.0)).unwrap_or(Value::Null),
+                "metric_source": metric_source,
+                "stream": false,
+                "usage": {
+                    "input": usage[0], "output": usage[1], "total": usage[4],
+                    "cache_read": usage[2], "cache_write": usage[3]
+                },
+                "trail": [{
+                    "upstream": provider, "model": model, "ok": true, "status": 200,
+                    "elapsed_seconds": if duration_ms.is_some() { json!(secs) } else { Value::Null }
+                }],
+                "source": source, "agent": agent, "session_id": sess.id,
+                "project": sess.project, "routed": routed
+            }));
+        }
     }
 }
 
@@ -585,7 +816,7 @@ pub fn today_totals(port: u16) -> TodayTotals {
     let mut aggs: AggMap = HashMap::new();
     let mut sessions: SessList = Vec::new();
     {
-        let mut ctx = Ctx { bases: &bases, port, since_ms, aggs: &mut aggs, sessions: &mut sessions };
+        let mut ctx = Ctx { bases: &bases, port, since_ms, route_filter: 0, metric: 0, magpie: HashMap::new(), aggs: &mut aggs, sessions: &mut sessions, records: None };
         let mut st = blank_stat("dsh", "DeepSeek Harness");
         scan_dsh(&mut ctx, &home, &mut st);
         let mut st = blank_stat("claude", "Claude Code");
@@ -691,13 +922,13 @@ impl LedgerAgg {
 
 /// 所有 Agent 会话的缓存账本。和路由流水无关：DSH / Claude / Pi / Codex
 /// 各自写的会话记录里只要有 usage，就进入这里；`routed` 只是其中一个子集。
-pub fn session_cache_ledger(port: u16, since_ms: i64) -> Value {
+pub fn session_cache_ledger(port: u16, since_ms: i64, route: u8) -> Value {
     let home = home();
     let bases = collect_bases(&home);
     let mut aggs: AggMap = HashMap::new();
     let mut sessions: SessList = Vec::new();
     {
-        let mut ctx = Ctx { bases: &bases, port, since_ms, aggs: &mut aggs, sessions: &mut sessions };
+        let mut ctx = Ctx { bases: &bases, port, since_ms, route_filter: route, metric: 0, magpie: HashMap::new(), aggs: &mut aggs, sessions: &mut sessions, records: None };
         let mut st = blank_stat("dsh", "DeepSeek Harness");
         scan_dsh(&mut ctx, &home, &mut st);
         let mut st = blank_stat("claude", "Claude Code");
@@ -760,6 +991,145 @@ pub fn session_cache_ledger(port: u16, since_ms: i64) -> Value {
         "upstreams": upstream_rows,
         "sessions": session_rows,
     })
+}
+
+
+/// 逐轮会话记录：给「请求记录」页展示所有 Agent 的每次调用，
+/// 而不是只看经过本机 8010 的 config.history.jsonl。
+pub fn session_records(port: u16, since_ms: i64, route: u8, metric: u8, day: &str, month: &str, group: &str, upstream: &str, model: &str, limit: usize, offset: usize) -> Value {
+    let home = home();
+    let bases = collect_bases(&home);
+    let mut records: Vec<Value> = Vec::new();
+    let mut aggs: AggMap = HashMap::new();
+    let mut sessions: SessList = Vec::new();
+    {
+        let mut ctx = Ctx {
+            bases: &bases, port, since_ms, route_filter: route, metric,
+            magpie: if metric == 1 { magpie_offsets() } else { HashMap::new() },
+            aggs: &mut aggs, sessions: &mut sessions, records: Some(&mut records),
+        };
+        let mut st = blank_stat("dsh", "DeepSeek Harness");
+        scan_dsh(&mut ctx, &home, &mut st);
+        let mut st = blank_stat("claude", "Claude Code");
+        scan_claude(&mut ctx, &home, &mut st);
+        let mut st = blank_stat("pi", "Pi");
+        scan_pi(&mut ctx, &home, &mut st);
+        let mut st = blank_stat("codex", "Codex");
+        scan_codex(&mut ctx, &home, &mut st);
+    }
+    let mut days: Vec<String> = records.iter().filter_map(|r| r["time"].as_str().map(|s| s.chars().take(10).collect())).collect();
+    days.sort(); days.dedup();
+    let mut months: Vec<String> = records.iter().filter_map(|r| r["time"].as_str().map(|s| s.chars().take(7).collect())).collect();
+    months.sort(); months.dedup();
+    if !day.is_empty() {
+        records.retain(|r| r["time"].as_str().map(|s| s.starts_with(day)).unwrap_or(false));
+    }
+    if !month.is_empty() {
+        records.retain(|r| r["time"].as_str().map(|s| s.starts_with(month)).unwrap_or(false));
+    }
+    if !group.is_empty() {
+        records.retain(|r| {
+            let p = r["upstream"].as_str().unwrap_or("");
+            let m = r["model"].as_str().unwrap_or("");
+            format!("{p}/{m}") == group
+        });
+    }
+    if !upstream.is_empty() {
+        records.retain(|r| r["upstream"].as_str() == Some(upstream));
+    }
+    if !model.is_empty() {
+        records.retain(|r| r["model"].as_str() == Some(model));
+    }
+    records.sort_by(|a, b| {
+        let at = a["at"].as_f64().unwrap_or(0.0);
+        let bt = b["at"].as_f64().unwrap_or(0.0);
+        bt.partial_cmp(&at).unwrap_or(std::cmp::Ordering::Equal)
+    });
+    let total = records.len();
+    let mut calls = 0u64; let mut input = 0u64; let mut output = 0u64;
+    let mut cache_read = 0u64; let mut cache_write = 0u64;
+    let mut groups: HashMap<String, (u64, u64, u64, u64, u64, String)> = HashMap::new();
+    let mut ups: HashMap<String, (u64, String)> = HashMap::new();
+    for r in &records {
+        calls += 1;
+        let u = &r["usage"];
+        input += u["input"].as_u64().unwrap_or(0);
+        output += u["output"].as_u64().unwrap_or(0);
+        cache_read += u["cache_read"].as_u64().unwrap_or(0);
+        cache_write += u["cache_write"].as_u64().unwrap_or(0);
+        let provider = r["upstream"].as_str().unwrap_or("");
+        let model = r["model"].as_str().unwrap_or("");
+        let gkey = format!("{provider}/{model}");
+        let e = groups.entry(gkey.clone()).or_insert((0, 0, 0, 0, 0, String::new()));
+        e.0 += 1;
+        e.1 += u["input"].as_u64().unwrap_or(0);
+        e.2 += u["output"].as_u64().unwrap_or(0);
+        e.3 += u["cache_read"].as_u64().unwrap_or(0);
+        e.4 += u["cache_write"].as_u64().unwrap_or(0);
+        e.5 = provider.to_string();
+        ups.entry(format!("{provider}\u{1}{model}")).or_insert((0, provider.to_string()));
+        if let Some(x) = ups.get_mut(&format!("{provider}\u{1}{model}")) { x.0 += 1; }
+    }
+    let mut group_rows: Vec<Value> = groups.into_iter().map(|(k, (c, i, o, cr, cw, p))| json!({
+        "group": k, "calls": c, "ok": c, "failed": 0, "attempts": c,
+        "avg_elapsed": 0.0, "upstream_count": 1,
+        "usage": {"input": i, "output": o, "cache_read": cr, "cache_write": cw},
+        "upstreams": [{"upstream": p, "calls": c, "ok": c, "failed": 0,
+                       "models": [{"model": k.splitn(2, '/').nth(1).unwrap_or(""), "calls": c, "ok": c, "failed": 0}]}]
+    })).collect();
+    group_rows.sort_by_key(|v| std::cmp::Reverse(v["calls"].as_u64().unwrap_or(0)));
+    let upstream_rows: Vec<Value> = ups.into_iter().map(|(k, (c, p))| {
+        let model = k.splitn(2, '\u{1}').nth(1).unwrap_or("");
+        json!({"upstream": p, "model": model, "key": format!("{p} · {model}"), "failed": 0, "calls": c})
+    }).collect();
+    // 口径覆盖：magpie 口径下有多少轮真的取到了网关实测值，多少轮回退到 request/header。
+    let mut magpie_hits = 0usize;
+    let mut header_hits = 0usize;
+    // 分母只算「这一轮确实走了 Magpie 网关」的，走 dli / primerelay 的不该拉低覆盖率
+    let mut via_magpie = 0usize;
+    for r in records.iter() {
+        let base = r.get("upstream_id").and_then(|v| v.as_str()).unwrap_or("");
+        let up = r.get("upstream").and_then(|v| v.as_str()).unwrap_or("");
+        if base.contains(":3425") || up.starts_with("magpie") {
+            via_magpie += 1;
+        }
+        match r.get("metric_source").and_then(|v| v.as_str()) {
+            Some("magpie") => magpie_hits += 1,
+            Some("header") => header_hits += 1,
+            _ => {}
+        }
+    }
+    let metric_label = match metric {
+        1 => "magpie",
+        2 => "dsh",
+        _ => "happycoding",
+    };
+    let rounds_total = records.len();
+    let entries: Vec<Value> = records.into_iter().skip(offset).take(limit).collect();
+    json!({
+        "scope": "all", "total": total, "offset": offset, "limit": limit,
+        "entries": entries,
+        "metric": {"mode": metric_label, "rounds": rounds_total,
+                   "magpie": magpie_hits, "header": header_hits, "via_magpie": via_magpie,
+                   "magpie_available": !self_magpie_empty(metric)},
+        "totals": {"calls": calls, "ok": calls, "failed": Value::Null, "attempts": calls,
+                   "input": input, "output": output, "cache_read": cache_read, "cache_write": cache_write},
+        "groups": group_rows, "upstreams": upstream_rows,
+        "days": days.iter().map(|d| json!({"key": d})).collect::<Vec<_>>(),
+        "months": months.iter().map(|m| json!({"key": m})).collect::<Vec<_>>(),
+    })
+}
+
+/// magpie 口径是否有可用的网关实测值（本机没开 Magpie 时为 false，前端据此提示）。
+fn self_magpie_empty(metric: u8) -> bool {
+    if metric != 1 {
+        return false;
+    }
+    let cell = MAGPIE_SNAP.get_or_init(|| Mutex::new(None));
+    match cell.lock() {
+        Ok(g) => g.as_ref().map(|s| s.map.is_empty()).unwrap_or(true),
+        Err(_) => true,
+    }
 }
 
 fn epoch_ms(v: &Value) -> i64 {
@@ -1025,6 +1395,10 @@ fn scan_dsh(ctx: &mut Ctx, home: &Path, st: &mut SrcStat) {
         let mut read = 0u64;
         let mut first = true;
         let mut step_starts: HashMap<(i64, i64), i64> = HashMap::new();
+        // request/header 不带 turn/step，只能按「最近一次 step/start」归属；
+        // startsSeries=true 表示这条 header 开启一个新的配置序列（DSH 会去重复用）。
+        let mut header_starts: HashMap<(i64, i64), i64> = HashMap::new();
+        let mut pending: Option<(i64, i64)> = None;
         for line in BufReader::new(lines).lines() {
             let Ok(line) = line else { break };
             read += line.len() as u64 + 1;
@@ -1048,10 +1422,22 @@ fn scan_dsh(ctx: &mut Ctx, home: &Path, st: &mut SrcStat) {
                         let at = v.get("time").and_then(|t| t.as_i64()).unwrap_or(0);
                         if turn > 0 && step > 0 && at > 0 {
                             step_starts.insert((turn, step), at);
+                            pending = Some((turn, step));
                         }
                         continue;
                     }
                 }
+            }
+            if line.contains("request/header") {
+                if let (Some(key), Ok(v)) = (pending, serde_json::from_str::<Value>(&line)) {
+                    if v.get("type").and_then(|t| t.as_str()) == Some("request/header") {
+                        if let Some(at) = v.get("time").and_then(|t| t.as_i64()) {
+                            // 同一轮可能在重试时写多条 header，取最早那条（第一条发出前的时刻）
+                            header_starts.entry(key).or_insert(at);
+                        }
+                    }
+                }
+                continue;
             }
             if !line.contains("assistant/message") {
                 continue;
@@ -1069,10 +1455,52 @@ fn scan_dsh(ctx: &mut Ctx, home: &Path, st: &mut SrcStat) {
             let d = v.get("data").cloned().unwrap_or(Value::Null);
             let turn = d.get("turn").and_then(|x| x.as_i64()).unwrap_or(0);
             let step = d.get("step").and_then(|x| x.as_i64()).unwrap_or(0);
-            let duration = step_starts
-                .remove(&(turn, step))
-                .filter(|start| at > *start)
-                .map(|start| (at - start) as f64);
+            let start = step_starts.remove(&(turn, step)).filter(|start| at > *start);
+            let header_ms = match (start, header_starts.get(&(turn, step)).copied()) {
+                (Some(start), Some(h)) if h >= start => Some((h - start) as f64),
+                _ => None,
+            };
+            // 一帧流里有三类时间点，三种口径各取所需：
+            //   frame     第一个 SSE 帧（含 role / block-start 这类空帧）
+            //   content   第一个真正带内容的块（跳过 block-start / block-end / usage / finish）
+            //   end       最后一个流块的时间（= 收到最后一个字节）
+            let stream = d.get("stream").and_then(|s| s.as_array());
+            let frame_time = stream
+                .and_then(|arr| arr.iter().filter_map(|x| x.get("time").and_then(|t| t.as_i64())).min());
+            let content_time = stream.and_then(|arr| {
+                arr.iter()
+                    .filter(|x| {
+                        let t = x.get("chunk").and_then(|c| c.get("type")).and_then(|t| t.as_str());
+                        !matches!(t, Some("block-start") | Some("block-end") | Some("usage") | Some("finish"))
+                    })
+                    .filter_map(|x| {
+                        x.get("time")
+                            .and_then(|t| t.as_i64())
+                            .or_else(|| x.get("time0").and_then(|t| t.as_i64()))
+                    })
+                    .min()
+            });
+            let end_time = stream.and_then(|arr| arr.iter().filter_map(|x| x.get("time").and_then(|t| t.as_i64())).max());
+            // 口径 0 = happycoding（New API）：首字取第一个 SSE 帧，耗时向下取整到整秒
+            // 口径 1 = magpie：首字取第一个有内容的块，耗时到最后一个字节
+            // 口径 2 = dsh（当前）：首字取第一个流帧，耗时到 assistant/message
+            let (first_chunk, duration) = match start {
+                Some(start) if at > start => match ctx.metric {
+                    1 => (
+                        content_time.filter(|t| *t >= start).map(|t| (t - start) as f64),
+                        end_time.filter(|t| *t > start).map(|t| (t - start) as f64),
+                    ),
+                    2 => (
+                        frame_time.filter(|t| *t >= start).map(|t| (t - start) as f64),
+                        Some((at - start) as f64),
+                    ),
+                    _ => (
+                        frame_time.filter(|t| *t >= start).map(|t| (t - start) as f64),
+                        Some((((at - start) as f64) / 1000.0).floor() * 1000.0),
+                    ),
+                },
+                _ => (None, None),
+            };
             let src = d
                 .get("message")
                 .and_then(|m| m.get("source"))
@@ -1088,7 +1516,7 @@ fn scan_dsh(ctx: &mut Ctx, home: &Path, st: &mut SrcStat) {
                 pick_num(&u, &["cacheWriteTokens", "cache_write"]),
                 pick_num(&u, &["totalTokens", "total"]),
             ];
-            ctx.round("dsh", "DeepSeek Harness", &mut sess, provider, model, at, usage, duration);
+            ctx.round("dsh", "DeepSeek Harness", &mut sess, provider, model, at, usage, duration, first_chunk, header_ms);
         }
         if read >= FILE_CAP {
             st.truncated = true;
@@ -1191,7 +1619,7 @@ fn scan_claude(ctx: &mut Ctx, home: &Path, st: &mut SrcStat) {
                     .and_then(|x| x.as_str())
                     .filter(|s| !s.is_empty())
                     .unwrap_or("anthropic");
-                ctx.round("claude", "Claude Code", &mut sess, provider, model, at, usage, None);
+                ctx.round("claude", "Claude Code", &mut sess, provider, model, at, usage, None, None, None);
             }
         });
         st.bytes += n;
@@ -1311,7 +1739,7 @@ fn scan_pi(ctx: &mut Ctx, home: &Path, st: &mut SrcStat) {
                 pick_num(&u, &["cacheWrite"]),
                 pick_num(&u, &["totalTokens", "total"]),
             ];
-            ctx.round("pi", "Pi", &mut sess, &provider, model, at, usage, None);
+            ctx.round("pi", "Pi", &mut sess, &provider, model, at, usage, None, None, None);
         });
         st.bytes += n;
         if n >= FILE_CAP {
@@ -1431,7 +1859,7 @@ fn scan_codex(ctx: &mut Ctx, home: &Path, st: &mut SrcStat) {
                     } else {
                         meta_provider.as_str()
                     };
-                    ctx.round("codex", "Codex", &mut sess, provider, &cur_model, at, usage, None);
+                    ctx.round("codex", "Codex", &mut sess, provider, &cur_model, at, usage, None, None, None);
                 }
                 _ => {}
             }
@@ -1451,7 +1879,10 @@ fn scan_codex(ctx: &mut Ctx, home: &Path, st: &mut SrcStat) {
 
 // ───────────────────────── 路由流水对照 ─────────────────────────
 
-fn journal_window(state: &AppState, since_ms: i64) -> Value {
+fn journal_window(state: &AppState, since_ms: i64, route: u8) -> Value {
+    if route == 2 {
+        return json!({"path": state.history_path().to_string_lossy().to_string(), "rounds": 0, "input": 0, "output": 0, "cache_read": 0, "cache_write": 0, "total": 0, "by_model": []});
+    }
     let path = state.history_path();
     let since = if since_ms > 0 { since_ms as f64 / 1000.0 } else { 0.0 };
     let entries = super::journal_index::entries(state, since, None);
@@ -1548,6 +1979,8 @@ pub async fn scan(State(state): State<Arc<AppState>>, Query(q): Query<ScanQuery>
         ],
     };
     let row_limit = q.limit.unwrap_or(ROW_LIMIT).clamp(10, 500);
+    let route_filter = route_filter(q.route.as_deref());
+    let metric = metric_mode(q.metric.as_deref());
     if wanted.is_empty() {
         return bad("sources 参数为空，请至少选一个数据源（dsh,claude,pi,codex）");
     }
@@ -1584,8 +2017,12 @@ pub async fn scan(State(state): State<Arc<AppState>>, Query(q): Query<ScanQuery>
                 bases: &bases,
                 port,
                 since_ms,
+                route_filter,
+                metric,
+                magpie: HashMap::new(),
                 aggs: &mut aggs,
                 sessions: &mut sessions,
+                records: None,
             };
             scan_dsh(&mut ctx, &home, &mut st);
         }
@@ -1598,8 +2035,12 @@ pub async fn scan(State(state): State<Arc<AppState>>, Query(q): Query<ScanQuery>
                 bases: &bases,
                 port,
                 since_ms,
+                route_filter,
+                metric,
+                magpie: HashMap::new(),
                 aggs: &mut aggs,
                 sessions: &mut sessions,
+                records: None,
             };
             scan_claude(&mut ctx, &home, &mut st);
         }
@@ -1612,8 +2053,12 @@ pub async fn scan(State(state): State<Arc<AppState>>, Query(q): Query<ScanQuery>
                 bases: &bases,
                 port,
                 since_ms,
+                route_filter,
+                metric,
+                magpie: HashMap::new(),
                 aggs: &mut aggs,
                 sessions: &mut sessions,
+                records: None,
             };
             scan_pi(&mut ctx, &home, &mut st);
         }
@@ -1626,15 +2071,19 @@ pub async fn scan(State(state): State<Arc<AppState>>, Query(q): Query<ScanQuery>
                 bases: &bases,
                 port,
                 since_ms,
+                route_filter,
+                metric,
+                magpie: HashMap::new(),
                 aggs: &mut aggs,
                 sessions: &mut sessions,
+                records: None,
             };
             scan_codex(&mut ctx, &home, &mut st);
         }
         stats.push(st);
     }
 
-    let journal = journal_window(&state, since_ms);
+    let journal = journal_window(&state, since_ms, route_filter);
 
     // 汇总
     let mut rows: Vec<Agg> = aggs.into_values().collect();
@@ -2012,6 +2461,38 @@ fn scan_claude_tools(
             }
         }
     }
+}
+
+
+pub async fn records(State(state): State<Arc<AppState>>, Query(q): Query<ScanQuery>) -> Response {
+    let port = {
+        let p = state.port.load(std::sync::atomic::Ordering::Relaxed);
+        if p == 0 { 8010 } else { p }
+    };
+    let has_hours = q.hours.is_some();
+    let hours = q.hours.unwrap_or(168);
+    let mut range = q.range.as_deref().map(|s| s.trim().to_ascii_lowercase()).unwrap_or_default();
+    if range.is_empty() && !has_hours { range = "today".to_string(); }
+    let since_ms = match range.as_str() {
+        "today" => {
+            let now = chrono::Local::now();
+            let secs = now.time().num_seconds_from_midnight() as i64;
+            (now.timestamp() - secs) * 1000
+        }
+        "all" => 0,
+        _ => if hours <= 0 { 0 } else { now_ms() - hours * 3600 * 1000 },
+    };
+    let day = q.day.as_deref().unwrap_or("").trim().to_string();
+    let month = q.month.as_deref().unwrap_or("").trim().to_string();
+    let group = q.group.as_deref().unwrap_or("").trim().to_string();
+    let upstream = q.upstream.as_deref().unwrap_or("").trim().to_string();
+    let model = q.model.as_deref().unwrap_or("").trim().to_string();
+    let route = route_filter(q.route.as_deref());
+    let metric = metric_mode(q.metric.as_deref());
+    let limit = q.limit.unwrap_or(50).clamp(5, 200);
+    let offset = q.offset.unwrap_or(0);
+    let value = session_records(port, since_ms, route, metric, &day, &month, &group, &upstream, &model, limit, offset);
+    Json(value).into_response()
 }
 
 pub async fn tools(State(_state): State<Arc<AppState>>, Query(q): Query<ToolQuery>) -> Response {

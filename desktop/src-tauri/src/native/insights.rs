@@ -30,6 +30,7 @@ pub struct SeriesQuery {
 pub struct LedgerQuery {
     pub range: Option<String>,
     pub hours: Option<f64>,
+    pub route: Option<String>,
 }
 
 struct Bucket {
@@ -401,7 +402,9 @@ fn ledger_window(q: &LedgerQuery) -> (f64, String) {
 /// 同时把粘性路由的会话数带出来，方便对照「固定上游后缓存是否更稳」。
 pub async fn cache_ledger(State(state): State<Arc<AppState>>, Query(q): Query<LedgerQuery>) -> Response {
     let (since, range_label) = ledger_window(&q);
-    let cache_key = format!("ledger|{}|{}", range_label, q.hours.unwrap_or(0.0));
+    let route = super::sessions::route_filter(q.route.as_deref());
+    let route_key = match route { 1 => "routed", 2 => "external", _ => "all" };
+    let cache_key = format!("ledger|{}|{}|{}", range_label, q.hours.unwrap_or(0.0), route_key);
     if let Some(v) = super::collector::get(&cache_key, 15) {
         return Json(v).into_response();
     }
@@ -412,10 +415,11 @@ pub async fn cache_ledger(State(state): State<Arc<AppState>>, Query(q): Query<Le
     // ledger_window() 返回的是秒；session_cache_ledger() 的 since_ms 需要毫秒，
     // 否则「今天」会把全部历史会话都算进来（最近 100 条也会错）。
     let since_ms = if since <= 0.0 { 0 } else { (since * 1000.0).round() as i64 };
-    let mut out = super::sessions::session_cache_ledger(port, since_ms);
+    let mut out = super::sessions::session_cache_ledger(port, since_ms, route);
     out["ok"] = json!(true);
     out["generated_at"] = json!(chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string());
     out["range"] = json!(range_label);
+    out["route"] = json!(route_key);
     out["since"] = json!(since);
     out["affinity_sticks"] = json!(state.affinity.lock().map(|s| s.count()).unwrap_or(0));
     super::collector::put(cache_key, out.clone());

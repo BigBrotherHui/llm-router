@@ -209,7 +209,12 @@ pub async fn report(
         .and_then(|s| s.parse::<usize>().ok())
         .unwrap_or(4000)
         .min(20000);
-    let cache_key = format!("health|{}|{}|{}", range, hours as i64, limit);
+    let route = q
+        .get("route")
+        .map(|s| s.trim().to_ascii_lowercase())
+        .unwrap_or_else(|| "all".to_string());
+    let route_filter = super::sessions::route_filter(Some(route.as_str()));
+    let cache_key = format!("health|{}|{}|{}|{}", range, hours as i64, limit, route);
     if let Some(v) = super::collector::get(&cache_key, 5) {
         return ok(v);
     }
@@ -340,6 +345,48 @@ pub async fn report(
         }
         rows.push(v);
     }
+    // 外部 Agent 会话没有失败/延迟样本，只在“全部/未走路由”范围里把上游列出来，
+    // 成功率等指标留空，避免把「没数据」误显示成 100%。
+    let mut external_calls = 0u64;
+    let mut external_totals = Value::Null;
+    if route_filter != 1 {
+        if route_filter == 2 {
+            rows.clear();
+            total_agg = Agg::default();
+        }
+        let port = state.port.load(std::sync::atomic::Ordering::Relaxed);
+        let since_ms = if cutoff > 0.0 { (cutoff * 1000.0).round() as i64 } else { 0 };
+        let ext = super::sessions::session_cache_ledger(port, since_ms, 2);
+        external_totals = ext.get("totals").cloned().unwrap_or(Value::Null);
+        if let Some(list) = ext.get("upstreams").and_then(|v| v.as_array()) {
+            for u in list {
+                let calls = u.get("calls").and_then(|v| v.as_u64()).unwrap_or(0);
+                if calls == 0 {
+                    continue;
+                }
+                external_calls += calls;
+                rows.push(json!({
+                    "id": Value::Null,
+                    "upstream": u.get("label").cloned().unwrap_or_else(|| json!("?")),
+                    "base_url": "",
+                    "enabled": true,
+                    "available": true,
+                    "external": true,
+                    "attempts": calls,
+                    "calls": calls,
+                    "ok": calls,
+                    "failed": 0,
+                    "success_rate": Value::Null,
+                    "p50_seconds": Value::Null,
+                    "p95_seconds": Value::Null,
+                    "first_chunk_p50_seconds": Value::Null,
+                    "cache_read": u.get("cache_read").cloned().unwrap_or(json!(0)),
+                    "cache_write": u.get("cache_write").cloned().unwrap_or(json!(0)),
+                    "models": [],
+                }));
+            }
+        }
+    }
     rows.sort_by(|a, b| {
         let af = a.get("failed").and_then(|v| v.as_i64()).unwrap_or(0);
         let bf = b.get("failed").and_then(|v| v.as_i64()).unwrap_or(0);
@@ -350,15 +397,40 @@ pub async fn report(
         })
     });
 
+    let mut totals = if route_filter == 2 { external_totals.clone() } else { total_agg.json() };
+    if route_filter == 0 {
+        if let Some(obj) = totals.as_object_mut() {
+            if let Some(ext) = external_totals.as_object() {
+                for (k, v) in ext {
+                    if matches!(k.as_str(), "calls" | "routed_calls" | "input" | "output" | "cache_read" | "cache_write" | "prompt_tokens" | "saved_tokens") {
+                        let n = v.as_u64().unwrap_or(0);
+                        let old = obj.get(k).and_then(|x| x.as_u64()).unwrap_or(0);
+                        obj.insert(k.clone(), json!(old + n));
+                    }
+                }
+                let ext_calls = ext.get("calls").and_then(|v| v.as_u64()).unwrap_or(0);
+                let old_ok = obj.get("ok").and_then(|v| v.as_u64()).unwrap_or(0);
+                let old_attempts = obj.get("attempts").and_then(|v| v.as_u64()).unwrap_or(0);
+                obj.insert("ok".into(), json!(old_ok + ext_calls));
+                obj.insert("attempts".into(), json!(old_attempts + ext_calls));
+                let ok = old_ok + ext_calls;
+                let att = old_attempts + ext_calls;
+                obj.insert("success_rate".into(), json!(if att > 0 { (ok as f64 / att as f64 * 1000.0).round() / 10.0 } else { 0.0 }));
+            }
+        }
+    }
+
     let out = json!({
         "ok": true,
         "hours": hours,
         "range": range_label,
         "since": if cutoff > 0.0 { json!(cutoff) } else { Value::Null },
-        "scanned": scanned,
-        "kept": kept,
+        "scanned": if route_filter == 2 { external_calls as usize } else { scanned },
+        "kept": if route_filter == 2 { external_calls as usize } else { kept },
         "generated_at": chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string(),
-        "totals": total_agg.json(),
+        "totals": totals,
+        "external_calls": external_calls,
+        "route": route,
         "threshold": super::state::FAILURE_THRESHOLD,
         "cooldown_seconds": super::state::COOLDOWN_SECONDS,
         "upstreams": rows,

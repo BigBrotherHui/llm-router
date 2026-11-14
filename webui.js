@@ -2326,6 +2326,7 @@ function curJournalFilter() {
 
 async function loadJournal() {
   const f = curJournalFilter();
+  const source = ($("#sideSource") && $("#sideSource").value) || "all";
   const qs = new URLSearchParams({
     limit: String(REQ_PAGE),
     offset: String((reqPage - 1) * REQ_PAGE),
@@ -2336,12 +2337,20 @@ async function loadJournal() {
   if (f.upstream) qs.set("upstream", f.upstream);
   if (f.model) qs.set("model", f.model);
   try {
-    journalPage = await api("/admin/journal?" + qs.toString(), undefined, "GET");
+    if (source === "router") {
+      journalPage = await api("/admin/journal?" + qs.toString(), undefined, "GET");
+    } else {
+      if (!f.day && !f.month) qs.set("range", "all");
+      qs.set("metric", timingMode());
+      journalPage = await api("/sessions/records?" + qs.toString(), undefined, "GET");
+    }
   } catch (e) {
-    journalPage = { entries: [], total: 0, error: e.message };
+    journalPage = { entries: [], total: 0, error: e.message, scope: source === "router" ? "router" : "all" };
   }
   // 上游下拉跟着当前分组走：只有选过分组才列上游，避免全量时列一长串。
   fillUpstreamOptions();
+  fillFilterOptions();
+  renderTabNums();
   return journalPage;
 }
 
@@ -2383,7 +2392,7 @@ async function loadJournalIndex() {
 // 默认选中今天也能看到明确的「今天还没有请求」。
 let journalDayDefaulted = false;   // 首次进入默认选今天；之后尊重用户选择
 function fillFilterOptions() {
-  if (!journalIndex) return;
+  if (!journalIndex && !journalPage) return;
   const fill = (sel, items, allLabel, extra = []) => {
     if (!sel) return;
     const base = (items || []).map(x => x.key);
@@ -2397,9 +2406,26 @@ function fillFilterOptions() {
     sel.dataset.opts = key;
   };
   const today = dayKeyOf();
-  fill($("#sideDay"), journalIndex.days, "全部日期", [today]);
-  fill($("#sideMonth"), journalIndex.months, "全部月份");
-  fill($("#sideFilter"), journalIndex.groups, "全部分组");
+  const idx = journalIndex || {};
+  const allScope = journalPage && journalPage.scope === "all";
+  const groupItems = allScope
+    ? (journalPage.groups || []).map(g => ({ key: g.group }))
+    : (idx.groups || []);
+  const dayItems = allScope && journalPage.days
+    ? journalPage.days
+    : (allScope
+      ? [...new Set((journalPage.entries || []).map(x => String(x.time || "").slice(0, 10)).filter(Boolean))]
+          .map(key => ({ key }))
+      : (idx.days || []));
+  const monthItems = allScope && journalPage.months
+    ? journalPage.months
+    : (allScope
+      ? [...new Set((journalPage.entries || []).map(x => String(x.time || "").slice(0, 7)).filter(Boolean))]
+          .map(key => ({ key }))
+      : (idx.months || []));
+  fill($("#sideDay"), dayItems, "全部日期", [today]);
+  fill($("#sideMonth"), monthItems, "全部月份");
+  fill($("#sideFilter"), groupItems, "全部模型 / Provider");
   // 默认按当天看（只默认一次；用户手动切到「全部日期」后不再抢回）
   if (!journalDayDefaulted) {
     journalDayDefaulted = true;
@@ -2484,7 +2510,10 @@ function renderSide() {
   // 老的实现里列表读的是内存里那 500 条 history，所以白天/昨天的记录翻不到，
   // 而汇总数字来自另一个口径 —— 两边永远对不上。现在统一成一个来源。
   const sr = state.stats_range || {};
-  const stats = sr.groups ? sr : (state.call_stats || {});
+  const allScope = journalPage && journalPage.scope === "all";
+  const stats = allScope
+    ? { totals: journalPage.totals || {}, groups: journalPage.groups || [] }
+    : (sr.groups ? sr : (state.call_stats || {}));
   const totals = stats.totals || {};
 
   const filter = $("#sideFilter").value;
@@ -2501,8 +2530,34 @@ function renderSide() {
     : `${shown.length} 条`;
   $("#sideCount").textContent = `${curFilterLabel()} ${shownHint}`;
   $("#sideCount").className = "badge" + (totals.failed ? " warn" : "");
+  const metricNote = $("#sideMetricNote");
+  if (metricNote) {
+    const mm = journalPage && journalPage.metric;
+    if (!allScope || !mm) {
+      metricNote.textContent = "";
+      metricNote.title = "";
+    } else if (mm.mode !== "magpie") {
+      metricNote.textContent = mm.mode === "dsh" ? "DSH 会话计时" : "happycoding 口径";
+      metricNote.title = TIMING_TEXT[mm.mode] || "";
+    } else if (mm.magpie_available === false) {
+      metricNote.textContent = "Magpie 未在运行，已回退";
+      metricNote.title = "没读到 Magpie 网关的用量日志，这些轮按 request/header 时刻推算";
+    } else {
+      const denom = mm.via_magpie != null ? mm.via_magpie : mm.rounds;
+      const rest = denom - mm.magpie;
+      metricNote.textContent = `网关实测 ${fmtCount(mm.magpie)} / ${fmtCount(denom)} 轮`;
+      metricNote.title = "按「会话 + 输入/输出/缓存读 token」和 Magpie 自己的用量日志对账，"
+        + "对上的直接用网关实测 ttft_ms / ms（实测 0 ms 误差）。"
+        + (rest > 0
+          ? `还有 ${fmtCount(rest)} 轮没对上：${fmtCount(mm.header)} 轮按 DSH request/header 时刻推算，其余用 step 口径。`
+          : "这个窗口里的每一轮都取到了网关实测值。")
+        + (mm.rounds - denom > 0 ? `另有 ${fmtCount(mm.rounds - denom)} 轮没经过 Magpie 网关，用 step 口径。` : "");
+    }
+  }
   $("#sideCount").title = fullCalls != null
-    ? `当前筛选下共 ${fullCalls} 条调用记录（全部来自落盘流水，可一直往下翻）`
+    ? (allScope
+      ? `当前筛选下共 ${fullCalls} 条 Agent 会话记录（DSH / Claude / Pi / Codex）；切到「本机路由流水」只看经过 8010 的请求`
+      : `当前筛选下共 ${fullCalls} 条调用记录（本机路由落盘流水，可一直往下翻）`)
     : "调用记录";
 
   // ---- 统计区 ----
@@ -2547,11 +2602,9 @@ function renderSide() {
     <div class="ovc"><b style="color:var(--warn)">${fmtNum(totals.cache_write)}</b><span>缓存写</span></div>
   </div>
   <div class="hint" style="padding:2px 2px 8px">
-    「总请求」按客户端请求算（失败会换下一个，还算一次）；「上游尝试」按实际发给上游算——
-    换过一次就会多一两次。和右上角每个上游卡片里的「请求/成功/失败」是同一口径。<br>
-    每个上游条上的「N 败」是该上游**自己**失败的次数（换家过程中失败的也算），
-    所以各条相加会大于客户端「失败」——想看某个上游的真实情况，就在上面的下拉里选它
-    （同一个上游挂多个模型时，选「上游 · 模型」看单模型的数据）。
+    ${allScope
+      ? "全部 Agent 会话来自 DSH / Claude / Pi / Codex 的会话记录；会话记录只包含成功轮，失败数不单独提供；首字来自流式首个内容块。切到「本机路由流水」可查看 8010 的失败、重试与上游尝试。"
+      : "「总请求」按客户端请求算（失败会换下一个，还算一次）；「上游尝试」按实际发给上游算——换过一次就会多一两次。和右上角每个上游卡片里的「请求/成功/失败」是同一口径。每个上游条上的「N 败」是该上游自己失败的次数（换家过程中失败的也算），所以各条相加会大于客户端「失败」——想看某个上游的真实情况，就在上面的下拉里选它。"}
   </div>`;
 
   const glist = filter
@@ -2687,6 +2740,8 @@ function renderSide() {
           <div class="hint" style="line-height:1.8">
             总耗时：<code>${fmtLat(h.elapsed_seconds)}</code>（从收到请求到响应结束，含上游重试与流式输出全过程）<br>
             首字延迟：<code>${h.first_chunk_seconds != null ? fmtLat(h.first_chunk_seconds) : "—"}</code>（首个内容块到达，只有新版本流式流水才有）<br>
+            ${h.metric_source ? `计时来源：<code>${{ magpie: "Magpie 网关用量日志", header: "DSH request/header 时刻", step: "DSH step/start" }[h.metric_source] || esc(h.metric_source)}</code><br>` : ""}
+            request/header：<code>${h.request_header_seconds != null ? fmtLat(h.request_header_seconds) : "—"}</code>（DSH 写请求头的时刻，相对 step/start；DSH 只在配置变更时才写这条事件，所以大多数轮没有）<br>
             有效内容块：<code>${h.chunks != null ? fmtCount(h.chunks) : "—"}</code>　·　请求方式：<code>${h.stream ? "流式" : "非流式"}</code><br>
              ${tpsDetail(h)}
           </div>
@@ -2877,15 +2932,17 @@ function renderTabNums() {
   // 优先用流水索引的 total；索引还没读到就退回聚合统计。
   const journalTotal = journalIndex && journalIndex.total != null
     ? journalIndex.total : null;
+  const liveAll = journalPage && journalPage.scope === "all" ? journalPage.total : null;
   const allTotals = (state.stats || {}).totals || {};
   const fallback = (state.stats_range || {}).totals || (state.call_stats || {}).totals || {};
   const totals = allTotals.calls != null ? allTotals : fallback;
-  const nCalls = journalTotal != null ? journalTotal
-                                      : (totals.calls != null ? totals.calls : 0);
+  const nCalls = liveAll != null ? liveAll
+                                  : (journalTotal != null ? journalTotal
+                                  : (totals.calls != null ? totals.calls : 0));
   // tab 上的数字是「累计请求数」，不是错误数：失败多少条在 tooltip 里说，
   // 别把整个数字染红，否则 410 会被误读成 410 个错误
   setTabNum("req", nCalls, false,
-            `调用记录共 ${nCalls} 条（落盘流水，跨重启保留，可一直翻）；` +
+            `调用记录共 ${nCalls} 条（全部 Agent 会话；可切到本机路由流水）；` +
             `按天 / 按月 / 按分组筛选，` +
             `${totals.failed ? `其中 ${totals.failed} 次失败` : "没有失败"}`);
   const ups = state.upstreams || [];
@@ -3446,6 +3503,19 @@ document.querySelectorAll("#tabs .tab").forEach(b => {
   b.onclick = () => setTab(b.dataset.tab);
 });
 $("#sideRefresh").onclick = async () => { lastSideHash = ""; await refresh(); };
+if ($("#sideSource")) {
+  $("#sideSource").onchange = async () => {
+    reqPage = 1; lastSideHash = "";
+    await loadJournal();
+    renderSide();
+  };
+}
+if ($("#sideMetric")) {
+  $("#sideMetric").onchange = () => {
+    reqPage = 1; lastSideHash = "";
+    saveTimingMode($("#sideMetric").value);
+  };
+}
 // 按天 / 按月 / 按分组筛选：改动后回到第一页重新从流水取
 if ($("#sideDay")) {
   $("#sideDay").onchange = async () => {
@@ -4006,10 +4076,50 @@ $("#ckAutoSave").onclick = saveCkSettings;
 
 /* ================= 界面刷新间隔 ================= */
 const REFRESH_KEY = "llm-router-refresh-seconds";
+const TIMING_KEY = "llm-router-timing-metric";
 const SESS_REFRESH_KEY = "llm-router-sess-refresh-seconds";
 let refreshTimer = null;
 let refreshDelay = 5000;
 let refreshing = false;
+
+// 首字 / 耗时口径：happycoding（默认）/ magpie / dsh。
+// 后端按这个参数换算法重算，不改原始时间戳。
+const TIMING_TEXT = {
+  happycoding: "happycoding（New API）：首字=第一个 SSE 帧（含空帧），耗时=开始处理→写回完成并截断到整秒；起点在读完请求体之后，数字最小。",
+  magpie: "Magpie：首字=上游第一个有内容的字节（跳过空帧），耗时=到最后一个字节，毫秒精度；会话记录里没有「网关收包」时刻，所以按会话 + token 指纹去 Magpie 自己的用量日志里对账，对上的直接用它的 ttft_ms / ms，对不上的回退到 DSH request/header 时刻。",
+  dsh: "DSH 会话（当前）：首字=第一个流帧（从 step/start 算起），耗时=step/start→assistant/message 落盘，毫秒精度；含 DSH 序列化时间（实测中位比网关多 1.8 秒）。",
+};
+function timingMode() {
+  const v = localStorage.getItem(TIMING_KEY);
+  return v === "magpie" || v === "dsh" ? v : "happycoding";
+}
+function applyTimingMode() {
+  const v = timingMode();
+  const sel = $("#timingMode");
+  if (sel) sel.value = v;
+  const quick = $("#sideMetric");
+  if (quick) quick.value = v;
+  const note = $("#timingNote");
+  if (note) note.innerHTML = "<b>当前口径：</b>" + esc(TIMING_TEXT[v]);
+  const st = $("#timingStatus");
+  if (st) st.textContent = "";
+}
+async function saveTimingMode(v) {
+  localStorage.setItem(TIMING_KEY, v === "magpie" || v === "dsh" ? v : "happycoding");
+  applyTimingMode();
+  const st = $("#timingStatus");
+  if (st) st.textContent = "已切换，正在按新口径重新统计…";
+  // 请求记录与会话对账都要重新取数，refresh() 只刷统计，不刷这两份明细。
+  lastSideHash = "";
+  if (curTab === "req") {
+    await loadJournal();
+    renderSide();
+  }
+  if (curTab === "sessions") await loadSessions();
+  await refresh();
+  if (st) st.textContent = "已按新口径重算";
+  toast("已切换为 " + timingMode() + " 口径", "ok");
+}
 
 function refreshSeconds() {
   const raw = Number(localStorage.getItem(REFRESH_KEY));
@@ -4070,6 +4180,10 @@ function saveRefreshInterval() {
   toast(`刷新间隔已保存（请求记录 ${n}s / 会话对账 ${sn}s）`, "ok");
 }
 $("#refreshIntervalSave").onclick = saveRefreshInterval;
+if ($("#timingMode")) {
+  $("#timingMode").onchange = () => saveTimingMode($("#timingMode").value);
+}
+applyTimingMode();
 
 const UPDATE_AUTO_KEY = "llm-router-update-auto";
 const UPDATE_CHANNEL_KEY = "llm-router-update-channel";
@@ -5032,7 +5146,7 @@ function healthAxes(r) {
   return [Number(r.success_rate) || 0, healthSpeedScore(r.p50_seconds), healthFirstScore(r.first_chunk_p50_seconds), stable, cache];
 }
 function renderHealthCharts(d) {
-  const rows = (d.upstreams || []).filter(r => (r.calls || 0) > 0);
+  const rows = (d.upstreams || []).filter(r => !r.external && (r.calls || 0) > 0);
   const barRows = rows.slice(0, 10).map(r => {
     const rate = Number(r.success_rate) || 0;
     return {
@@ -5142,23 +5256,33 @@ function renderHealth() {
   const t = d.totals || {};
   $("#healthThreshold").textContent = d.threshold ?? 3;
   $("#healthCooldown").textContent = d.cooldown_seconds ?? 60;
-  $("#healthMeta").textContent = `窗口 ${d.range === "today" ? "今天 00:00 起" : d.range === "all" || d.hours === 0 ? "全部" : d.hours + "h"} · 扫描 ${fmtCount(d.scanned)} 条 · 采用 ${fmtCount(d.kept)} 条 · ${d.generated_at || ""}`;
+  const hr = ($("#healthRoute") && $("#healthRoute").value) || "all";
+  const routeLabel = hr === "routed" ? " · 只看过 LLM Router" : hr === "external" ? " · 只看未走 LLM Router" : "";
+  const extLabel = hr === "routed" && d.external_calls ? ` · 外部 Agent ${fmtCount(d.external_calls)} 轮` : "";
+  const scanLabel = hr === "external"
+    ? `外部会话 ${fmtCount(d.external_calls)} 轮`
+    : hr === "all"
+      ? `本机路由 ${fmtCount(d.kept)} 条 · 外部 Agent ${fmtCount(d.external_calls)} 轮`
+      : `扫描 ${fmtCount(d.scanned)} 条 · 采用 ${fmtCount(d.kept)} 条`;
+  $("#healthMeta").textContent = `窗口 ${d.range === "today" ? "今天 00:00 起" : d.range === "all" || d.hours === 0 ? "全部" : d.hours + "h"} · ${scanLabel}${routeLabel}${extLabel} · ${d.generated_at || ""}`;
   renderHealthCharts(d);
   $("#healthTotals").innerHTML = `<div class="tkn">
-    ${healthCell("总尝试", fmtCount(t.calls))}
+    ${healthCell(hr === "external" ? "外部轮次" : (hr === "routed" ? "路由尝试" : "调用尝试"), fmtCount(t.calls))}
     ${healthCell("成功", fmtCount(t.ok), "var(--ok)")}
     ${healthCell("失败", fmtCount(t.failed), t.failed ? "var(--bad)" : "")}
-    ${healthCell("成功率", healthPct(t.success_rate), "var(--accent)")}
+    ${healthCell(hr === "routed" ? "路由成功率" : "成功率", healthPct(t.success_rate), "var(--accent)")}
     ${healthCell("首字 P50", healthLat(t.first_chunk_p50_seconds))}
     ${healthCell("缓存读", fmtNum(t.cache_read))}
     ${healthCell("缓存写", fmtNum(t.cache_write))}
     ${healthCell("输入", fmtNum(t.input))}
     ${healthCell("输出", fmtNum(t.output))}
+    ${d.external_calls && hr !== "external" ? healthCell("外部 Agent", fmtCount(d.external_calls), "var(--dim)") : ""}
   </div>`;
 
   const onlyBad = $("#healthOnlyBad").value === "1";
   let rows = (d.upstreams || []).slice();
   const bad = r => (r.failed || 0) > 0 || r.cooldown_remaining_seconds > 0 || r.consecutive_failures > 0 || r.available === false || r.enabled === false || r.orphan;
+  if (hr === "all" && !(d.kept > 0)) rows = rows.filter(r => (r.attempts || r.calls || 0) > 0 || bad(r));
   if (onlyBad) rows = rows.filter(bad);
   const badCount = (d.upstreams || []).filter(bad).length;
   setTabNum("health", badCount, badCount > 0, "异常 / 冷却中的上游数");
@@ -5170,7 +5294,9 @@ function renderHealth() {
   $("#healthList").innerHTML = rows.map((r, i) => {
     const key = r.id || r.upstream || ("row" + i);
     const open = healthOpen.has(key);
-    const statusBadge = r.orphan
+    const statusBadge = r.external
+      ? `<span class="badge">外部 Agent · 无延迟样本</span>`
+      : r.orphan
       ? `<span class="badge">配置已删除</span>`
       : r.enabled === false
         ? `<span class="badge">已禁用</span>`
@@ -5199,7 +5325,7 @@ function renderHealth() {
         ${r.base_url ? `<span class="hint mono">${esc(r.base_url)}</span>` : ""}
         <div class="grow"></div>
         <button class="mini" data-health-act="clear" data-id="${esc(r.id || "")}" ${r.id ? "" : "disabled"} title="清掉这个上游的连续失败计数与冷却">清除熔断</button>
-        <button class="mini" data-health-act="toggle" data-key="${esc(key)}" title="把这个上游的统计按模型拆开，逐个模型看调用次数、成功率和耗时">${open ? "收起模型明细" : "展开模型明细 (" + models.length + ")"}</button>
+        ${r.external ? "" : `<button class="mini" data-health-act="toggle" data-key="${esc(key)}" title="把这个上游的统计按模型拆开，逐个模型看调用次数、成功率和耗时">${open ? "收起模型明细" : "展开模型明细 (" + models.length + ")"}</button>`}
       </div>
       <div class="tkn" style="margin-top:8px">
         ${healthCell("尝试", fmtCount(r.calls))}
@@ -5233,7 +5359,9 @@ async function loadHealth() {
   healthBusy = true;
   try {
     const hours = $("#healthHours") ? $("#healthHours").value : "today";
-    const qs = hours === "today" ? "range=today" : "hours=" + encodeURIComponent(hours);
+    const route = ($("#healthRoute") && $("#healthRoute").value) || "all";
+    let qs = hours === "today" ? "range=today" : "hours=" + encodeURIComponent(hours);
+    if (route !== "all") qs += "&route=" + encodeURIComponent(route);
     const d = await api("/health/upstreams?" + qs);
     healthData = d;
     renderHealth();
@@ -5256,6 +5384,7 @@ async function clearHealth(id, all) {
 }
 
 $("#healthRefresh").onclick = () => loadHealth();
+if ($("#healthRoute")) $("#healthRoute").onchange = () => loadHealth();
 $("#healthHours").onchange = () => loadHealth();
 $("#healthOnlyBad").onchange = () => renderHealth();
 $("#healthClearAll").onclick = async () => {
@@ -5387,9 +5516,9 @@ function renderSessions() {
   const auto = sessRefreshSeconds();
   const autoHint = $("#sessAutoHint");
   if (autoHint) autoHint.textContent = String(auto);
-  const onlyExt = $("#sessOnlyExternal") && $("#sessOnlyExternal").checked;
+  const routeMode = ($("#sessRoute") && $("#sessRoute").value) || "all";
   const needle = ($("#sessSearch") && $("#sessSearch").value || "").trim().toLowerCase();
-  const dataSig = JSON.stringify({ range: d.range, totals: t, external: e, journal: j, rows: d.rows, sessions: d.sessions, sources: d.sources, onlyExt, needle });
+  const dataSig = JSON.stringify({ range: d.range, route: routeMode, totals: t, external: e, journal: j, rows: d.rows, sessions: d.sessions, sources: d.sources, needle });
   const metaHtml = [
     ["窗口", sessRange],
     ["Provider/模型", fmtCount(d.rows_total) + " 个"],
@@ -5458,7 +5587,8 @@ function renderSessions() {
   setTabNum("sessions", ext, ext > 0, "窗口内没走本机路由的调用轮数");
 
   let rows = (d.rows || []).slice();
-  if (onlyExt) rows = rows.filter(r => !r.routed);
+  if (routeMode === "external") rows = rows.filter(r => !r.routed);
+  else if (routeMode === "routed") rows = rows.filter(r => r.routed);
   if (needle) rows = rows.filter(r => [r.agent, r.source, r.provider, r.model, r.base_url].join(" ").toLowerCase().includes(needle));
   $("#sessRowsMeta").textContent = `${fmtCount(rows.length)} / ${fmtCount(d.rows_total || 0)} 行`;
   $("#sessRows").innerHTML = rows.length
@@ -5466,7 +5596,8 @@ function renderSessions() {
     : `<tr><td colspan="11" class="sess-empty">没有匹配的记录，试试换个筛选条件。</td></tr>`;
 
   let sess = (d.sessions || []).slice();
-  if (onlyExt) sess = sess.filter(s => (s.external_rounds || 0) > 0);
+  if (routeMode === "external") sess = sess.filter(s => (s.external_rounds || 0) > 0);
+  else if (routeMode === "routed") sess = sess.filter(s => (s.routed_rounds || 0) > 0);
   if (needle) sess = sess.filter(s => [s.agent, s.source, s.project, s.cwd, s.path].concat((s.external_models || []).map(m => m.label)).join(" ").toLowerCase().includes(needle));
   $("#sessListMeta").textContent = `${fmtCount(sess.length)} / ${fmtCount(d.sessions_total || 0)} 个`;
   $("#sessList").innerHTML = sess.length
@@ -5493,8 +5624,11 @@ async function loadSessions() {
       return;
     }
     const qs = new URLSearchParams({ sources: src.join(","), limit: "200" });
+    const route = ($("#sessRoute") && $("#sessRoute").value) || "all";
+    if (route !== "all") qs.set("route", route);
     if (win === "today") qs.set("range", "today");
     else qs.set("hours", win);
+    qs.set("metric", timingMode());
     const d = await api("/sessions/scan?" + qs.toString());
     sessData = d;
     renderSessions();
@@ -5585,7 +5719,9 @@ async function loadCacheLedger() {
   if (meta) meta.textContent = "正在统计 Prompt Cache…";
   try {
     const range = $("#cacheRange") ? $("#cacheRange").value : "today";
+    const route = ($("#cacheRoute") && $("#cacheRoute").value) || "all";
     const qs = new URLSearchParams();
+    if (route !== "all") qs.set("route", route);
     if (range === "today") qs.set("range", "today");
     else if (range === "0") qs.set("range", "all");
     else qs.set("hours", range);
@@ -5638,6 +5774,7 @@ if ($("#toolHours")) $("#toolHours").onchange = () => loadTools();
 
 if ($("#cacheRefresh")) $("#cacheRefresh").onclick = () => loadCacheLedger();
 if ($("#cacheRange")) $("#cacheRange").onchange = () => loadCacheLedger();
+if ($("#cacheRoute")) $("#cacheRoute").onchange = () => loadCacheLedger();
 
 if ($("#sessReload")) $("#sessReload").onclick = () => loadSessions();
 if ($("#sessHours")) $("#sessHours").onchange = () => loadSessions();
@@ -5645,7 +5782,7 @@ if ($("#sessHours")) $("#sessHours").onchange = () => loadSessions();
   const el = document.getElementById(id);
   if (el) el.onchange = () => loadSessions();
 });
-if ($("#sessOnlyExternal")) $("#sessOnlyExternal").onchange = () => renderSessions();
+if ($("#sessRoute")) $("#sessRoute").onchange = () => loadSessions();
 if ($("#sessSearch")) $("#sessSearch").oninput = () => renderSessions();
 
 // 自动刷新：跟随「设置 → 界面刷新 → 会话对账刷新间隔」（默认 5 秒）；只在本页可见且没有正在扫描时执行。

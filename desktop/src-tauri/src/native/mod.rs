@@ -224,6 +224,7 @@ pub async fn serve(state: Arc<AppState>, port: u16) -> Result<(), String> {
         .route("/health/upstreams", get(health::report))
         .route("/health/upstreams/clear", post(health::clear))
         .route("/sessions/scan", get(sessions::scan))
+        .route("/sessions/records", get(sessions::records))
         .route("/sessions/bases", get(sessions::bases))
         .route("/sessions/tools", get(sessions::tools))
         .layer(DefaultBodyLimit::max(64 * 1024 * 1024))

@@ -172,6 +172,9 @@ Agent 卡片会显示「默认模型 magpie/loomy/DeepSeek-V4.1-Flash（没走�
 成功率 / P50 / P95 / 首字 P50 / 缓存读 / 缓存写），用来判断是整条上游都慢、还是只有某一个模型慢。
 时间窗口默认「今天」（按本机时区当天 00:00 起算，不是滚动 24 小时），也可切 1 / 6 / 24 / 72 / 168 小时与「全部」，
 可勾「只看异常」（有失败 / 冷却中 / 已禁用 / 配置已删的孤儿记录）。
+顶部「路由范围」可切「全部请求 / 只过 LLM Router / 只未走 LLM Router」，默认全部：
+全部与未走模式会把 Agent 会话里的外部上游一并列出（这些行只有会话轮数与缓存量，成功率和延迟显示
+为「—」，因为它们不经过本机路由，没有本机健康样本）；路由模式只统计本机流水。
 「清除熔断」把内存里的连续失败计数与 60 秒冷却清零（阈值 3 次），不改状态文件。
 
 聚合来源是流水里的 `trail[]`（每次上游尝试一条），所以重试、切换上游都算得清；
@@ -183,6 +186,21 @@ Agent 卡片会显示「默认模型 magpie/loomy/DeepSeek-V4.1-Flash（没走�
 GET  /health/upstreams?range=today&limit=4000
 GET  /health/upstreams?hours=24&limit=4000
 POST /health/upstreams/clear  {"id":"..."} 或 {"all":true}
+```
+
+## 请求记录（全部 Agent 会话）
+
+请求记录页顶部「数据口径」默认是 **全部 Agent 会话**：直接读 DSH / Claude Code / Pi / Codex 的会话记录，
+每一条模型调用算一行，分类按 `provider / 模型`（与「会话对账」一致），不再只看经过本机 `8010` 的请求。
+切到「本机路由流水」才回到 `config.history.jsonl` 的客户端请求口径。
+
+DSH 行会从 `step/start` 到首个 `stream[].time` 计算首字延迟，从 `step/start` 到 `assistant/message` 计算总耗时；
+Claude / Pi / Codex 的会话记录没有首字时间时显示 `—`。表格里的 TPS 仍按「输出 token ÷ (总耗时 − 首字)」计算。
+
+```
+GET /sessions/records?range=today&limit=100
+GET /sessions/records?range=today&group=magpie/workbuddy/deepseek-v4.1-flash&limit=100
+GET /sessions/records?range=today&route=external&day=2026-11-15&limit=100
 ```
 
 ## 会话对账（找没走本机路由的调用）
@@ -204,7 +222,8 @@ baseURL**（`~/.dsh/settings.yaml` 与 profile patch 层、`~/.pi/agent/models.j
 这一页会立刻显示「未走路由」的调用轮数与 token，并按会话列出外部模型。
 
 大文件只读尾部（默认最后 48MiB / 每个数据源最多 400 个文件），窗口默认「今天」（本机时区当天 00:00 起），
-也可切 24h / 3 天 / 7 天 / 30 天 / 全部，可勾「只看未走路由」。
+也可切 24h / 3 天 / 7 天 / 30 天 / 全部；顶部「路由范围」默认「全部请求」，可切「只过 LLM Router /
+只未走 LLM Router」，切换后表格与会话卡会同步过滤。
 扫描在打开本页、切换筛选条件或点「重新扫描」时触发；页面可见时跟随「设置 → 界面刷新 →
 会话对账刷新间隔」自动重扫（默认 5 秒，范围 2–600 秒，独立于请求记录的间隔，只在本页可见且没有正在扫描时执行）。
 页面只读，不改任何配置。
@@ -216,6 +235,39 @@ GET /sessions/scan?range=today&sources=dsh,claude,pi,codex&limit=200
 GET /sessions/scan?hours=168&sources=dsh,claude,pi,codex&limit=200
 GET /sessions/bases
 ```
+
+## 首字与耗时口径（可切换）
+
+同一轮调用在 happycoding / Magpie / 我们三处面板上的「首字」和「总耗时」必然不同 —— 三家掐表的起点和终点都不一样。
+设置页新增「首字与耗时口径」卡片，可以三选一，默认 **happycoding**；切换后「请求记录」的首字、总耗时与 TPS 按新口径重算，
+原始会话记录与流水不改。健康看板统计的是本机路由流水里实测写下的时间，不参与换算。
+
+| 口径 | 首字 | 总耗时 | 已知偏差 |
+|---|---|---|---|
+| `happycoding`（默认，New API） | 第一个 SSE `data:` 帧（含 `role` 空帧 / `block-start`），网关开始处理请求算起 | 开始处理 → 写回完成，**截断到整秒** | 起点在读完请求体、选完渠道之后，排队与上传不计入，所以数字最小 |
+| `magpie` | 上游第一个**有内容**的字节（跳过空帧），网关收到请求头算起，含上传请求体时间 | 首字 + 纯解码段，到最后一个字节 | 会话记录里没有「网关收包」时刻：先按**会话 + 输入/输出/缓存读 token** 去 Magpie 用量日志对账，对上直接用网关实测 `ttft_ms` / `ms`（实测误差 0 ms）；对不上的回退到 DSH `request/header` 时刻，再没有就用 step 口径 |
+| `dsh` | 第一个流帧，`step/start` 算起 | `step/start` → `assistant/message` 落盘 | 含 DSH 自己序列化请求体的时间（实测中位比网关多约 1.8 秒），数字最大 |
+
+三套口径都从 DSH 会话里的同一批时间戳换算，差别在「哪一帧算首字」和「算到哪一帧」。
+各面板与我们的起点差异（DSH 本地序列化、happycoding 读完请求体才计时）无法从会话文件还原，
+所以 `magpie` 口径改为**直接和 Magpie 网关对账**：
+
+- Magpie 的 `GET /v1/magpie/usage/requests`（`Authorization: Bearer magpie`）记录每轮的
+  `ttft_ms`（网关收到请求头 → 上游第一个有内容的字节）与 `ms`（到最后一个字节）。
+- 后端每 30 秒在后台线程拉一次（最多 500 条），用「会话 id + 输入 / 输出 / 缓存读 token」
+  做指纹，对上的轮直接写网关实测值；本机没开 Magpie 时自动跳过，不影响其它口径。
+- DSH 的 `request/header`（写请求头的时刻，不带 turn/step，按最近一次 `step/start` 归属）
+  也一并落进每条记录：`request_header_seconds`。它是「网关收包」的本地近似，
+  对账失败时用它把 DSH 本地准备时间扣掉。
+- 每条记录带 `metric_source`：`magpie`（网关实测）/ `header`（按 request/header 推算）/
+  `step`（原始 step/start 口径）。请求页右上角显示「网关实测 N / M 轮」，展开单条请求能看到
+  这条记录用的是哪种时间。
+
+本机路由流水的时间是转发时实测写入的，不参与换算。
+
+接口参数：`GET /sessions/records?metric=happycoding|magpie|dsh`、`GET /sessions/scan?metric=...`；
+返回里带 `metric: {mode, rounds, magpie, header, magpie_available}`，说明这个窗口里多少轮真的取到了网关实测值。
+桌面端与浏览器各自的设置在 localStorage（`llm-router-timing-metric`），请求页工具条上也有同一个下拉可快捷切换。
 
 ## 图表与 MCP 工具排行榜
 
@@ -266,6 +318,7 @@ Claude/其它 5 分钟）；`session` / `strict` 固定 30 天；`turn` 只在�
 并单独标出其中走本机路由的子集。命中率 = `cache_read ÷ (input + cache_read + cache_write)`、
 节省 token = `cache_read`，同时给出粘性会话数量。
 接口：`GET /stats/cache-ledger?range=today`（或 `hours=24` / `range=all`）。
+顶部「路由范围」默认「全部请求」，可切「只过 LLM Router / 只未走 LLM Router」，接口对应 `route=routed|external`。
 
 > 缓存写说明：Agent 会话记录普遍只记缓存读，不记缓存写——DSH 的 usage 只有 `cacheReadTokens`，
 > Claude 的 `cache_creation_input_tokens`、Pi 的 `cacheWrite`、Codex 的 `cache_write_input_tokens`

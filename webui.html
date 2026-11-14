@@ -78,6 +78,18 @@
       <div class="reqbar">
         <span class="badge" id="sideCount"></span>
         <div class="grow"></div>
+        <select id="sideSource" style="font-size:12px;padding:5px 8px"
+              title="数据口径：全部 Agent 会话包含没经过 llm-router 的调用">
+          <option value="all" selected>全部 Agent 会话</option>
+          <option value="router">本机路由流水</option>
+        </select>
+        <select id="sideMetric" style="font-size:12px;padding:5px 8px"
+              title="首字 / 耗时口径，与设置页联动">
+          <option value="happycoding" selected>口径：happycoding</option>
+          <option value="magpie">口径：Magpie</option>
+          <option value="dsh">口径：DSH 会话</option>
+        </select>
+        <span class="hint" id="sideMetricNote" style="font-size:11.5px"></span>
         <select id="sideDay" style="font-size:12px;padding:5px 8px"
               title="按天筛选：只列这一天的调用记录">
           <option value="">全部日期</option>
@@ -336,7 +348,8 @@
       <div class="card">
         <h2>上游健康看板</h2>
         <div class="hint" style="margin:-6px 0 12px">
-          按落盘流水聚合：成功率 = 成功尝试 / 全部尝试；P50/P95 是尝试耗时分位数；
+          本机路由部分按落盘流水聚合；路由范围选「全部请求」时会合并外部 Agent 会话的调用轮数与 token
+          （外部会话没有延迟样本时 P50 / 首字显示「—」）。成功率 = 成功尝试 / 全部尝试；P50/P95 是尝试耗时分位数；
           <b>首字 P50</b> 是流式请求首个内容块到达时间，缓存读 / 缓存写只算在最后一次成功的尝试上。
           熔断阈值连续
           <code id="healthThreshold">3</code> 次失败，冷却 <code id="healthCooldown">60</code> 秒。
@@ -353,6 +366,11 @@
             <option value="72">最近 3 天</option>
             <option value="168">最近 7 天</option>
             <option value="0">全部（尾部缓存）</option>
+          </select>
+          <select id="healthRoute" style="font-size:12px;padding:5px 8px" title="路由范围：全部 / 只走过本机路由 / 只未走本机路由">
+            <option value="all" selected>全部请求</option>
+            <option value="routed">只过 LLM Router</option>
+            <option value="external">只未走 LLM Router</option>
           </select>
           <select id="healthOnlyBad" style="font-size:12px;padding:5px 8px" title="只看有问题的上游">
             <option value="0">全部上游</option>
@@ -426,10 +444,13 @@
               <label class="sess-check"><input type="checkbox" id="sessSrcCodex" checked><span>Codex</span></label>
             </div>
           </div>
-          <label class="sess-switch" title="只显示没走本机路由的记录">
-            <input type="checkbox" id="sessOnlyExternal">
-            <span class="sess-switch-track"><i></i></span>
-            <span>只看未走路由</span>
+          <label class="sess-field">
+            <span class="sess-field-label">路由范围</span>
+            <select id="sessRoute" class="sess-select" title="全部请求 / 只走过本机路由 / 只未走本机路由">
+              <option value="all" selected>全部请求</option>
+              <option value="routed">只过 LLM Router</option>
+              <option value="external">只未走 LLM Router</option>
+            </select>
           </label>
           <label class="sess-field sess-search">
             <span class="sess-field-label">筛选</span>
@@ -516,6 +537,11 @@
           <h2 style="margin:0">Prompt Cache 账本 <span class="badge" style="vertical-align:middle">全部 Agent 会话</span></h2>
           <span class="hint" id="cacheMeta"></span>
           <div class="grow"></div>
+          <select id="cacheRoute" class="chart-range" title="路由范围：全部 / 只走过本机路由 / 只未走本机路由">
+            <option value="all" selected>全部请求</option>
+            <option value="routed">只过 LLM Router</option>
+            <option value="external">只未走 LLM Router</option>
+          </select>
           <select id="cacheRange" class="chart-range" title="统计时间窗口">
             <option value="today" selected>今天（当天 00:00 起）</option>
             <option value="24">最近 24 小时</option>
@@ -670,6 +696,58 @@
           <span class="hint" id="refreshIntervalStatus"></span>
         </div>
         <div class="hint" style="margin-top:8px">只影响当前设备 / 浏览器，桌面和手机可以分别设置；会话对账要扫多个会话文件，建议不低于 5 秒。</div>
+      </div>
+
+      <div class="card" style="margin-top:14px" id="timingCard">
+        <h2>首字与耗时口径</h2>
+        <div class="hint" style="margin:-6px 0 12px">
+          三家面板对「首字」和「总耗时」的掐表位置不一样，同一个请求会得到三个数。这里选一套口径，
+          「请求记录」里的首字、总耗时与 TPS 会按它重算（原始会话记录不动，只换算法）。
+          本机路由流水是转发时实测写入的，健康看板按那份原始数据统计，不参与换算。
+        </div>
+        <div class="row" style="gap:10px;align-items:flex-end;flex-wrap:wrap">
+          <label class="cap-cell" style="max-width:260px">
+            <span class="cap-k">计算口径</span>
+            <select id="timingMode" style="font-size:13px">
+              <option value="happycoding">happycoding（New API）· 默认</option>
+              <option value="magpie">Magpie</option>
+              <option value="dsh">DSH 会话（当前方案）</option>
+            </select>
+          </label>
+          <span class="hint" id="timingStatus"></span>
+        </div>
+        <div class="hint" id="timingNote" style="margin-top:10px;line-height:1.75"></div>
+        <div class="timing-table-wrap">
+        <table class="timing-table">
+          <thead><tr><th>口径</th><th>首字怎么算</th><th>耗时怎么算</th><th>已知偏差</th></tr></thead>
+          <tbody>
+            <tr>
+              <td><b>happycoding</b><br><span class="hint">New API</span></td>
+              <td>第一个 SSE <code>data:</code> 帧到达（含 <code>role</code> 空帧 / <code>block-start</code> 这类不带内容的帧），从网关开始处理请求算起</td>
+              <td>网关开始处理 → 响应写回完成，<b>截断到整秒</b>（<code>Unix()</code> 秒差）</td>
+              <td>起点在读完请求体、选完渠道之后，前面的排队与上传不计入，所以数字最小</td>
+            </tr>
+            <tr>
+              <td><b>magpie</b><br><span class="hint">本地网关 3425</span></td>
+              <td>上游第一个<b>有内容</b>的字节（跳过空帧），网关从收到请求头开始算，含把请求体传给上游的时间</td>
+              <td>首字 + 纯解码段，到最后一个字节，毫秒精度</td>
+              <td>会话记录里没有「网关收包」时刻：按<b>会话 + 输入/输出/缓存读 token</b>去 Magpie 用量日志对账，对上直接取它的 <code>ttft_ms</code> / <code>ms</code>（实测误差 0 ms）；对不上的回退到 DSH <code>request/header</code> 时刻，再没有就退回 step 口径</td>
+            </tr>
+            <tr>
+              <td><b>dsh</b><br><span class="hint">会话记录</span></td>
+              <td>第一个流帧到达，从 <code>step/start</code> 算起</td>
+              <td><code>step/start</code> → <code>assistant/message</code> 落盘，毫秒精度</td>
+              <td>含 DSH 自己序列化请求体的时间（实测中位 +1.8 秒），所以数字最大</td>
+            </tr>
+          </tbody>
+        </table>
+        </div>
+        <div class="hint" style="margin-top:8px">
+          三套口径都从 DSH 会话里的同一批时间戳换算，原始记录不改：
+          happycoding = 首帧 + 整秒截断；magpie = Magpie 网关实测（对不上时用 <code>request/header</code> 时刻推算）；dsh = 首帧 + 到消息落盘。
+          起点都是 <code>step/start</code>；magpie 口径会读 <code>GET /v1/magpie/usage/requests</code>（本机没开 Magpie 时自动回退），
+          请求页右上角会显示「网关实测 N / M 轮」，展开单条请求还能看到这条记录用的是哪套时间。
+        </div>
       </div>
 
       <div class="card" style="margin-top:14px" id="updateCard">

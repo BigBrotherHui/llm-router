@@ -86,9 +86,11 @@ pub fn scan_key(q: &ScanQuery) -> String {
             None => "today".into(),
         });
     format!(
-        "scan|{range}|{}|{}",
+        "scan|{range}|{}|{}|{}|{}",
         norm_sources(q.sources.as_deref()),
-        q.limit.unwrap_or(200)
+        q.limit.unwrap_or(200),
+        q.route.as_deref().unwrap_or("all").trim().to_ascii_lowercase(),
+        q.metric.as_deref().unwrap_or("happycoding").trim().to_ascii_lowercase()
     )
 }
 
@@ -120,6 +122,14 @@ pub fn start(state: Arc<AppState>) {
                 range: Some("today".into()),
                 sources: Some("dsh,claude,pi,codex".into()),
                 limit: Some(200),
+                route: None,
+                metric: None,
+                day: None,
+                month: None,
+                group: None,
+                upstream: None,
+                model: None,
+                offset: None,
             };
             invalidate(&scan_key(&scan_q));
             let _ = sessions::scan(State(state.clone()), Query(scan_q)).await;
