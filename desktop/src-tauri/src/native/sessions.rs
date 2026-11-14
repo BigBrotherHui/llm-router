@@ -263,6 +263,7 @@ struct Agg {
     first_ms: i64,
     last_ms: i64,
     durations: Vec<f64>,
+    first_chunks: Vec<f64>,
     sessions: HashSet<String>,
 }
 
@@ -284,6 +285,7 @@ impl Agg {
             first_ms: 0,
             last_ms: 0,
             durations: Vec::new(),
+            first_chunks: Vec::new(),
             sessions: HashSet::new(),
         }
     }
@@ -297,10 +299,16 @@ impl Agg {
         cache_write: u64,
         total: u64,
         duration_ms: Option<f64>,
+        first_chunk_ms: Option<f64>,
     ) {
         if let Some(d) = duration_ms {
             if d > 0.0 {
                 self.durations.push(d / 1000.0);
+            }
+        }
+        if let Some(f) = first_chunk_ms {
+            if f > 0.0 {
+                self.first_chunks.push(f / 1000.0);
             }
         }
         self.rounds += 1;
@@ -367,11 +375,12 @@ fn bump(
     at_ms: i64,
     u: [u64; 5],
     duration_ms: Option<f64>,
+    first_chunk_ms: Option<f64>,
 ) {
     let e = aggs
         .entry(key.to_string())
         .or_insert_with(|| make());
-    e.add(at_ms, u[0], u[1], u[2], u[3], u[4], duration_ms);
+    e.add(at_ms, u[0], u[1], u[2], u[3], u[4], duration_ms, first_chunk_ms);
 }
 
 fn num(v: &Value) -> u64 {
@@ -719,6 +728,7 @@ impl<'a> Ctx<'a> {
             at_ms,
             usage,
             duration_ms,
+            first_chunk_ms,
         );
         if let Some(e) = self.aggs.get_mut(&key) {
             e.routed = routed;
@@ -862,6 +872,8 @@ struct LedgerAgg {
     sessions: HashSet<String>,
     upstreams: HashSet<String>,
     last_at: f64,
+    durations: Vec<f64>,
+    first_chunks: Vec<f64>,
 }
 
 impl LedgerAgg {
@@ -878,6 +890,8 @@ impl LedgerAgg {
             self.routed_cache_read += a.cache_read;
             self.routed_cache_write += a.cache_write;
         }
+        self.durations.extend_from_slice(&a.durations);
+        self.first_chunks.extend_from_slice(&a.first_chunks);
         self.sessions.extend(a.sessions.iter().cloned());
         if !a.provider.is_empty() {
             self.upstreams.insert(a.provider.clone());
@@ -896,6 +910,24 @@ impl LedgerAgg {
         self.last_at = self.last_at.max(s.ended_ms as f64 / 1000.0);
     }
 
+    fn p50(&self, p: f64) -> Value {
+        if self.durations.is_empty() {
+            return Value::Null;
+        }
+        json!(pct_ms(&self.durations, p) / 1000.0)
+    }
+
+    fn p95(&self) -> Value {
+        self.p50(0.95)
+    }
+
+    fn fc50(&self) -> Value {
+        if self.first_chunks.is_empty() {
+            return Value::Null;
+        }
+        json!(pct_ms(&self.first_chunks, 0.50) / 1000.0)
+    }
+
     fn json(&self, label: &str) -> Value {
         let prompt = self.input + self.cache_read + self.cache_write;
         json!({
@@ -911,6 +943,9 @@ impl LedgerAgg {
             "routed_cache_read": self.routed_cache_read,
             "routed_cache_write": self.routed_cache_write,
             "prompt_tokens": prompt,
+            "p50_seconds": self.p50(0.50),
+            "p95_seconds": self.p95(),
+            "first_chunk_p50_seconds": self.fc50(),
             "hit_rate": if prompt > 0 { (self.cache_read as f64 / prompt as f64 * 1000.0).round() / 10.0 } else { 0.0 },
             "saved_tokens": self.cache_read,
             "sessions": self.sessions.len(),
@@ -922,13 +957,17 @@ impl LedgerAgg {
 
 /// 所有 Agent 会话的缓存账本。和路由流水无关：DSH / Claude / Pi / Codex
 /// 各自写的会话记录里只要有 usage，就进入这里；`routed` 只是其中一个子集。
-pub fn session_cache_ledger(port: u16, since_ms: i64, route: u8) -> Value {
+pub fn session_cache_ledger(port: u16, since_ms: i64, route: u8, metric: u8) -> Value {
     let home = home();
     let bases = collect_bases(&home);
     let mut aggs: AggMap = HashMap::new();
     let mut sessions: SessList = Vec::new();
     {
-        let mut ctx = Ctx { bases: &bases, port, since_ms, route_filter: route, metric: 0, magpie: HashMap::new(), aggs: &mut aggs, sessions: &mut sessions, records: None };
+        let mut ctx = Ctx {
+            bases: &bases, port, since_ms, route_filter: route, metric,
+            magpie: if metric == 1 { magpie_offsets() } else { HashMap::new() },
+            aggs: &mut aggs, sessions: &mut sessions, records: None,
+        };
         let mut st = blank_stat("dsh", "DeepSeek Harness");
         scan_dsh(&mut ctx, &home, &mut st);
         let mut st = blank_stat("claude", "Claude Code");

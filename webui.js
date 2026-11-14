@@ -5146,33 +5146,53 @@ function healthAxes(r) {
   return [Number(r.success_rate) || 0, healthSpeedScore(r.p50_seconds), healthFirstScore(r.first_chunk_p50_seconds), stable, cache];
 }
 function renderHealthCharts(d) {
-  const rows = (d.upstreams || []).filter(r => !r.external && (r.calls || 0) > 0);
-  const barRows = rows.slice(0, 10).map(r => {
-    const rate = Number(r.success_rate) || 0;
+  // 外部 Agent 会话的上游也要进图：它们没有成功率（会话记录里没有失败），但有调用量、
+  // P50 与首字，所以条形图在「全都没成功率」时退回按调用量画，雷达用 0 表示未测到。
+  const all = (d.upstreams || []).filter(r => (r.calls || 0) > 0);
+  const rows = all.filter(r => !r.external);
+  const rateRows = all.filter(r => r.success_rate != null);
+  const pctMode = rateRows.length > 0;
+  // 有成功率时按百分比排序画；全是外部会话（没有成功率）时退回按调用量画。
+  const barSrc = pctMode
+    ? rateRows.slice().sort((a, b) => (Number(b.success_rate) || 0) - (Number(a.success_rate) || 0))
+    : all.slice().sort((a, b) => (b.calls || 0) - (a.calls || 0));
+  const barRows = barSrc.slice(0, 10).map(r => {
+    const rate = r.success_rate == null ? 0 : Number(r.success_rate);
+    const base = pctMode ? rate : (Number(r.calls) || 0);
     return {
       label: r.upstream || "(未命名)",
-      value: rate,
-      display: rate.toFixed(1) + "%",
-      title: `${r.upstream} · ${fmtCount(r.calls)} 次尝试 · 成功 ${fmtCount(r.ok)} / 失败 ${fmtCount(r.failed)} · P50 ${chartMs((r.p50_seconds || 0) * 1000)}`,
-      color: rate >= 95 ? CHART_COLORS.green : rate >= 80 ? CHART_COLORS.warn : CHART_COLORS.red,
+      value: base,
+      display: pctMode ? rate.toFixed(1) + "%" : fmtCount(r.calls) + " 轮",
+      title: r.external
+        ? `${r.upstream} · ${fmtCount(r.calls)} 轮 · P50 ${chartMs((r.p50_seconds || 0) * 1000)} · 首字 P50 ${chartMs((r.first_chunk_p50_seconds || 0) * 1000)} · 外部 Agent 会话`
+        : `${r.upstream} · ${fmtCount(r.calls)} 次尝试 · 成功 ${fmtCount(r.ok)} / 失败 ${fmtCount(r.failed)} · P50 ${chartMs((r.p50_seconds || 0) * 1000)}`,
+      color: r.external
+        ? CHART_COLORS.purple || CHART_COLORS.blue
+        : (rate >= 95 ? CHART_COLORS.green : rate >= 80 ? CHART_COLORS.warn : CHART_COLORS.red),
     };
   });
-  barChart($("#healthBarChart"), barRows, { max: 100, labelChars: 16, empty: "这一窗口没有上游调用" });
+  const barTitle = $("#healthBarTitle");
+  if (barTitle) barTitle.textContent = pctMode ? "上游成功率（按成功率 Top 10）" : "上游调用量 Top 10（外部会话没有成功率）";
+  barChart($("#healthBarChart"), barRows, {
+    max: pctMode ? 100 : undefined,
+    labelChars: 16,
+    empty: "这一窗口没有上游调用",
+  });
 
   const sel = $("#healthRadarUp");
   if (!sel) return;
-  if (!rows.length) {
+  if (!all.length) {
     sel.innerHTML = "";
     chartEmpty($("#healthRadarChart"), "这一窗口没有上游调用");
     return;
   }
   const prev = sel.value;
-  sel.innerHTML = rows.map(r => `<option value="${esc(r.upstream || "")}">${esc(r.upstream || "(未命名)")}</option>`).join("");
-  if (prev && rows.some(r => (r.upstream || "") === prev)) sel.value = prev;
-  const chosen = rows.find(r => (r.upstream || "") === sel.value) || rows[0];
+  sel.innerHTML = all.map(r => `<option value="${esc(r.upstream || "")}">${esc(r.upstream || "(未命名)")}${r.external ? " · 外部" : ""}</option>`).join("");
+  if (prev && all.some(r => (r.upstream || "") === prev)) sel.value = prev;
+  const chosen = all.find(r => (r.upstream || "") === sel.value) || all[0];
   const axes = ["成功率", "响应速度", "首字速度", "稳定性", "缓存复用"];
   const avg = [0, 0, 0, 0, 0];
-  rows.forEach(r => healthAxes(r).forEach((v, i) => { avg[i] += v / rows.length; }));
+  all.forEach(r => healthAxes(r).forEach((v, i) => { avg[i] += v / all.length; }));
   radarChart($("#healthRadarChart"), axes, [
     { name: chosen.upstream || "(未命名)", values: healthAxes(chosen), color: CHART_COLORS.blue },
     { name: "全部平均", values: avg, color: CHART_COLORS.purple },
@@ -5266,18 +5286,24 @@ function renderHealth() {
       : `扫描 ${fmtCount(d.scanned)} 条 · 采用 ${fmtCount(d.kept)} 条`;
   $("#healthMeta").textContent = `窗口 ${d.range === "today" ? "今天 00:00 起" : d.range === "all" || d.hours === 0 ? "全部" : d.hours + "h"} · ${scanLabel}${routeLabel}${extLabel} · ${d.generated_at || ""}`;
   renderHealthCharts(d);
+  // 外部 Agent 会话记录里没有失败信息，只有本机路由流水才有真实成败；
+  // 这一窗口全是外部会话时不要伪造成 100% 成功率。
+  const noFail = (d.kept || 0) === 0 && (d.external_calls || 0) > 0;
+  const failHint = noFail ? "外部 Agent 会话记录不含失败信息，只统计到轮次与 token" : "";
   $("#healthTotals").innerHTML = `<div class="tkn">
     ${healthCell(hr === "external" ? "外部轮次" : (hr === "routed" ? "路由尝试" : "调用尝试"), fmtCount(t.calls))}
-    ${healthCell("成功", fmtCount(t.ok), "var(--ok)")}
-    ${healthCell("失败", fmtCount(t.failed), t.failed ? "var(--bad)" : "")}
-    ${healthCell(hr === "routed" ? "路由成功率" : "成功率", healthPct(t.success_rate), "var(--accent)")}
+    ${healthCell(noFail ? "成功（无数据）" : "成功", noFail ? "—" : fmtCount(t.ok), noFail ? "" : "var(--ok)")}
+    ${healthCell(noFail ? "失败（无数据）" : "失败", noFail ? "—" : fmtCount(t.failed), !noFail && t.failed ? "var(--bad)" : "")}
+    ${healthCell(hr === "routed" ? "路由成功率" : "成功率", noFail ? "—" : healthPct(t.success_rate), noFail ? "" : "var(--accent)")}
+    ${healthCell("总耗时 P50", healthLat(t.p50_seconds), "var(--accent)")}
+    ${healthCell("总耗时 P95", healthLat(t.p95_seconds))}
     ${healthCell("首字 P50", healthLat(t.first_chunk_p50_seconds))}
     ${healthCell("缓存读", fmtNum(t.cache_read))}
     ${healthCell("缓存写", fmtNum(t.cache_write))}
     ${healthCell("输入", fmtNum(t.input))}
     ${healthCell("输出", fmtNum(t.output))}
     ${d.external_calls && hr !== "external" ? healthCell("外部 Agent", fmtCount(d.external_calls), "var(--dim)") : ""}
-  </div>`;
+  </div>${failHint ? `<div class="hint" style="margin-top:6px">${failHint}</div>` : ""}`;
 
   const onlyBad = $("#healthOnlyBad").value === "1";
   let rows = (d.upstreams || []).slice();
@@ -5362,6 +5388,8 @@ async function loadHealth() {
     const route = ($("#healthRoute") && $("#healthRoute").value) || "all";
     let qs = hours === "today" ? "range=today" : "hours=" + encodeURIComponent(hours);
     if (route !== "all") qs += "&route=" + encodeURIComponent(route);
+    // 外部 Agent 会话的耗时 / 首字按请求页当前口径取，否则一侧是 magpie 实测、一侧是 step 口径会对不上
+    qs += "&metric=" + encodeURIComponent(timingMode());
     const d = await api("/health/upstreams?" + qs);
     healthData = d;
     renderHealth();
@@ -5722,6 +5750,7 @@ async function loadCacheLedger() {
     const route = ($("#cacheRoute") && $("#cacheRoute").value) || "all";
     const qs = new URLSearchParams();
     if (route !== "all") qs.set("route", route);
+    qs.set("metric", timingMode());
     if (range === "today") qs.set("range", "today");
     else if (range === "0") qs.set("range", "all");
     else qs.set("hours", range);

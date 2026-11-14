@@ -214,7 +214,8 @@ pub async fn report(
         .map(|s| s.trim().to_ascii_lowercase())
         .unwrap_or_else(|| "all".to_string());
     let route_filter = super::sessions::route_filter(Some(route.as_str()));
-    let cache_key = format!("health|{}|{}|{}|{}", range, hours as i64, limit, route);
+    let metric = super::sessions::metric_mode(q.get("metric").map(|s| s.as_str()));
+    let cache_key = format!("health|{}|{}|{}|{}|{}", range, hours as i64, limit, route, metric);
     if let Some(v) = super::collector::get(&cache_key, 5) {
         return ok(v);
     }
@@ -356,7 +357,7 @@ pub async fn report(
         }
         let port = state.port.load(std::sync::atomic::Ordering::Relaxed);
         let since_ms = if cutoff > 0.0 { (cutoff * 1000.0).round() as i64 } else { 0 };
-        let ext = super::sessions::session_cache_ledger(port, since_ms, 2);
+        let ext = super::sessions::session_cache_ledger(port, since_ms, 2, metric);
         external_totals = ext.get("totals").cloned().unwrap_or(Value::Null);
         if let Some(list) = ext.get("upstreams").and_then(|v| v.as_array()) {
             for u in list {
@@ -377,9 +378,9 @@ pub async fn report(
                     "ok": calls,
                     "failed": 0,
                     "success_rate": Value::Null,
-                    "p50_seconds": Value::Null,
-                    "p95_seconds": Value::Null,
-                    "first_chunk_p50_seconds": Value::Null,
+                    "p50_seconds": u.get("p50_seconds").cloned().unwrap_or(Value::Null),
+                    "p95_seconds": u.get("p95_seconds").cloned().unwrap_or(Value::Null),
+                    "first_chunk_p50_seconds": u.get("first_chunk_p50_seconds").cloned().unwrap_or(Value::Null),
                     "cache_read": u.get("cache_read").cloned().unwrap_or(json!(0)),
                     "cache_write": u.get("cache_write").cloned().unwrap_or(json!(0)),
                     "models": [],
@@ -396,6 +397,16 @@ pub async fn report(
             bc.cmp(&ac)
         })
     });
+
+    // 外部 Agent 会话没有「上游尝试」记录，但 session_cache_ledger 已经按每轮真实耗时
+    // 算好了 p50 / p95 / 首字 p50（百分位基于样本，不是平均）。本机流水没有延迟样本时
+    // （当天没走 8010）总览直接回填外部的分位数，避免显示成空白。
+    let ext_p50 = external_totals.get("p50_seconds").cloned().unwrap_or(Value::Null);
+    let ext_p95 = external_totals.get("p95_seconds").cloned().unwrap_or(Value::Null);
+    let ext_fc = external_totals
+        .get("first_chunk_p50_seconds")
+        .cloned()
+        .unwrap_or(Value::Null);
 
     let mut totals = if route_filter == 2 { external_totals.clone() } else { total_agg.json() };
     if route_filter == 0 {
@@ -416,6 +427,15 @@ pub async fn report(
                 let ok = old_ok + ext_calls;
                 let att = old_attempts + ext_calls;
                 obj.insert("success_rate".into(), json!(if att > 0 { (ok as f64 / att as f64 * 1000.0).round() / 10.0 } else { 0.0 }));
+                if obj.get("p50_seconds").map(|v| v.is_null()).unwrap_or(true) && !ext_p50.is_null() {
+                    obj.insert("p50_seconds".into(), ext_p50.clone());
+                }
+                if obj.get("p95_seconds").map(|v| v.is_null()).unwrap_or(true) && !ext_p95.is_null() {
+                    obj.insert("p95_seconds".into(), ext_p95.clone());
+                }
+                if obj.get("first_chunk_p50_seconds").map(|v| v.is_null()).unwrap_or(true) && !ext_fc.is_null() {
+                    obj.insert("first_chunk_p50_seconds".into(), ext_fc.clone());
+                }
             }
         }
     }
