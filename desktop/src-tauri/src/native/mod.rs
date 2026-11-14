@@ -2,6 +2,7 @@ pub mod admin;
 pub mod agents;
 pub mod anthropic;
 pub mod checkin;
+pub mod health;
 pub mod journal;
 pub mod proxy;
 pub mod relay;
@@ -160,9 +161,12 @@ pub async fn serve(state: Arc<AppState>, port: u16) -> Result<(), String> {
         .route("/agents/scan", get(agents::list))
         .route("/agents/configure", post(agents::configure))
         .route("/agents/restore", post(agents::restore))
+        .route("/agents/repair", post(agents::repair))
         .route("/data/summary", get(transfer::summary))
         .route("/data/export", post(transfer::export_data))
         .route("/data/import", post(transfer::import_data))
+        .route("/health/upstreams", get(health::report))
+        .route("/health/upstreams/clear", post(health::clear))
         .layer(DefaultBodyLimit::max(64 * 1024 * 1024))
         .layer(CompressionLayer::new().compress_when(
             DefaultPredicate::new().and(NotForContentType::new("text/event-stream")),

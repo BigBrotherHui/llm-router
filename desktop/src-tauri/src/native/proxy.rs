@@ -1,4 +1,5 @@
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
+use std::time::Instant;
 
 use axum::body::Body;
 use axum::extract::State;
@@ -9,6 +10,157 @@ use futures_util::StreamExt;
 use serde_json::{json, Value};
 
 use super::state::{mask_key, AppState, Upstream};
+
+/// 流式响应期间累积的用量与分块信息。
+#[derive(Default)]
+struct StreamUsage {
+    /// 上游 SSE 里出现过的所有 usage 字段合并结果（保留原始键名）。
+    usage: Value,
+    chunks: usize,
+    first_chunk_seconds: Option<f64>,
+}
+
+/// 把后到的 usage 对象合并进已有对象；嵌套对象递归合并。
+/// message_start / message_delta 这类分段回报的字段靠这个拼回完整 usage。
+fn merge_usage(dst: &mut Value, src: &Value) {
+    if let (Some(d), Some(s)) = (dst.as_object_mut(), src.as_object()) {
+        for (k, v) in s {
+            if v.is_object() {
+                let slot = d.entry(k.clone()).or_insert_with(|| json!({}));
+                merge_usage(slot, v);
+            } else {
+                d.insert(k.clone(), v.clone());
+            }
+        }
+    }
+}
+
+/// 从一行 SSE 里抽取 usage / 内容块，并记录首块到达时间。
+fn observe_sse_line(line: &str, shared: &Arc<Mutex<StreamUsage>>, started_all: Instant) {
+    let trimmed = line.trim_start();
+    let Some(rest) = trimmed.strip_prefix("data:") else {
+        return;
+    };
+    let payload = rest.trim();
+    if payload.is_empty() || payload == "[DONE]" {
+        return;
+    }
+    let Ok(v) = serde_json::from_str::<Value>(payload) else {
+        return;
+    };
+    let mut acc = shared.lock().unwrap();
+    let mut usage = v.get("usage").cloned();
+    if usage.is_none() {
+        usage = v.pointer("/message/usage").cloned();
+    }
+    if let Some(u) = usage {
+        if u.is_object() {
+            merge_usage(&mut acc.usage, &u);
+        }
+    }
+    let has_delta = v
+        .pointer("/choices/0/delta/content")
+        .and_then(|c| c.as_str())
+        .map(|s| !s.is_empty())
+        .unwrap_or(false)
+        || v.pointer("/choices/0/delta/reasoning_content")
+            .and_then(|c| c.as_str())
+            .map(|s| !s.is_empty())
+            .unwrap_or(false)
+        || v.pointer("/choices/0/delta/tool_calls")
+            .and_then(|c| c.as_array())
+            .map(|a| !a.is_empty())
+            .unwrap_or(false)
+        || matches!(
+            v.get("type").and_then(|x| x.as_str()),
+            Some("content_block_delta")
+        );
+    if has_delta {
+        acc.chunks += 1;
+        if acc.first_chunk_seconds.is_none() {
+            acc.first_chunk_seconds = Some(started_all.elapsed().as_secs_f64());
+        }
+    }
+}
+
+/// 生成一条与 Python 版对齐的流水记录。
+/// elapsed_seconds = 整个请求耗时（含重试、含流式输出全过程）；
+/// first_chunk_seconds = 首个内容块到达时间（首字延迟，非流式时等于 elapsed_seconds）。
+#[allow(clippy::too_many_arguments)]
+fn journal_entry(
+    up: &Upstream,
+    requested: &str,
+    real_model: &str,
+    status: u16,
+    ok: bool,
+    stream: bool,
+    attempts: &[Value],
+    error: &str,
+    usage: &Value,
+    elapsed: f64,
+    first_chunk: Option<f64>,
+    chunks: usize,
+) -> Value {
+    let mut e = json!({
+        "at": chrono::Utc::now().timestamp() as f64,
+        "time": chrono::Local::now().format("%H:%M:%S").to_string(),
+        "upstream_id": up.id,
+        "upstream": up.name,
+        "key": mask_key(up.api_keys.first().map(|s| s.as_str()).unwrap_or("")),
+        "model": requested,
+        "effective_model": real_model,
+        "status": status,
+        "elapsed_seconds": elapsed,
+        "ok": ok,
+        "stream": stream,
+        "attempts": attempts.len(),
+        "route_source": "配置",
+        "error": error,
+        "usage": super::stats::with_normalized_usage(usage),
+        "trail": attempts,
+    });
+    e["first_chunk_seconds"] = first_chunk.map(|v| json!(v)).unwrap_or(Value::Null);
+    e["chunks"] = json!(chunks);
+    e
+}
+
+/// 流式请求结束时（或客户端提前断开时）写流水的守卫。
+/// async_stream 的 generator 被 drop 时局部变量一起 drop，保证不会漏记。
+struct StreamJournalGuard {
+    state: Arc<AppState>,
+    up: Upstream,
+    requested: String,
+    real_model: String,
+    attempts: Vec<Value>,
+    started_all: Instant,
+    shared: Arc<Mutex<StreamUsage>>,
+    written: bool,
+}
+
+impl Drop for StreamJournalGuard {
+    fn drop(&mut self) {
+        if self.written {
+            return;
+        }
+        self.written = true;
+        let acc = self.shared.lock().unwrap();
+        let e = journal_entry(
+            &self.up,
+            &self.requested,
+            &self.real_model,
+            200,
+            true,
+            true,
+            &self.attempts,
+            "",
+            &acc.usage,
+            self.started_all.elapsed().as_secs_f64(),
+            acc.first_chunk_seconds,
+            acc.chunks,
+        );
+        super::state::append_journal(&self.state, e);
+    }
+}
 
 fn join_url(base: &str, endpoint: &str) -> String {
     let mut b = base.trim_end_matches('/').to_string();
@@ -171,37 +323,19 @@ pub async fn chat_completions(
             }));
         };
     }
-    macro_rules! finish_journal {
-        ($final_up:expr, $final_model:expr, $final_status:expr, $final_ok:expr, $final_err:expr, $usage:expr) => {{
-            super::state::append_journal(
-                &state,
-                json!({
-                    "at": chrono::Utc::now().timestamp() as f64,
-                    "time": chrono::Local::now().format("%H:%M:%S").to_string(),
-                    "upstream_id": $final_up.id,
-                    "upstream": $final_up.name,
-                    "key": super::state::mask_key($final_up.api_keys.first().map(|s| s.as_str()).unwrap_or("")),
-                    "model": requested,
-                    "effective_model": $final_model,
-                    "status": $final_status,
-                    "elapsed_seconds": started_all.elapsed().as_secs_f64(),
-                    "ok": $final_ok,
-                    "stream": stream,
-                    "attempts": attempts.len(),
-                    "route_source": "配置",
-                    "error": $final_err,
-                    "usage": $usage,
-                    "trail": attempts,
-                }),
-            );
-        }};
-    }
-
     for (up, real_model) in &candidates {
         let url = join_url(&up.base_url, "/chat/completions");
         let mut out = payload.clone();
         out["model"] = json!(real_model);
-        let started = std::time::Instant::now();
+        if stream {
+            // 让上游在最后一块回报 usage；否则流式请求永远统计不到 token / 缓存读写。
+            if !out.get("stream_options").map(|v| v.is_object()).unwrap_or(false) {
+                out["stream_options"] = json!({ "include_usage": true });
+            } else if out["stream_options"].get("include_usage").is_none() {
+                out["stream_options"]["include_usage"] = json!(true);
+            }
+        }
+        let started = Instant::now();
         let resp = state
             .client
             .post(&url)
@@ -241,15 +375,33 @@ pub async fn chat_completions(
                         };
                         super::state::record_upstream_result(&state, &up.id, true, "");
                         push_attempt!(up, real_model, true, status.as_u16(), started.elapsed().as_secs_f64(), "");
-                        finish_journal!(up, real_model, 200, true, "", json!({}));
                         state.bump_total();
                         let requested_name = requested.clone();
+                        let shared = Arc::new(Mutex::new(StreamUsage {
+                            usage: json!({}),
+                            chunks: 0,
+                            first_chunk_seconds: None,
+                        }));
+                        let observe = shared.clone();
+                        let guard = StreamJournalGuard {
+                            state: state.clone(),
+                            up: up.clone(),
+                            requested: requested.clone(),
+                            real_model: real_model.clone(),
+                            attempts: attempts.clone(),
+                            started_all,
+                            shared,
+                            written: false,
+                        };
                         let body_stream = async_stream::stream! {
+                            // guard 被 generator 持有，流结束/客户端断开时 Drop 里补写完整流水。
+                            let _guard = guard;
                             let mut buffer = String::new();
                             buffer.push_str(&String::from_utf8_lossy(&first));
                             while let Some(pos) = buffer.find('\n') {
                                 let line = buffer[..=pos].to_string();
                                 buffer.drain(..=pos);
+                                observe_sse_line(&line, &observe, started_all);
                                 yield Ok::<_, std::io::Error>(Bytes::from(rewrite_sse_line(&line, &requested_name)));
                             }
                             while let Some(chunk) = source.next().await {
@@ -259,10 +411,12 @@ pub async fn chat_completions(
                                         while let Some(pos) = buffer.find('\n') {
                                             let line = buffer[..=pos].to_string();
                                             buffer.drain(..=pos);
+                                            observe_sse_line(&line, &observe, started_all);
                                             yield Ok::<_, std::io::Error>(Bytes::from(rewrite_sse_line(&line, &requested_name)));
                                         }
                                         // 单行异常长（没有换行）时先吐出去，防止内存无限增长
                                         if buffer.len() > 1024 * 1024 {
+                                            observe_sse_line(&buffer, &observe, started_all);
                                             yield Ok::<_, std::io::Error>(Bytes::from(rewrite_sse_line(&buffer, &requested_name)));
                                             buffer.clear();
                                         }
@@ -274,6 +428,7 @@ pub async fn chat_completions(
                                 }
                             }
                             if !buffer.is_empty() {
+                                observe_sse_line(&buffer, &observe, started_all);
                                 yield Ok::<_, std::io::Error>(Bytes::from(rewrite_sse_line(&buffer, &requested_name)));
                             }
                         };
@@ -300,7 +455,11 @@ pub async fn chat_completions(
                     let body = rewrite_model(&bytes, &requested).unwrap_or(bytes);
                     super::state::record_upstream_result(&state, &up.id, true, "");
                     push_attempt!(up, real_model, true, status.as_u16(), started.elapsed().as_secs_f64(), "");
-                    finish_journal!(up, real_model, 200, true, "", usage);
+                    let elapsed = started_all.elapsed().as_secs_f64();
+                    super::state::append_journal(
+                        &state,
+                        journal_entry(up, &requested, real_model, 200, true, false, &attempts, "", &usage, elapsed, Some(elapsed), 1),
+                    );
                     state.bump_total();
                     return Response::builder()
                         .status(StatusCode::OK)
@@ -333,7 +492,24 @@ pub async fn chat_completions(
                 requested.clone(),
             )
         });
-    finish_journal!(final_up, final_model, last_status.as_u16(), false, last_message, json!({}));
+    let elapsed = started_all.elapsed().as_secs_f64();
+    super::state::append_journal(
+        &state,
+        journal_entry(
+            &final_up,
+            &requested,
+            &final_model,
+            last_status.as_u16(),
+            false,
+            stream,
+            &attempts,
+            &last_message,
+            &json!({}),
+            elapsed,
+            None,
+            0,
+        ),
+    );
     error_response(last_status, &last_message, &attempts)
 }
 

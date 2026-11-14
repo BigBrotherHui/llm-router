@@ -491,6 +491,9 @@
     <button class="tab" data-tab="model" role="tab" aria-selected="false">
       <span>模型路由</span><span class="n" id="tabN-model" title="已配置路由的模型个数"></span>
     </button>
+    <button class="tab" data-tab="health" role="tab" aria-selected="false">
+      <span>健康看板</span><span class="n" id="tabN-health" title="异常上游数"></span>
+    </button>
     <button class="tab" data-tab="agent" role="tab" aria-selected="false">
       <span>本机 Agent</span><span class="n" id="tabN-agent" title="已识别的本机 Agent 数"></span>
     </button>
@@ -665,6 +668,41 @@
 
         <div id="agentResult" style="margin-top:10px"></div>
         <div id="agentList" style="margin-top:10px"></div>
+      </div>
+    </section>
+
+    <!-- ============ 上游健康看板 ============ -->
+    <section class="pane" id="pane-health" role="tabpanel" hidden>
+      <div class="card">
+        <h2>上游健康看板</h2>
+        <div class="hint" style="margin:-6px 0 12px">
+          按落盘流水聚合：成功率 = 成功尝试 / 全部尝试；P50/P95 是尝试耗时分位数；
+          <b>首字 P50</b> 是流式请求首个内容块到达时间。熔断阈值连续
+          <code id="healthThreshold">3</code> 次失败，冷却 <code id="healthCooldown">60</code> 秒。
+          历史流水由旧版本写入、没有首字字段时会显示「—」。
+          每个上游卡片默认只显示汇总；点「展开模型明细」把这个上游的数据按模型拆开，
+          逐个模型看调用次数、成功率和耗时，用来分清是整条上游都慢、还是只有某一个模型慢。
+        </div>
+        <div class="row" style="flex-wrap:wrap;gap:8px;align-items:center">
+          <select id="healthHours" style="font-size:12px;padding:5px 8px" title="统计时间窗口">
+            <option value="1">最近 1 小时</option>
+            <option value="6">最近 6 小时</option>
+            <option value="24" selected>最近 24 小时</option>
+            <option value="72">最近 3 天</option>
+            <option value="168">最近 7 天</option>
+            <option value="0">全部（尾部缓存）</option>
+          </select>
+          <select id="healthOnlyBad" style="font-size:12px;padding:5px 8px" title="只看有问题的上游">
+            <option value="0">全部上游</option>
+            <option value="1">只看异常 / 冷却中</option>
+          </select>
+          <button id="healthRefresh">↻ 刷新</button>
+          <button id="healthClearAll" title="清掉所有上游的连续失败计数与冷却，立刻恢复参与路由">清除全部熔断</button>
+          <div class="grow"></div>
+          <span class="hint" id="healthMeta"></span>
+        </div>
+        <div id="healthTotals" style="margin-top:10px"></div>
+        <div id="healthList" style="margin-top:10px"></div>
       </div>
     </section>
 
@@ -3480,6 +3518,47 @@ function fmtCount(n) {
   return Number.isFinite(v) ? v.toLocaleString("zh-CN") : String(n);
 }
 
+// TPS = 输出 token / 秒。优先「生成速度」（总耗时扣掉首字等待，最贴近体感）；
+// 旧流水没有 first_chunk_seconds 时退回「全链路速度」（输出 ÷ 总耗时，含首字等待）。
+function tpsOf(h) {
+  const out = Number((h.usage || {}).output);
+  const elapsed = Number(h.elapsed_seconds);
+  if (!Number.isFinite(out) || out <= 0 || !Number.isFinite(elapsed) || elapsed <= 0) return null;
+  const first = h.first_chunk_seconds != null ? Number(h.first_chunk_seconds) : null;
+  let genSecs = first != null && Number.isFinite(first) && elapsed > first ? elapsed - first : null;
+  const overall = out / elapsed;
+  let gen = null;
+  // 上游把整段一次性吐回来时首字≈总耗时，生成窗口趋近 0，
+  // 算出来的速度会到几万 tok/s，没有意义：窗口 < 50ms 或速度 > 1000 tok/s 视为不可测。
+  if (genSecs != null && genSecs >= 0.05) {
+    const g = out / genSecs;
+    if (g <= 1000) gen = g; else genSecs = null;
+  } else {
+    genSecs = null;
+  }
+  return { out, elapsed, first, genSecs, overall, gen };
+}
+function fmtTps(v) {
+  if (v == null || !Number.isFinite(v)) return "—";
+  return v >= 100 ? v.toFixed(0) : v.toFixed(1);
+}
+function tpsBadge(h) {
+  const t = tpsOf(h);
+  if (!t) return "";
+  const shown = t.gen != null ? t.gen : t.overall;
+  const tip = t.gen != null
+    ? `生成速度 ${fmtTps(t.gen)} tok/s = 输出 ${fmtNum(t.out)} tok ÷ 生成耗时 ${fmtLat(t.genSecs)}（总耗时扣掉首字等待）；全链路 ${fmtTps(t.overall)} tok/s`
+    : `全链路速度 ${fmtTps(t.overall)} tok/s = 输出 ${fmtNum(t.out)} tok ÷ 总耗时 ${fmtLat(t.elapsed)}；首字延迟缺失或生成窗口过短，无法单独算生成速度`;
+  return `<span class="badge" title="${tip}">TPS ${fmtTps(shown)} tok/s</span>`;
+}
+function tpsDetail(h) {
+  const t = tpsOf(h);
+  if (!t) return `输出速度：<code>—</code>（这条流水没有输出 token 或耗时）`;
+  const main = `生成速度：<code>${fmtTps(t.gen)} tok/s</code>（输出 ${fmtNum(t.out)} tok ÷ 生成耗时 ${fmtLat(t.genSecs)}）`;
+  const all = `全链路：<code>${fmtTps(t.overall)} tok/s</code>（输出 ${fmtNum(t.out)} tok ÷ 总耗时 ${fmtLat(t.elapsed)}）`;
+  return `输出速度：${t.gen != null ? main + "　·　" + all : all + "（首字延迟缺失或生成窗口过短，按全链路口径，含首字等待）"}`;
+}
+
 function usageCells(u, withCache) {
   if (!u || !Object.keys(u).length) {
     return `<div class="tkn"><div><b>—</b><span>无用量数据</span></div></div>`;
@@ -3598,6 +3677,7 @@ function renderSide() {
           <div><b>${fmtNum(g.usage.input)}</b><span>输入</span></div>
           <div><b>${fmtNum(g.usage.output)}</b><span>输出</span></div>
           <div class="tkn"><b style="color:var(--ok);font-size:13.5px">${fmtNum(g.usage.cache_read)}</b><span>缓存读</span></div>
+          <div class="tkn"><b style="color:var(--warn);font-size:13.5px">${fmtNum(g.usage.cache_write)}</b><span>缓存写</span></div>
         </div>
         ${g.upstreams.filter(u => !upName || u.upstream === upName).map(u => {
           // 失败只占条里对应的那一小段，别把整条染红 —— 414 次里错 16 次
@@ -3683,7 +3763,9 @@ function renderSide() {
         ${fellBack ? `<span class="hint">→ ${esc(h.upstream)}</span>` : ""}
         <div class="grow"></div>
         ${use.total != null ? `<span class="badge">${fmtNum(use.total)} tok</span>` : ""}
-        <span class="hint">${fmtLat(h.elapsed_seconds)}</span>
+        ${tpsBadge(h)}
+        <span class="hint" title="总耗时：从收到请求到整个响应结束（含重试、含流式输出全过程）">总耗时 ${fmtLat(h.elapsed_seconds)}</span>
+        ${h.first_chunk_seconds != null ? `<span class="hint" title="首字延迟：从收到请求到第一个内容块到达">首字 ${fmtLat(h.first_chunk_seconds)}</span>` : ""}
         ${h.stream ? `<span class="badge blue">流式</span>` : ""}
         ${requestPathSummary(h, trail)}
       </div>
@@ -3692,6 +3774,19 @@ function renderSide() {
         <div class="req-sec">
           <h5>Token 用量</h5>
           ${usageCells(use, true)}
+          <div class="hint" style="line-height:1.8;margin-top:4px">
+            缓存读 = 命中提示缓存的 token；缓存写 = 新建提示缓存的 token（Anthropic / DeepSeek / 中转站字段已统一归一）。
+            显示 0 表示上游确实没报缓存，显示「—」表示这条流水是旧版本写的、没有用量字段。
+          </div>
+        </div>
+        <div class="req-sec">
+          <h5>耗时</h5>
+          <div class="hint" style="line-height:1.8">
+            总耗时：<code>${fmtLat(h.elapsed_seconds)}</code>（从收到请求到响应结束，含上游重试与流式输出全过程）<br>
+            首字延迟：<code>${h.first_chunk_seconds != null ? fmtLat(h.first_chunk_seconds) : "—"}</code>（首个内容块到达，只有新版本流式流水才有）<br>
+            有效内容块：<code>${h.chunks != null ? fmtCount(h.chunks) : "—"}</code>　·　请求方式：<code>${h.stream ? "流式" : "非流式"}</code><br>
+             ${tpsDetail(h)}
+          </div>
         </div>
         <div class="req-sec">
           <h5>详情</h5>
@@ -3763,13 +3858,13 @@ async function ensureEntryText(at, upstream) {
 }
 
 /* ================= 左侧 tab：请求记录 / 上游来源 / 模型路由 ================= */
-const TABS = ["req", "up", "model", "agent", "ck", "set", "log"];
-const TAB_LABEL = { req: "请求记录", up: "上游来源", model: "模型路由", agent: "本机 Agent", ck: "签到", set: "设置", log: "日志" };
+const TABS = ["req", "up", "model", "health", "agent", "ck", "set", "log"];
+const TAB_LABEL = { req: "请求记录", up: "上游来源", model: "模型路由", health: "健康看板", agent: "本机 Agent", ck: "签到", set: "设置", log: "日志" };
 let curTab = null;
 
 function setTab(name) {
-  // 中继页面没有本地 /agents 接口，回退到请求记录
-  if (name === "agent" && !AGENT_LOCAL) name = "req";
+  // 中继页面没有本地 /agents、/health/upstreams 接口，回退到请求记录
+  if ((name === "agent" || name === "health") && !AGENT_LOCAL) name = "req";
   const tab = TABS.includes(name) ? name : "req";
   TABS.forEach(t => {
     const btn = document.querySelector(`#tabs .tab[data-tab="${t}"]`);
@@ -3789,6 +3884,8 @@ function setTab(name) {
   if (tab === "ck") loadCheckin();
   // 切到本机 Agent：扫一次本机安装情况
   if (tab === "agent") loadAgents();
+  // 切到健康看板：拉一次按上游聚合的指标
+  if (tab === "health") loadHealth();
   // 换 tab 时回到顶部，免得带着上一屏的滚动位置落进新内容中间
   if (curTab !== null && curTab !== tab) window.scrollTo(0, 0);
   curTab = tab;
@@ -5192,7 +5289,11 @@ function renderAgents() {
   list.innerHTML = agents.map(a => {
     const detected = !!a.detected;
     const sel = agentSelected === a.id;
+    const driftBadge = a.drifted
+      ? '<span class="badge" style="color:var(--bad)" title="配置被别的工具改走或不再指向本机路由">配置已漂移</span>'
+      : (a.expected_model ? '<span class="badge" style="color:var(--ok)">配置一致</span>' : "");
     const badges = [
+      driftBadge,
       a.source ? `<span class="badge">${esc(a.source)}</span>` : "",
       a.pkg ? `<span class="badge mono">${esc(a.pkg)}${a.version ? "@" + esc(a.version) : ""}</span>` : "",
       a.bin ? `<span class="badge mono">${esc(a.bin)}</span>` : "",
@@ -5202,6 +5303,8 @@ function renderAgents() {
     if (a.current_model) cur.push(`模型 <code>${esc(a.current_model)}</code>`);
     if (a.current_base) cur.push(`地址 <code>${esc(a.current_base)}</code>`);
     if (a.connected) cur.push('<span style="color:var(--ok)">已指向 llm-router</span>');
+    if (a.expected_model) cur.push(`上次导入 <code>${esc(a.expected_model)}</code>`);
+    if (a.applied_at) cur.push(`<span class="muted">${esc(a.applied_at)}</span>`);
     const notes = a.notes ? `<div class="hint muted" style="margin-top:4px">${esc(a.notes)}</div>` : "";
     const actions = a.configurable
       ? `<div class="row" style="gap:8px;align-items:center;margin-top:8px">
@@ -5209,6 +5312,7 @@ function renderAgents() {
              <input type="radio" name="agentPick" data-act="pick" data-id="${esc(a.id)}" ${sel ? "checked" : ""}> 选中
            </label>
            <button data-act="import" data-id="${esc(a.id)}" ${detected ? "" : "disabled"} title="${detected ? "一键写入该 Agent 配置" : "未检测到安装"}">一键导入此 Agent</button>
+           ${a.drifted ? `<button class="primary" data-act="repair" data-id="${esc(a.id)}" title="用上次导入的模型与地址写回">一键修回</button>` : ""}
          </div>`
       : '<div class="hint muted" style="margin-top:8px">仅识别，请用「复制通用配置」手动填写</div>';
     return `<div class="card" data-agent="${esc(a.id)}" style="margin:0 0 10px;${sel ? "border-color:var(--accent)" : ""}">
@@ -5300,8 +5404,34 @@ $("#agentList").addEventListener("click", ev => {
   } else if (el.dataset.act === "import") {
     agentSelected = id;
     importAgent(id, $("#agentDryRun").checked);
+  } else if (el.dataset.act === "repair") {
+    agentSelected = id;
+    repairAgent(id);
   }
 });
+
+async function repairAgent(id) {
+  if (!AGENT_LOCAL || agentImporting) return;
+  agentImporting = true;
+  try {
+    const r = await api("/agents/repair", { agent_id: id }, "POST");
+    agentResultHtml(`<div class="card" style="margin:0">
+      <div class="row" style="gap:8px;align-items:center">
+        <strong>${esc(r.name || id)}</strong>
+        <span class="badge" style="color:var(--ok)">已修回</span>
+        <span class="badge">${esc(r.model)}</span>
+      </div>
+      <div class="hint" style="margin-top:6px">写入位置：<code>${((r.config_paths && r.config_paths.length) ? r.config_paths : [r.config_path]).map(esc).join("</code>、<code>")}</code></div>
+    </div>`);
+    toast("配置已修回", "ok");
+    await loadAgents();
+  } catch (e) {
+    agentResultHtml(`<div class="hint" style="color:var(--bad)">修回失败：${esc(e.message || e)}</div>`);
+    toast("修回失败：" + (e.message || e), "bad");
+  } finally {
+    agentImporting = false;
+  }
+}
 $("#agentCopy").onclick = async () => {
   const model = $("#agentModel").value || (agentData && agentData.models && agentData.models[0]) || "";
   const key = (($("#agentApiKey").value || "llm-router").trim()) || "llm-router";
@@ -5501,6 +5631,157 @@ $("#transferImport").onclick = () => doTransferImport(false);
 if (!AGENT_LOCAL) {
   const card = $("#transferCard");
   if (card) card.style.display = "none";
+}
+
+/* ================= 健康看板：按上游聚合成功率 / 分位延迟 / 冷却 ================= */
+let healthData = null;
+let healthBusy = false;
+let healthOpen = new Set();
+
+function healthCell(label, value, color) {
+  return `<div class="tkn"><b${color ? ` style="color:${color}"` : ""}>${value == null ? "—" : value}</b><span>${label}</span></div>`;
+}
+function healthLat(v) { return v == null ? "—" : fmtLat(v); }
+function healthPct(v) { return v == null ? "—" : v.toFixed(1) + "%"; }
+function healthAt(v) {
+  if (v == null) return "—";
+  const d = new Date(v * 1000);
+  return Number.isNaN(d.getTime()) ? "—" : d.toLocaleString("zh-CN", { hour12: false });
+}
+
+function renderHealth() {
+  if (!healthData) return;
+  const d = healthData;
+  const t = d.totals || {};
+  $("#healthThreshold").textContent = d.threshold ?? 3;
+  $("#healthCooldown").textContent = d.cooldown_seconds ?? 60;
+  $("#healthMeta").textContent = `窗口 ${d.hours === 0 ? "全部" : d.hours + "h"} · 扫描 ${fmtCount(d.scanned)} 条 · 采用 ${fmtCount(d.kept)} 条 · ${d.generated_at || ""}`;
+  $("#healthTotals").innerHTML = `<div class="tkn">
+    ${healthCell("总尝试", fmtCount(t.calls))}
+    ${healthCell("成功", fmtCount(t.ok), "var(--ok)")}
+    ${healthCell("失败", fmtCount(t.failed), t.failed ? "var(--bad)" : "")}
+    ${healthCell("成功率", healthPct(t.success_rate), "var(--accent)")}
+    ${healthCell("缓存读", fmtNum(t.cache_read))}
+    ${healthCell("缓存写", fmtNum(t.cache_write))}
+  </div>`;
+
+  const onlyBad = $("#healthOnlyBad").value === "1";
+  let rows = (d.upstreams || []).slice();
+  const bad = r => (r.failed || 0) > 0 || r.cooldown_remaining_seconds > 0 || r.consecutive_failures > 0 || r.available === false || r.enabled === false || r.orphan;
+  if (onlyBad) rows = rows.filter(bad);
+  const badCount = (d.upstreams || []).filter(bad).length;
+  setTabNum("health", badCount, badCount > 0, "异常 / 冷却中的上游数");
+
+  if (!rows.length) {
+    $("#healthList").innerHTML = `<div class="hint">当前筛选下没有上游记录。</div>`;
+    return;
+  }
+  $("#healthList").innerHTML = rows.map((r, i) => {
+    const key = r.id || r.upstream || ("row" + i);
+    const open = healthOpen.has(key);
+    const statusBadge = r.orphan
+      ? `<span class="badge">配置已删除</span>`
+      : r.enabled === false
+        ? `<span class="badge">已禁用</span>`
+        : r.cooldown_remaining_seconds > 0
+          ? `<span class="badge" style="color:var(--bad)">冷却中 ${r.cooldown_remaining_seconds}s</span>`
+          : r.available === false
+            ? `<span class="badge" style="color:var(--bad)">熔断中</span>`
+            : `<span class="badge" style="color:var(--ok)">正常</span>`;
+    const models = r.models || [];
+    const modelRows = models.slice().sort((a, b) => (b.calls || 0) - (a.calls || 0)).map(m => `<tr>
+      <td class="mono">${esc(m.model || "-")}</td>
+      <td>${fmtCount(m.calls)}</td>
+      <td style="color:var(--ok)">${fmtCount(m.ok)}</td>
+      <td style="color:${m.failed ? "var(--bad)" : "var(--dim)"}">${fmtCount(m.failed)}</td>
+      <td>${healthPct(m.success_rate)}</td>
+      <td>${healthLat(m.p50_seconds)}</td>
+      <td>${healthLat(m.p95_seconds)}</td>
+      <td>${healthLat(m.first_chunk_p50_seconds)}</td>
+    </tr>`).join("");
+    return `<div class="card" style="margin-top:10px;padding:12px">
+      <div class="row" style="flex-wrap:wrap;gap:8px;align-items:center">
+        <b>${esc(r.upstream || "(未命名上游)")}</b>
+        ${statusBadge}
+        ${r.base_url ? `<span class="hint mono">${esc(r.base_url)}</span>` : ""}
+        <div class="grow"></div>
+        <button class="mini" data-health-act="clear" data-id="${esc(r.id || "")}" ${r.id ? "" : "disabled"} title="清掉这个上游的连续失败计数与冷却">清除熔断</button>
+        <button class="mini" data-health-act="toggle" data-key="${esc(key)}" title="把这个上游的统计按模型拆开，逐个模型看调用次数、成功率和耗时">${open ? "收起模型明细" : "展开模型明细 (" + models.length + ")"}</button>
+      </div>
+      <div class="tkn" style="margin-top:8px">
+        ${healthCell("尝试", fmtCount(r.calls))}
+        ${healthCell("成功", fmtCount(r.ok), "var(--ok)")}
+        ${healthCell("失败", fmtCount(r.failed), r.failed ? "var(--bad)" : "")}
+        ${healthCell("成功率", healthPct(r.success_rate), "var(--accent)")}
+        ${healthCell("P50", healthLat(r.p50_seconds))}
+        ${healthCell("P95", healthLat(r.p95_seconds))}
+        ${healthCell("P99", healthLat(r.p99_seconds))}
+        ${healthCell("首字 P50", healthLat(r.first_chunk_p50_seconds))}
+        ${healthCell("缓存读", fmtNum(r.cache_read))}
+        ${healthCell("缓存写", fmtNum(r.cache_write))}
+        ${healthCell("连续失败", fmtCount(r.consecutive_failures))}
+        ${healthCell("最近调用", healthAt(r.last_at))}
+      </div>
+      ${r.last_error || r.last_error_runtime ? `<div class="hint" style="margin-top:6px;color:var(--bad)">最后错误：${esc(r.last_error_runtime || r.last_error)}</div>` : ""}
+      ${open ? `<div style="margin-top:10px;overflow-x:auto">
+        <table class="mono" style="width:100%;font-size:12px;border-collapse:collapse">
+          <thead><tr style="text-align:left;color:var(--dim)">
+            <th>模型</th><th>尝试</th><th>成功</th><th>失败</th><th>成功率</th><th>P50</th><th>P95</th><th>首字 P50</th>
+          </tr></thead>
+          <tbody>${modelRows || `<tr><td colspan="8" class="hint">该窗口没有按模型的记录</td></tr>`}</tbody>
+        </table>
+      </div>` : ""}
+    </div>`;
+  }).join("");
+}
+
+async function loadHealth() {
+  if (healthBusy) return;
+  healthBusy = true;
+  try {
+    const hours = $("#healthHours") ? $("#healthHours").value : "24";
+    const d = await api("/health/upstreams?hours=" + encodeURIComponent(hours));
+    healthData = d;
+    renderHealth();
+  } catch (e) {
+    $("#healthList").innerHTML = `<div class="hint" style="color:var(--bad)">健康数据加载失败：${esc(e.message || e)}</div>`;
+  } finally {
+    healthBusy = false;
+  }
+}
+
+async function clearHealth(id, all) {
+  try {
+    const r = await api("/health/upstreams/clear", all ? { all: true } : { id });
+    toast(all ? "已清除全部熔断" : "已清除熔断", "ok");
+    await loadHealth();
+    return r;
+  } catch (e) {
+    toast("清除失败：" + (e.message || e), "bad");
+  }
+}
+
+$("#healthRefresh").onclick = () => loadHealth();
+$("#healthHours").onchange = () => loadHealth();
+$("#healthOnlyBad").onchange = () => renderHealth();
+$("#healthClearAll").onclick = async () => {
+  if (!confirm("清除所有上游的连续失败计数与冷却，让被熔断的上游立刻重新参与路由？")) return;
+  await clearHealth("", true);
+};
+$("#healthList").addEventListener("click", e => {
+  const btn = e.target.closest("[data-health-act]");
+  if (!btn) return;
+  if (btn.dataset.healthAct === "toggle") {
+    const k = btn.dataset.key;
+    if (healthOpen.has(k)) healthOpen.delete(k); else healthOpen.add(k);
+    renderHealth();
+  } else if (btn.dataset.healthAct === "clear") {
+    if (btn.dataset.id) clearHealth(btn.dataset.id, false);
+  }
+});
+if (!AGENT_LOCAL) {
+  const hb = document.querySelector('#tabs .tab[data-tab="health"]');
+  if (hb) hb.style.display = "none";
 }
 
 (async function boot() {

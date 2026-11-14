@@ -6,17 +6,130 @@ fn num(v: Option<&Value>) -> i64 {
     v.and_then(|x| x.as_i64()).unwrap_or(0)
 }
 
+/// 上游 usage 字段百花齐放：OpenAI 原生 prompt_tokens / completion_tokens、
+/// Anthropic 的 cache_creation_input_tokens + claude_cache_creation_5_m_tokens、
+/// 中转站塞进 billing_usage.claude_usage.*、opencode 塞进 opencode.tokens.*。
+/// 统一归一成 5 个键，否则「缓存读/写」永远显示 0 或 —。
+fn as_num(v: Option<&Value>) -> i64 {
+    match v {
+        Some(Value::Number(n)) => n
+            .as_i64()
+            .unwrap_or_else(|| n.as_f64().unwrap_or(0.0) as i64),
+        Some(Value::String(s)) => s.parse::<f64>().unwrap_or(0.0) as i64,
+        _ => 0,
+    }
+}
+
+fn at_path<'a>(usage: &'a Value, path: &[&str]) -> Option<&'a Value> {
+    let mut cur = usage;
+    for seg in path {
+        cur = cur.get(*seg)?;
+    }
+    Some(cur)
+}
+
+/// 别名组：取第一个非零值（同一个量的多种写法，不能相加）。
+fn first_of(usage: &Value, paths: &[&[&str]]) -> i64 {
+    for p in paths {
+        let n = as_num(at_path(usage, p));
+        if n != 0 {
+            return n;
+        }
+    }
+    0
+}
+
+/// 可叠加的多桶（1h / 5m 缓存写、多个 creation 明细）要相加。
+fn sum_of(usage: &Value, paths: &[&[&str]]) -> i64 {
+    paths.iter().map(|p| as_num(at_path(usage, p))).sum()
+}
+
+pub fn normalize_usage(raw: &Value) -> Value {
+    let input = first_of(
+        raw,
+        &[
+            &["input"],
+            &["prompt_tokens"],
+            &["input_tokens"],
+            &["billing_usage", "claude_usage", "input_tokens"],
+            &["opencode", "tokens", "input"],
+        ],
+    );
+    let output = first_of(
+        raw,
+        &[
+            &["output"],
+            &["completion_tokens"],
+            &["output_tokens"],
+            &["billing_usage", "claude_usage", "output_tokens"],
+            &["opencode", "tokens", "output"],
+        ],
+    );
+    let total_raw = first_of(raw, &[&["total"], &["total_tokens"]]);
+    let total = if total_raw != 0 { total_raw } else { input + output };
+    let cache_read = first_of(
+        raw,
+        &[
+            &["cache_read"],
+            &["cache_read_input_tokens"],
+            &["prompt_tokens_details", "cached_tokens"],
+            &["input_tokens_details", "cached_tokens"],
+            &["prompt_cache_hit_tokens"],
+            &["cached_tokens"],
+            &["billing_usage", "claude_usage", "cache_read_input_tokens"],
+            &["opencode", "tokens", "cache_read"],
+        ],
+    );
+    let cache_write = first_of(
+        raw,
+        &[
+            &["cache_write"],
+            &["cache_creation_input_tokens"],
+            &["prompt_cache_miss_tokens"],
+        ],
+    ) + sum_of(
+        raw,
+        &[
+            &["billing_usage", "claude_usage", "cache_creation_input_tokens"],
+            &["claude_cache_creation_1_h_tokens"],
+            &["claude_cache_creation_5_m_tokens"],
+            &["prompt_tokens_details", "cache_creation_tokens"],
+            &["cache_creation", "ephemeral_1h_input_tokens"],
+            &["cache_creation", "ephemeral_5m_input_tokens"],
+            &["opencode", "tokens", "cache_write_1h"],
+            &["opencode", "tokens", "cache_write_5m"],
+        ],
+    );
+    json!({
+        "input": input,
+        "output": output,
+        "total": total,
+        "cache_read": cache_read,
+        "cache_write": cache_write,
+    })
+}
+
+/// 写进流水时保留上游原始字段，同时补上 5 个标准键（覆盖同名字段），
+/// 这样前端 usageCells 和统计累计都读同一套键，不会一半显示、一半「—」。
+pub fn with_normalized_usage(raw: &Value) -> Value {
+    let mut v = raw.as_object().cloned().unwrap_or_default();
+    let n = normalize_usage(raw);
+    for k in USAGE_KEYS {
+        v.insert(k.to_string(), n[k].clone());
+    }
+    Value::Object(v)
+}
+
 fn float(v: Option<&Value>) -> f64 {
     v.and_then(|x| x.as_f64()).unwrap_or(0.0)
 }
 
 fn usage_of(bucket: &Value) -> Value {
+    // 5 个键全给，0 也写明：前端 fmtNum(0) 显示 0，而不是缺字段显示「—」，
+    // 用户才分得清「上游没报」和「真的没缓存命中」。
     let mut out = Map::new();
     for k in USAGE_KEYS {
-        let v = num(bucket.get(k));
-        if v != 0 {
-            out.insert(k.to_string(), json!(v));
-        }
+        out.insert(k.to_string(), json!(num(bucket.get(k))));
     }
     Value::Object(out)
 }
@@ -177,7 +290,9 @@ pub fn record(state: &super::state::AppState, entry: &Value) {
         .get("elapsed_seconds")
         .and_then(|v| v.as_f64())
         .unwrap_or(0.0);
-    let usage = entry.get("usage").cloned().unwrap_or_else(|| json!({}));
+    // 流水里的 usage 可能是上游原始格式，先归一成 5 键再累计。
+    let raw_usage = entry.get("usage").cloned().unwrap_or_else(|| json!({}));
+    let usage = normalize_usage(&raw_usage);
     let trail = entry
         .get("trail")
         .and_then(|v| v.as_array())

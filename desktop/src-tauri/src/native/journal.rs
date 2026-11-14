@@ -30,6 +30,11 @@ fn read_tail(path: &std::path::Path, max_bytes: u64) -> Vec<Value> {
         .collect()
 }
 
+/// 健康看板取最近的流水条目（尾部缓存，按文件大小+mtime 失效）。
+pub fn recent(state: &AppState) -> Arc<Vec<Value>> {
+    tail_cached(state)
+}
+
 /// 8MB 尾巴只解析一次：index / query / entry 共用，按文件长度+mtime 失效。
 fn tail_cached(state: &AppState) -> Arc<Vec<Value>> {
     let path = state.history_path();

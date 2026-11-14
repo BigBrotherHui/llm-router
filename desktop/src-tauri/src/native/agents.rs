@@ -33,6 +33,12 @@ pub struct AgentInfo {
     pub current_model: Option<String>,
     pub current_base: Option<String>,
     pub connected: bool,
+    /// 曾经被 llm-router 写入过，但当前配置已被别的工具改走
+    pub drifted: bool,
+    /// 上次一键导入时写入的模型（漂移后「一键修回」用这个值）
+    pub expected_model: Option<String>,
+    pub expected_base: Option<String>,
+    pub applied_at: Option<String>,
     pub notes: String,
     /// 识别来源：内置规则 / npm 全局包 / 安装目录……
     pub source: String,
@@ -286,6 +292,10 @@ fn make_agent(
         current_model,
         current_base,
         connected,
+        drifted: false,
+        expected_model: None,
+        expected_base: None,
+        applied_at: None,
         notes: notes.to_string(),
         source: "内置规则".to_string(),
         pkg: None,
@@ -410,16 +420,16 @@ fn known_npm(name: &str) -> Option<(&'static str, &'static str, &'static str)> {
         "@earendil-works/pi-coding-agent" => ("pi", "Pi (Coding Agent)", ".pi/agent/models.json"),
         "@sourcegraph/amp" => ("amp", "Amp (Sourcegraph)", ".config/amp/settings.json"),
         "@augmentcode/auggie" => ("auggie", "Auggie (Augment Code)", ".augment/settings.json"),
-        "@charmland/crush" => ("crush", "Crush (Charm)", ".config/crush/config.json"),
-        "@factory/cli-win32-x64" | "@factory/cli" => ("droid", "Droid (Factory)", ".factory/config.json"),
+        "@charmland/crush" => ("crush", "Crush (Charm)", ".config/crush/crushrc"),
+        "@factory/cli-win32-x64" | "@factory/cli" => ("droid", "Droid (Factory)", ".factory/settings.json"),
         "@github/copilot" => ("copilot-cli", "GitHub Copilot CLI", ".copilot/config.json"),
         "@kilocode/cli" => ("kilo-code", "Kilo Code", ".config/kilo/config.json"),
         "@continuedev/cli" => ("continue-cli", "Continue CLI", ".continue/config.json"),
-        "@tencent-ai/codebuddy-code" => ("codebuddy", "CodeBuddy Code", ".codebuddy/settings.json"),
+        "@tencent-ai/codebuddy-code" => ("codebuddy", "CodeBuddy Code", ".codebuddy/models.json"),
         "cline" => ("cline-cli", "Cline CLI", ".cline/config.json"),
         "codebuff" => ("codebuff", "Codebuff", ".codebuff/config.json"),
         "command-code" => ("command-code", "Command Code", ".commandcode/settings.json"),
-        "dsh-tui" => ("dsh-tui", "DSH TUI", ".config/dsh-tui/config.json"),
+        "dsh-tui" => ("dsh-tui", "DeepSeek Harness", ".dsh/settings.yaml"),
         "freebuff" => ("freebuff", "Freebuff", ".freebuff/config.json"),
         "openclaw" => ("openclaw", "OpenClaw", ".openclaw/config.json"),
         _ => return None,
@@ -657,7 +667,7 @@ fn enrich_agents(out: &mut Vec<AgentInfo>, port: u16) {
         ("marscode", "MarsCode", &["marscode"], ".marscode/config.json"),
         ("codeverse", "CodeVerse", &["codeverse"], ".codeverse/settings.json"),
         ("sheetagent", "SheetAgent", &["sheetagent"], ".sheetagent/config.json"),
-        ("workbuddy", "WorkBuddy", &["workbuddy"], ".workbuddy/config.json"),
+        ("workbuddy", "WorkBuddy", &["workbuddy"], ".workbuddy/models.json"),
     ];
     for (id, name, exes, hint) in extra {
         if out.iter().any(|a| a.id == *id) {
@@ -976,7 +986,118 @@ pub fn scan_agents(state: &AppState) -> Vec<AgentInfo> {
     }
 
     enrich_agents(&mut out, port);
+    apply_templates(&mut out, port);
+    apply_drift(state, &mut out);
     out
+}
+
+/// 一键导入过的 Agent 会在这里留一份「期望状态」，扫描时用来判断配置漂移。
+fn applied_path(state: &AppState) -> PathBuf {
+    state
+        .state_path
+        .parent()
+        .unwrap_or_else(|| Path::new("."))
+        .join("agent-applied.json")
+}
+
+fn load_applied(state: &AppState) -> Value {
+    std::fs::read_to_string(applied_path(state))
+        .ok()
+        .and_then(|s| serde_json::from_str::<Value>(&s).ok())
+        .unwrap_or_else(|| json!({}))
+}
+
+fn save_applied(state: &AppState, v: &Value) -> Result<(), String> {
+    let path = applied_path(state);
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir).map_err(|e| format!("创建状态目录失败: {e}"))?;
+    }
+    let text = serde_json::to_string_pretty(v).map_err(|e| format!("序列化失败: {e}"))?;
+    std::fs::write(&path, text).map_err(|e| format!("写入应用记录失败: {e}"))
+}
+
+/// 把「上次导入」与「当前配置」对比：只要不再指向本机路由、或模型被改掉，就标漂移。
+fn apply_drift(state: &AppState, agents: &mut [AgentInfo]) {
+    let applied = load_applied(state);
+    let Some(map) = applied.as_object() else { return };
+    let port = port_of(state);
+    let marker = format!("127.0.0.1:{port}");
+    for a in agents.iter_mut() {
+        let Some(rec) = map.get(&a.id) else { continue };
+        let expected_model = rec
+            .get("model")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        let expected_base = rec
+            .get("base_url")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        a.expected_model = if expected_model.is_empty() { None } else { Some(expected_model.clone()) };
+        a.expected_base = if expected_base.is_empty() { None } else { Some(expected_base.clone()) };
+        a.applied_at = rec
+            .get("applied_at")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string());
+
+        // 新增的 7 个模板会写多个文件 / 非 JSON 格式，粗略的 grab() 容易误判；
+        // 直接把所有目标文件的原文拼起来，判「是否仍指向本机 + 是否仍含上次导入的模型」。
+        if template_paths(&a.id).is_some() {
+            let text = a
+                .config_paths
+                .iter()
+                .map(|p| std::fs::read_to_string(p).unwrap_or_default())
+                .collect::<Vec<_>>()
+                .join("\n");
+            let still_connected = text.contains(&marker) || text.contains("llm-router");
+            // 有的模板会把模型名写进多处（customModels[].model + 顶层 model），
+            // 有的（Amp）根本不写模型名：用导入时的出现次数做基线，比「是否包含」准确。
+            let baseline = rec.get("model_hits").and_then(|v| v.as_u64());
+            let hits = if expected_model.is_empty() {
+                0
+            } else {
+                text.matches(expected_model.as_str()).count() as u64
+            };
+            let model_gone = match baseline {
+                Some(n) => n > 0 && hits < n,
+                // 旧记录没有基线字段时退回「完全不含模型名」的粗判。
+                None => !expected_model.is_empty() && hits == 0,
+            };
+            a.connected = still_connected;
+            a.drifted = !still_connected || model_gone;
+            if a.drifted {
+                let why = if !still_connected {
+                    "配置已不再指向本机 llm-router"
+                } else {
+                    "上次导入的模型已不在配置里"
+                };
+                a.notes = format!("{}；⚠ 配置已漂移：{}，可点「一键修回」", a.notes, why);
+            }
+            continue;
+        }
+        let model_changed = !expected_model.is_empty()
+            && a.current_model
+                .as_deref()
+                .map(|m| m != expected_model)
+                .unwrap_or(false);
+        let base_changed = a
+            .current_base
+            .as_deref()
+            .map(|b| !b.contains(&marker) && !b.contains("llm-router"))
+            .unwrap_or(false);
+        a.drifted = !a.connected || model_changed || base_changed;
+        if a.drifted {
+            let why = if !a.connected {
+                "配置已不再指向本机 llm-router"
+            } else if model_changed {
+                "模型被改成了别的值"
+            } else {
+                "接口地址被改走了"
+            };
+            a.notes = format!("{}；⚠ 配置已漂移：{}，可点「一键修回」", a.notes, why);
+        }
+    }
 }
 
 fn backup_path_for(path: &Path) -> PathBuf {
@@ -996,12 +1117,21 @@ fn persist(path: &Path, content: &str, dry_run: bool) -> Result<(Option<String>,
         std::fs::create_dir_all(dir).map_err(|e| format!("创建配置目录失败: {e}"))?;
     }
     let backup = backup_path_for(path);
-    if path.exists() && !backup.exists() {
-        std::fs::copy(path, &backup).map_err(|e| format!("备份原配置失败: {e}"))?;
+    if !backup.exists() {
+        if path.exists() {
+            std::fs::copy(path, &backup).map_err(|e| format!("备份原配置失败: {e}"))?;
+        } else {
+            // 文件本来不存在：留一个标记，恢复时按「删除新建文件」处理。
+            std::fs::write(&backup, NEW_FILE_MARKER)
+                .map_err(|e| format!("写入新文件标记失败: {e}"))?;
+        }
     }
     std::fs::write(path, content).map_err(|e| format!("写入配置失败: {e}"))?;
     Ok((Some(backup.to_string_lossy().to_string()), None))
 }
+
+/// 目标文件原本不存在时，备份文件里写这个标记，恢复时据此删除新建文件。
+const NEW_FILE_MARKER: &str = "__LLMROUTER_CREATED_BY_IMPORT__";
 
 /// VS Code 的 settings.json 常带 // 注释或尾逗号，先做一遍保留字符串字面量的清洗。
 fn strip_jsonc(text: &str) -> String {
@@ -1315,6 +1445,532 @@ fn write_agent(
     }
 }
 
+// ---------- 七个新增 Agent 的写入模板 ----------
+//
+// 键名来自本机各 CLI 自带文档 / 官方配置说明的只读调研，见 desktop/README.md。
+// 原则：只追加/替换 llm-router 自己的条目或 managed 块，绝不整体覆盖用户原有配置。
+
+/// 这几个 Agent 一键导入会触碰的全部文件（绝对路径）。None = 未适配。
+fn template_paths(id: &str) -> Option<Vec<PathBuf>> {
+    let h = home();
+    Some(match id {
+        "droid" => vec![h.join(".factory").join("settings.json")],
+        "amp" => vec![
+            h.join(".config").join("amp").join("settings.json"),
+            h.join(".local").join("share").join("amp").join("secrets.json"),
+        ],
+        "crush" => vec![h.join(".config").join("crush").join("crushrc")],
+        "codebuddy" => vec![
+            h.join(".codebuddy").join("models.json"),
+            h.join(".codebuddy").join("settings.json"),
+        ],
+        "kimi-code" => vec![h.join(".kimi-code").join("config.toml")],
+        "zcode" => vec![h.join(".zcode").join("v2").join("config.json")],
+        "workbuddy" => vec![h.join(".workbuddy").join("models.json")],
+        // DeepSeek Harness（dsh / dsh-tui 共用一套 host 配置）
+        "dsh-tui" => vec![
+            h.join(".dsh").join("settings.yaml"),
+            h.join(".dsh").join(".env"),
+        ],
+        _ => return None,
+    })
+}
+
+fn template_notes(id: &str) -> &'static str {
+    match id {
+        "droid" => "写入 customModels[]（provider=generic-chat-completion-api）与顶层 model；保留原有 hooks。",
+        "amp" => "写入用户级 amp.url 与 secrets.json 的 apiKey@<URL>（两个文件）。Amp 固定 model ID，若报模型不存在请在 Amp 里选路由中已有的模型。",
+        "crush" => "在 crushrc 追加 provider add / model add 命令块（completions）；只写我们生成的命令，默认模型请在 Crush 里手动选。",
+        "codebuddy" => "写入 models.json 的 models[]（完整 /chat/completions 路径）与 settings.json 的 model / env.CODEBUDDY_*；保留 hooks。",
+        "kimi-code" => "在 Orca 托管块之外追加 default_model 与 [providers.llm-router] / [models.*]；不动 [[hooks]]。",
+        "zcode" => "追加 provider.llm-router（kind=anthropic）而不覆盖 magpie；默认模型需在 ZCode UI 里选。",
+        "workbuddy" => "在 models.json 数组追加一条自定义模型；默认模型需在 WorkBuddy UI 里选。",
+        "dsh-tui" => {
+            "把 llm-router 作为 openai-completions provider 追加到 ~/.dsh/settings.yaml，并在 ~/.dsh/.env 写 LLM_ROUTER_KEY；重启 dsh web / dsh-tui 后在模型列表里选「LLM Router」下的模型。"
+        }
+        _ => "",
+    }
+}
+
+/// npm 动态发现出来的卡片默认 configurable=false，这里按稳定 id 补齐写入能力。
+fn apply_templates(out: &mut [AgentInfo], port: u16) {
+    for a in out.iter_mut() {
+        let Some(paths) = template_paths(&a.id) else {
+            continue;
+        };
+        let p: Vec<String> = paths.iter().map(|x| x.to_string_lossy().to_string()).collect();
+        a.configurable = true;
+        a.config_path = p[0].clone();
+        a.config_paths = p;
+        a.notes = template_notes(&a.id).to_string();
+        if a.id == "dsh-tui" {
+            // settings.yaml 里同时有多种 provider，不能靠通用 grab() 猜；
+            // 只读我们自己的 llm-router 块。
+            let text = std::fs::read_to_string(&paths[0]).unwrap_or_default();
+            let (m, b) = read_dsh_provider(&text);
+            a.connected = b
+                .as_deref()
+                .map(|x| x.contains(&format!("127.0.0.1:{port}")) || x.contains("llm-router"))
+                .unwrap_or(false);
+            a.current_model = m;
+            a.current_base = b;
+            continue;
+        }
+        let (m, b, c) = read_current(&paths[0], port);
+        a.current_model = m;
+        a.current_base = b;
+        a.connected = c;
+    }
+}
+
+fn toml_str(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 2);
+    for c in s.chars() {
+        match c {
+            '\\' => out.push_str("\\\\"),
+            '"' => out.push_str("\\\""),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if c.is_control() => out.push_str(&format!("\\u{:04X}", c as u32)),
+            c => out.push(c),
+        }
+    }
+    out
+}
+
+/// crushrc 是可执行 shell：值里只保留安全字符，避免引入 $()/反引号/引号。
+fn shell_safe(s: &str) -> String {
+    s.chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-' | ':' | '/') {
+                c
+            } else {
+                '-'
+            }
+        })
+        .collect()
+}
+
+/// 删掉旧的 managed 块（含首尾标记行），再把新块追加到末尾。
+fn replace_managed(text: &str, start: &str, end: &str, block: &str) -> String {
+    let mut out = String::with_capacity(text.len() + block.len());
+    let mut skipping = false;
+    for line in text.lines() {
+        if line.trim() == start {
+            skipping = true;
+            continue;
+        }
+        if skipping {
+            if line.trim() == end {
+                skipping = false;
+            }
+            continue;
+        }
+        out.push_str(line);
+        out.push('\n');
+    }
+    let mut base = out.trim_end_matches('\n').to_string();
+    if !block.is_empty() {
+        if !base.is_empty() {
+            base.push('\n');
+        }
+        base.push_str(block.trim_end_matches('\n'));
+    }
+    base.push('\n');
+    base
+}
+
+/// 读 DSH settings.yaml 里我们自己写的 llm-router provider：返回 (第一个模型 id, baseURL)。
+fn read_dsh_provider(text: &str) -> (Option<String>, Option<String>) {
+    let mut inside = false;
+    let mut base: Option<String> = None;
+    let mut model: Option<String> = None;
+    for line in text.lines() {
+        let t = line.trim();
+        if t == "llm-router:" {
+            inside = true;
+            continue;
+        }
+        if !inside {
+            continue;
+        }
+        // 缩进回到 4 空格说明已经到了下一个 provider，块结束。
+        if !t.is_empty() && !t.starts_with('#') && line.starts_with("    ") && !line.starts_with("      ") {
+            break;
+        }
+        if let Some(v) = t.strip_prefix("baseURL:") {
+            if base.is_none() {
+                base = Some(v.trim().trim_matches('"').to_string());
+            }
+        }
+        if model.is_none() {
+            if let Some(v) = t.strip_prefix("- id:") {
+                model = Some(v.trim().trim_matches('"').to_string());
+            }
+        }
+    }
+    (model, base)
+}
+
+/// ~/.dsh/.env 这类 KEY=VALUE 文件：替换同名键，其余行原样保留，缺的追加到末尾。
+fn merge_dotenv(path: &Path, entries: &[(&str, String)]) -> Result<String, String> {
+    let text = std::fs::read_to_string(path).unwrap_or_default();
+    let mut lines: Vec<String> = Vec::new();
+    let mut seen: HashSet<String> = HashSet::new();
+    for line in text.lines() {
+        let t = line.trim();
+        let mut hit = false;
+        for (k, v) in entries {
+            if t.starts_with(&format!("{k}=")) || t.starts_with(&format!("export {k}=")) {
+                lines.push(format!("{k}={v}"));
+                seen.insert((*k).to_string());
+                hit = true;
+                break;
+            }
+        }
+        if !hit {
+            lines.push(line.to_string());
+        }
+    }
+    for (k, v) in entries {
+        if !seen.contains(*k) {
+            lines.push(format!("{k}={v}"));
+        }
+    }
+    Ok(lines.join("\n") + "\n")
+}
+
+/// YAML 双引号标量里需要转义的只有反斜杠和双引号。
+fn yaml_str(s: &str) -> String {
+    s.replace('\\', "\\\\").replace('"', "\\\"")
+}
+
+/// llm-router 在 DSH settings.yaml 里的 provider 块（缩进 4 空格，挂在 providers: 下）。
+fn dsh_provider_block(model: &str, all: &[String], openai: &str) -> String {
+    let mut list: Vec<String> = all.to_vec();
+    if !list.iter().any(|m| m == model) {
+        list.insert(0, model.to_string());
+    }
+    let mut b = String::new();
+    b.push_str("    # >>> llm-router managed >>>\n");
+    b.push_str("    llm-router:\n");
+    b.push_str("      displayName: LLM Router\n");
+    b.push_str("      apiKeyEnv: LLM_ROUTER_KEY\n");
+    b.push_str("      api: openai-completions\n");
+    b.push_str(&format!("      baseURL: \"{}\"\n", yaml_str(openai)));
+    b.push_str("      models:\n");
+    for m in &list {
+        let id = yaml_str(m);
+        b.push_str(&format!("        - id: \"{id}\"\n"));
+        b.push_str(&format!("          name: \"{id} · LLM Router\"\n"));
+        b.push_str("          contextWindow: 128000\n");
+        b.push_str("          maxTokens: 8192\n");
+        b.push_str("          input: [text, image]\n");
+    }
+    b.push_str("    # <<< llm-router managed <<<\n");
+    b
+}
+
+/// 把 provider 块并进 settings.yaml：已有 providers 映射就替换旧块并追加到末尾。
+fn dsh_settings_with_provider(raw: &str, block: &str) -> Result<String, String> {
+    const START: &str = "# >>> llm-router managed >>>";
+    const END: &str = "# <<< llm-router managed <<<";
+    if raw.trim().is_empty() {
+        return Ok(format!("llm-pi-ai:\n  providers:\n{block}"));
+    }
+    if !raw.contains("providers:") {
+        return Ok(format!("{}\nllm-pi-ai:\n  providers:\n{}", raw.trim_end(), block));
+    }
+    // 追加到文件末尾只有在末尾仍处于 providers 映射（缩进 >= 4）时才安全。
+    let tail = raw.lines().rev().find(|l| !l.trim().is_empty()).unwrap_or("");
+    let indent = tail.len() - tail.trim_start().len();
+    if indent < 4 {
+        return Err(format!(
+            "{} 末尾缩进只有 {indent} 空格，不在 providers 块内；为避免写坏原文件已中止",
+            "settings.yaml"
+        ));
+    }
+    Ok(replace_managed(raw, START, END, block))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn write_template_plan(
+    id: &str,
+    paths: &[PathBuf],
+    model: &str,
+    api_key: &str,
+    openai: &str,
+    anthropic: &str,
+    all_models: &[String],
+) -> Result<WritePlan, String> {
+    let chat = format!("{}/chat/completions", openai.trim_end_matches('/'));
+    let display = format!("llm-router / {model}");
+    match id {
+        "droid" => {
+            let content = merge_json(&paths[0], |v| {
+                if !v.get("customModels").map(|x| x.is_array()).unwrap_or(false) {
+                    v["customModels"] = json!([]);
+                }
+                let arr = v["customModels"].as_array_mut().unwrap();
+                arr.retain(|x| {
+                    !(x.get("displayName")
+                        .and_then(|s| s.as_str())
+                        .map(|s| s.starts_with("llm-router /"))
+                        .unwrap_or(false)
+                        || x.get("model").and_then(|s| s.as_str()) == Some(model))
+                });
+                arr.push(json!({
+                    "model": model,
+                    "displayName": display,
+                    "baseUrl": openai,
+                    "apiKey": api_key,
+                    "provider": "generic-chat-completion-api",
+                    "maxOutputTokens": 8192
+                }));
+                v["model"] = json!(model);
+            })?;
+            Ok(WritePlan {
+                files: vec![(paths[0].clone(), content)],
+                changed_keys: vec!["customModels[]".into(), "model".into()],
+            })
+        }
+        "amp" => {
+            let settings = merge_json(&paths[0], |v| {
+                v["amp.url"] = json!(openai);
+            })?;
+            let secret_key = format!("apiKey@{openai}");
+            let key_copy = secret_key.clone();
+            let secrets = merge_json(&paths[1], |v| {
+                if let Some(obj) = v.as_object_mut() {
+                    let stale: Vec<String> = obj
+                        .keys()
+                        .filter(|k| k.starts_with("apiKey@http://127.0.0.1:"))
+                        .cloned()
+                        .collect();
+                    for k in stale {
+                        obj.remove(&k);
+                    }
+                }
+                v[key_copy.as_str()] = json!(api_key);
+            })?;
+            Ok(WritePlan {
+                files: vec![(paths[0].clone(), settings), (paths[1].clone(), secrets)],
+                changed_keys: vec!["amp.url".into(), secret_key],
+            })
+        }
+        "crush" => {
+            let url = shell_safe(openai);
+            let key = shell_safe(api_key);
+            let mid = shell_safe(model);
+            let block = format!(
+                "# >>> llm-router managed >>>\nprovider add llm-router --type completions --base-url \"{url}\" --api-key \"{key}\"\nmodel add llm-router/{mid} --name \"llm-router / {mid}\" --context-window 128000 --default-max-tokens 8192\n# <<< llm-router managed <<<\n"
+            );
+            let raw = std::fs::read_to_string(&paths[0]).unwrap_or_default();
+            let content = replace_managed(
+                &raw,
+                "# >>> llm-router managed >>>",
+                "# <<< llm-router managed <<<",
+                &block,
+            );
+            Ok(WritePlan {
+                files: vec![(paths[0].clone(), content)],
+                changed_keys: vec![
+                    "provider add llm-router".into(),
+                    format!("model add llm-router/{mid}"),
+                ],
+            })
+        }
+        "codebuddy" => {
+            let models_content = merge_json(&paths[0], |v| {
+                if !v.get("models").map(|x| x.is_array()).unwrap_or(false) {
+                    v["models"] = json!([]);
+                }
+                let arr = v["models"].as_array_mut().unwrap();
+                arr.retain(|x| {
+                    !(x.get("id").and_then(|s| s.as_str()) == Some(model)
+                        || x.get("name")
+                            .and_then(|s| s.as_str())
+                            .map(|s| s.starts_with("llm-router /"))
+                            .unwrap_or(false))
+                });
+                arr.push(json!({
+                    "id": model,
+                    "name": display,
+                    "vendor": "llm-router",
+                    "api": "openai-completions",
+                    "url": chat,
+                    "apiKey": api_key,
+                    "maxInputTokens": 128000,
+                    "maxOutputTokens": 8192,
+                    "supportsToolCall": true
+                }));
+                if !v.get("availableModels").map(|x| x.is_array()).unwrap_or(false) {
+                    v["availableModels"] = json!([]);
+                }
+                let av = v["availableModels"].as_array_mut().unwrap();
+                av.retain(|x| x.as_str() != Some(model));
+                av.push(json!(model));
+            })?;
+            let settings_content = merge_json(&paths[1], |v| {
+                v["model"] = json!(model);
+                if !v.get("env").map(|x| x.is_object()).unwrap_or(false) {
+                    v["env"] = json!({});
+                }
+                v["env"]["CODEBUDDY_MODEL"] = json!(model);
+                v["env"]["CODEBUDDY_BASE_URL"] = json!(openai);
+                v["env"]["CODEBUDDY_API_KEY"] = json!(api_key);
+                v["env"]["CODEBUDDY_SMALL_FAST_MODEL"] = json!(model);
+            })?;
+            Ok(WritePlan {
+                files: vec![
+                    (paths[0].clone(), models_content),
+                    (paths[1].clone(), settings_content),
+                ],
+                changed_keys: vec![
+                    "models[]".into(),
+                    "availableModels".into(),
+                    "settings.model".into(),
+                    "env.CODEBUDDY_*".into(),
+                ],
+            })
+        }
+        "kimi-code" => {
+            let alias = format!("llm-router/{model}");
+            let top = format!(
+                "# >>> llm-router managed top >>>\ndefault_model = \"{}\"\n# <<< llm-router managed top <<<\n",
+                toml_str(&alias)
+            );
+            let bottom = format!(
+                "# >>> llm-router managed >>>\n[providers.llm-router]\ntype = \"openai\"\nbase_url = \"{}\"\napi_key = \"{}\"\n\n[models.\"{}\"]\nprovider = \"llm-router\"\nmodel = \"{}\"\nmax_context_size = 128000\nmax_output_size = 8192\ndisplay_name = \"{}\"\n# <<< llm-router managed <<<\n",
+                toml_str(openai),
+                toml_str(api_key),
+                toml_str(&alias),
+                toml_str(model),
+                toml_str(&display)
+            );
+            let raw = std::fs::read_to_string(&paths[0]).unwrap_or_default();
+            let stripped = replace_managed(
+                &raw,
+                "# >>> llm-router managed top >>>",
+                "# <<< llm-router managed top <<<",
+                "",
+            );
+            let body = replace_managed(
+                &stripped,
+                "# >>> llm-router managed >>>",
+                "# <<< llm-router managed <<<",
+                "",
+            );
+            let content = format!("{top}{}{bottom}", body.trim_start_matches('\n'));
+            Ok(WritePlan {
+                files: vec![(paths[0].clone(), content)],
+                changed_keys: vec![
+                    "default_model".into(),
+                    "providers.llm-router".into(),
+                    format!("models.\"{alias}\""),
+                ],
+            })
+        }
+        "zcode" => {
+            let mut models = serde_json::Map::new();
+            models.insert(
+                format!("llm-router/{model}"),
+                json!({
+                    "limit": {"context": 128000, "output": 8192},
+                    "modalities": {"input": ["text"], "output": ["text"]},
+                    "name": display,
+                    "reasoning": {
+                        "defaultLevel": "high",
+                        "enabled": false,
+                        "levels": ["low", "high"],
+                        "providerOptionsByLevel": {}
+                    }
+                }),
+            );
+            let content = merge_json(&paths[0], |v| {
+                if !v.get("provider").map(|x| x.is_object()).unwrap_or(false) {
+                    v["provider"] = json!({});
+                }
+                v["provider"]["llm-router"] = json!({
+                    "enabled": true,
+                    "kind": "anthropic",
+                    "source": "custom",
+                    "name": "llm-router",
+                    "options": {"baseURL": anthropic, "apiKey": api_key},
+                    "models": models
+                });
+            })?;
+            Ok(WritePlan {
+                files: vec![(paths[0].clone(), content)],
+                changed_keys: vec!["provider.llm-router".into()],
+            })
+        }
+        "workbuddy" => {
+            let raw = std::fs::read_to_string(&paths[0]).unwrap_or_default();
+            let text = strip_jsonc(raw.trim_start_matches('\u{feff}'));
+            let mut doc: Value = if text.trim().is_empty() {
+                json!([])
+            } else {
+                serde_json::from_str(&text).map_err(|e| {
+                    format!("{} 不是合法 JSON（{}），已保留原文件", paths[0].display(), e)
+                })?
+            };
+            let entry = json!({
+                "id": model,
+                "name": display,
+                "url": chat,
+                "apiKey": api_key,
+                "maxInputTokens": 128000,
+                "maxOutputTokens": 8192,
+                "supportsToolCall": true,
+                "supportsImages": false,
+                "supportsReasoning": false
+            });
+            let ours = |x: &Value| -> bool {
+                x.get("id").and_then(|s| s.as_str()) == Some(model)
+                    || x.get("name")
+                        .and_then(|s| s.as_str())
+                        .map(|s| s.starts_with("llm-router /"))
+                        .unwrap_or(false)
+            };
+            if doc.is_array() {
+                let arr = doc.as_array_mut().unwrap();
+                arr.retain(|x| !ours(x));
+                arr.push(entry);
+            } else if doc.get("models").map(|x| x.is_array()).unwrap_or(false) {
+                let arr = doc["models"].as_array_mut().unwrap();
+                arr.retain(|x| !ours(x));
+                arr.push(entry);
+            } else {
+                return Err(format!(
+                    "{} 顶层不是数组，也不是含 models 数组的对象，已保留原文件",
+                    paths[0].display()
+                ));
+            }
+            Ok(WritePlan {
+                files: vec![(paths[0].clone(), serde_json::to_string_pretty(&doc).map_err(|e| e.to_string())?)],
+                changed_keys: vec!["models[]".into()],
+            })
+        }
+        "dsh-tui" => {
+            let block = dsh_provider_block(model, all_models, openai);
+            let raw = std::fs::read_to_string(&paths[0]).unwrap_or_default();
+            let content = dsh_settings_with_provider(&raw, &block)?;
+            let env = merge_dotenv(&paths[1], &[("LLM_ROUTER_KEY", api_key.to_string())])?;
+            Ok(WritePlan {
+                files: vec![(paths[0].clone(), content), (paths[1].clone(), env)],
+                changed_keys: vec![
+                    "llm-pi-ai.providers.llm-router".into(),
+                    "models[]".into(),
+                    "LLM_ROUTER_KEY".into(),
+                ],
+            })
+        }
+        _ => Err("该 Agent 暂未适配自动写入".to_string()),
+    }
+}
+
 /// 一键导入的写入计划：普通 Agent 一个文件，Pi 需要 models.json + settings.json 两个。
 struct WritePlan {
     files: Vec<(PathBuf, String)>,
@@ -1327,6 +1983,7 @@ fn write_plan(
     api_key: &str,
     openai: &str,
     anthropic: &str,
+    all_models: &[String],
 ) -> Result<WritePlan, String> {
     if agent.id == "pi" {
         let models_path = PathBuf::from(&agent.config_path);
@@ -1365,6 +2022,9 @@ fn write_plan(
                 "defaultModel".into(),
             ],
         });
+    }
+    if let Some(paths) = template_paths(&agent.id) {
+        return write_template_plan(&agent.id, &paths, model, api_key, openai, anthropic, all_models);
     }
     let (content, changed_keys) = write_agent(
         &agent.id,
@@ -1426,7 +2086,7 @@ pub async fn configure(State(state): State<Arc<AppState>>, Json(p): Json<Value>)
     let anthropic = anthropic_base(&base_input);
     let dry_run = p.get("dry_run").and_then(|v| v.as_bool()).unwrap_or(false);
 
-    let plan = match write_plan(&agent, model, &api_key, &openai, &anthropic) {
+    let plan = match write_plan(&agent, model, &api_key, &openai, &anthropic, &models) {
         Ok(v) => v,
         Err(e) => return bad(&e),
     };
@@ -1455,6 +2115,31 @@ pub async fn configure(State(state): State<Arc<AppState>>, Json(p): Json<Value>)
             joined.replace(&api_key, "***")
         })
     };
+    if !dry_run {
+        let hits: usize = plan
+            .files
+            .iter()
+            .map(|(_, content)| content.matches(model).count())
+            .sum();
+        let rec = json!({
+            "model": model,
+            "base_url": openai,
+            "anthropic_base_url": anthropic,
+            "api_key": api_key,
+            "config_paths": agent.config_paths,
+            "model_hits": hits,
+            "applied_at": chrono::Utc::now().to_rfc3339(),
+        });
+        let mut all = load_applied(&state);
+        if let Some(m) = all.as_object_mut() {
+            m.insert(agent.id.clone(), rec);
+        } else {
+            all = json!({ agent.id.clone(): rec });
+        }
+        if let Err(e) = save_applied(&state, &all) {
+            return bad(&e);
+        }
+    }
     ok(json!({
         "ok": true,
         "agent_id": agent.id,
@@ -1470,6 +2155,30 @@ pub async fn configure(State(state): State<Arc<AppState>>, Json(p): Json<Value>)
         "dry_run": dry_run,
         "preview": preview,
     }))
+}
+
+/// 一键修回：用上次成功导入的参数重新写入（被别的工具改走时点这个）。
+pub async fn repair(State(state): State<Arc<AppState>>, Json(p): Json<Value>) -> Response {
+    let id = p.get("agent_id").and_then(|v| v.as_str()).unwrap_or("");
+    if id.is_empty() {
+        return bad("缺少 agent_id");
+    }
+    let applied = load_applied(&state);
+    let Some(rec) = applied.get(id) else {
+        return bad("没有找到这个 Agent 的导入记录，请先一键导入");
+    };
+    let model = rec.get("model").and_then(|v| v.as_str()).unwrap_or("");
+    if model.is_empty() || !model_ids(&state).iter().any(|m| m == model) {
+        return bad("记录里的模型已不在当前路由的 /v1/models 里，请重新选模型导入");
+    }
+    let req = json!({
+        "agent_id": id,
+        "model": model,
+        "api_key": rec.get("api_key").and_then(|v| v.as_str()).unwrap_or("llm-router"),
+        "base_url": rec.get("base_url").and_then(|v| v.as_str()).unwrap_or(""),
+        "dry_run": p.get("dry_run").and_then(|v| v.as_bool()).unwrap_or(false),
+    });
+    configure(State(state), Json(req)).await
 }
 
 pub async fn restore(State(state): State<Arc<AppState>>, Json(p): Json<Value>) -> Response {
@@ -1490,7 +2199,19 @@ pub async fn restore(State(state): State<Arc<AppState>>, Json(p): Json<Value>) -
         if !backup.exists() {
             continue;
         }
-        if let Err(e) = std::fs::copy(&backup, path) {
+        let created = std::fs::read_to_string(&backup)
+            .map(|s| s.trim() == NEW_FILE_MARKER)
+            .unwrap_or(false);
+        let res = if created {
+            if path.exists() {
+                std::fs::remove_file(path)
+            } else {
+                Ok(())
+            }
+        } else {
+            std::fs::copy(&backup, path).map(|_| ())
+        };
+        if let Err(e) = res {
             return bad(&format!("恢复失败: {e}"));
         }
         if first_backup.is_empty() {
@@ -1500,6 +2221,11 @@ pub async fn restore(State(state): State<Arc<AppState>>, Json(p): Json<Value>) -
     }
     if restored.is_empty() {
         return bad("没有找到 .llmrouter.bak 备份，无法恢复");
+    }
+    let mut all = load_applied(&state);
+    if let Some(m) = all.as_object_mut() {
+        m.remove(id);
+        let _ = save_applied(&state, &all);
     }
     ok(json!({
         "ok": true,
