@@ -13,6 +13,26 @@ mod native;
 
 const DEFAULT_PORT: u16 = 8010;
 
+#[cfg(desktop)]
+static HUD_SHOWN_AT: std::sync::Mutex<Option<Instant>> = std::sync::Mutex::new(None);
+
+#[cfg(desktop)]
+fn mark_hud_shown() {
+    if let Ok(mut at) = HUD_SHOWN_AT.lock() {
+        *at = Some(Instant::now());
+    }
+}
+
+#[cfg(desktop)]
+fn hud_just_shown() -> bool {
+    HUD_SHOWN_AT
+        .lock()
+        .ok()
+        .and_then(|at| *at)
+        .map(|at| at.elapsed() < Duration::from_millis(700))
+        .unwrap_or(false)
+}
+
 fn port() -> u16 {
     std::env::var("LLM_ROUTER_PORT")
         .ok()
@@ -152,6 +172,7 @@ fn show_main_window(app: &tauri::AppHandle) {
 fn show_hud(app: &tauri::AppHandle) {
     if let Some(window) = app.get_webview_window("hud") {
         let _ = window.show();
+        mark_hud_shown();
         let _ = window.set_focus();
         return;
     }
@@ -161,8 +182,8 @@ fn show_hud(app: &tauri::AppHandle) {
         tauri::WebviewUrl::App("hud.html".into()),
     )
     .title("llm-router HUD")
-    .inner_size(326.0, 208.0)
-    .min_inner_size(300.0, 190.0)
+    .inner_size(372.0, 272.0)
+    .min_inner_size(340.0, 248.0)
     .decorations(false)
     .transparent(true)
     .shadow(false)
@@ -175,10 +196,19 @@ fn show_hud(app: &tauri::AppHandle) {
         let scale = monitor.scale_factor();
         let pos = monitor.position().to_logical::<f64>(scale);
         let size = monitor.size().to_logical::<f64>(scale);
-        builder = builder.position(pos.x + size.width - 350.0, pos.y + size.height - 300.0);
+        builder = builder.position(pos.x + size.width - 396.0, pos.y + size.height - 360.0);
     }
-    if let Err(e) = builder.build() {
-        eprintln!("[hud] 创建迷你 HUD 失败: {e}");
+    match builder.build() {
+        Ok(window) => {
+            let _ = window.show();
+            mark_hud_shown();
+            let w = window.clone();
+            std::thread::spawn(move || {
+                std::thread::sleep(Duration::from_millis(180));
+                let _ = w.set_focus();
+            });
+        }
+        Err(e) => eprintln!("[hud] 创建迷你 HUD 失败: {e}"),
     }
 }
 
@@ -189,6 +219,7 @@ fn toggle_hud(app: &tauri::AppHandle) {
             let _ = window.hide();
         } else {
             let _ = window.show();
+            mark_hud_shown();
             let _ = window.set_focus();
         }
     } else {
@@ -336,15 +367,27 @@ pub fn run() {
             hud_open_main
         ])
         .on_window_event(|window, event| {
-            if let tauri::WindowEvent::CloseRequested { api, .. } = event {
-                #[cfg(desktop)]
-                {
-                    // HUD 的关闭按钮/Alt+F4 只隐藏它，不影响主窗口的关闭策略。
-                    if window.label() == "hud" {
+            #[cfg(desktop)]
+            if window.label() == "hud" {
+                match event {
+                    tauri::WindowEvent::CloseRequested { api, .. } => {
                         api.prevent_close();
                         let _ = window.hide();
                         return;
                     }
+                    // 点击 HUD 以外的地方时收起，像浮层而不是常驻窗口。
+                    tauri::WindowEvent::Focused(false) => {
+                        if !hud_just_shown() {
+                            let _ = window.hide();
+                        }
+                        return;
+                    }
+                    _ => {}
+                }
+            }
+            if let tauri::WindowEvent::CloseRequested { api, .. } = event {
+                #[cfg(desktop)]
+                {
                     let state = window.app_handle().state::<Arc<native::state::AppState>>();
                     let behavior = state
                         .file

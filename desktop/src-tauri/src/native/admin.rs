@@ -328,6 +328,15 @@ pub async fn model_save(State(state): State<Arc<AppState>>, Json(p): Json<Value>
         return bad("缺少模型名");
     }
     let strategy = p.get("strategy").and_then(|v| v.as_str()).unwrap_or("priority").to_string();
+    let affinity = p
+        .get("affinity")
+        .and_then(|v| v.as_str())
+        .unwrap_or("auto")
+        .trim()
+        .to_ascii_lowercase();
+    if !["auto", "session", "turn", "off", "strict"].contains(&affinity.as_str()) {
+        return bad("affinity 只能是 auto / session / turn / off / strict");
+    }
     let entries: Vec<RouteEntry> = p
         .get("entries")
         .and_then(|v| v.as_array())
@@ -351,7 +360,17 @@ pub async fn model_save(State(state): State<Arc<AppState>>, Json(p): Json<Value>
     }
     {
         let mut file = state.file.write().unwrap();
-        file.models.insert(name.clone(), ModelRoute { strategy, entries, orderings: Default::default(), extra: Default::default() });
+        let (orderings, mut extra) = file
+            .models
+            .get(&name)
+            .map(|r| (r.orderings.clone(), r.extra.clone()))
+            .unwrap_or_default();
+        if affinity == "auto" {
+            extra.remove("affinity");
+        } else {
+            extra.insert("affinity".to_string(), json!(affinity));
+        }
+        file.models.insert(name.clone(), ModelRoute { strategy, entries, orderings, extra });
     }
     let _ = state.save();
     state.bump_catalog();

@@ -31,6 +31,12 @@
   健康看板的上游成功率条形与能力雷达；全部内联 SVG，不引第三方图表库）
 - MCP / 工具调用排行榜：`GET /sessions/tools`（配对 DSH `tool/call` + `tool/result`
   与 Claude Code `tool_use` + `tool_result`，统计调用次数、失败率、P50 / P95、常见错误）
+- Prompt Cache 账本：`GET /stats/cache-ledger`（按模型 / 上游 / 会话统计缓存读、缓存写、命中率与节省 token）
+- 会话粘性：模型级 `affinity`（默认 `auto`，可选 `session` / `turn` / `off` / `strict`），
+  `GET /affinity/status` 查看、`POST /affinity/clear` 清空；流水记录 `session_id`，响应回 `x-llm-router-session` / `x-llm-router-affinity`
+- 流水双层：JSONL 原文 + `config.history.sqlite3` SQLite 索引（`GET /journal/db/status`、`POST /journal/db/sync`）
+- 统一采集器：`GET /collector/status`（后台每 10 秒预热会话扫描、工具排行、今日统计与 SQLite 同步）
+- 自动更新：`GET /update/check?channel=stable|beta`（读 GitHub Releases，API 不可用时退回 atom feed）
 - 勾选式导入 / 导出：`GET /data/summary`、`POST /data/export`、`POST /data/import`
   （请求记录 / 上游来源 / 模型路由 / 签到，四类任选，支持 merge / replace、预览、脱敏、自动备份）
 - 用量与耗时：流式请求注入 `stream_options.include_usage` 并在流结束落完整 usage，
@@ -42,12 +48,14 @@
 ```
 desktop/
 ├─ ui/index.html                 # 启动页：桌面自动等本地服务，移动端填服务地址
+├─ ui/hud.html                   # 托盘迷你 HUD（372x272，跟随当前/上一轮路由）
 └─ src-tauri/
    ├─ src/main.rs                # 入口
    ├─ src/lib.rs                 # Tauri 生命周期 + 内嵌 HTTP 服务启动
-   ├─ src/native/                # Rust 原生后端（state / proxy / admin / agents / anthropic / transfer / health / stats / journal）
+   ├─ src/native/                # Rust 原生后端（state / proxy / admin / agents / anthropic / transfer / health / stats / journal / journal_index / collector / update）
    ├─ tauri.conf.json
    └─ capabilities/default.json
+webui.html / webui.css / webui.js  # 控制台骨架、样式、脚本（服务端按 /assets 提供，中继构建时内联）
 ```
 
 ## Windows 构建
@@ -201,7 +209,7 @@ baseURL**（`~/.dsh/settings.yaml` 与 profile patch 层、`~/.pi/agent/models.j
 会话对账刷新间隔」自动重扫（默认 5 秒，范围 2–600 秒，独立于请求记录的间隔，只在本页可见且没有正在扫描时执行）。
 页面只读，不改任何配置。
 
-页面顶部是总览卡：调用轮数、未走路由、路由覆盖率、输入 / 输出 / 缓存读写和本机流水轮数；下面是路由覆盖比例条、四个数据源的扫描卡片，再往下是 provider / 模型明细表与会话卡片。筛选条支持时间窗口、数据源多选、只看未走路由，以及按 provider / 模型 / 接口地址搜索。
+页面顶部是总览卡：今日所有请求、其中过 LLM Router（包含关系）、未走路由、输入 / 输出 / 缓存读写和本机流水轮数；下面是路由覆盖比例条、四个数据源的扫描卡片，再往下是 provider / 模型明细表与会话卡片。筛选条支持时间窗口、数据源多选、只看未走路由，以及按 provider / 模型 / 接口地址搜索。
 
 ```
 GET /sessions/scan?range=today&sources=dsh,claude,pi,codex&limit=200
@@ -223,9 +231,10 @@ GET /sessions/bases
   自动刷新间隔（同样只在页面可见时刷新）。
 - **请求瀑布**：展开任一请求，在「请求瀑布」区按时间轴画出每次上游尝试（成功/失败）
   的耗时占比；没有 trail 的旧记录按「首字等待 / 生成」两段拆分。
-- 直方图复用同一组 SVG 柱子做增量过渡，自动刷新时不再整块重建闪一下。
+- 直方图复用同一组 SVG 柱子做增量过渡，自动刷新时不再整块重建闪一下；折线图、条形图和雷达图同样复用已有 SVG 节点，只更新路径、几何属性和文字，自动刷新不会重播放入场动画。
+- 会话对账、MCP 工具表格按数据签名复用：数据没变时只更新时间文字，不重写整张表；确有新数据才增删行。
 - **托盘迷你 HUD**：托盘图标悬浮显示今日请求量 / 成功率 / P50；左键打开无边框、
-  置顶、可拖动的迷你 HUD（同样四格指标，3 秒刷新），右键菜单也能打开或退出。
+  置顶、可拖动的迷你 HUD（今日所有请求 + 其中过 LLM Router 的轮数与占比，另有成功率 / P50 / 首字和缓存指标；下方「最近路由」只显示一条：有请求进行中时显示当前路由，空闲时显示最近一轮对话；标注该轮是否经过 LLM Router（含没走 8010 的调用），多个尝试用 → 串联，3 秒刷新；点击 HUD 以外区域会自动收起），右键菜单也能打开或退出。左上角圆点表示与后端服务的连接状态（绿色已连接，红色读取失败），不代表上游请求成败。
 - 图表全部用内联 SVG 绘制，不引第三方图表库；切页、柱状、折线、雷达、状态灯都有
   轻量 CSS 动画，并遵守系统 `prefers-reduced-motion` 设置。
 
@@ -237,15 +246,31 @@ GET /sessions/tools?range=today&sources=dsh,claude&limit=50
 
 ## 路由策略与会话粘性
 
-模型路由目前有 `priority`（按配置顺序，冷却中的排后）、`random`、`round_robin` 三种策略，
-**每次请求都独立选路**：同一个会话的上一轮可能落到上游 A，下一轮轮询到 B 或随机到 C。
-失败时会按候选列表继续尝试下一家，但不会记住「这个会话上次在哪家成功」。
+模型路由有 `priority`（按配置顺序，冷却中的排后）、`random`、`round_robin` 三种策略，
+另有**会话粘性**（默认 `auto`，借鉴 Magpie 的 affinity 思路）：同一个会话在 TTL 内优先回到
+上次成功的上游，只有它失败或冷却时才切换。会话 id 按 `x-llm-router-session`、
+`x-magpie-session`、`x-session-id`、`x-claude-code-session`、`x-codex-thread-id`、`x-thread-id`
+→ body 的 `session_id` / `conversation_id` / `thread_id` / `prompt_cache_key`
+→ `metadata.*` → system + 首条 user 内容哈希的顺序提取，覆盖不主动传 id 的客户端。
 
-「会话级粘性路由」就是给一段会话（例如带 `X-Session-Id` 的请求，或按首条消息哈希）
-记住上次成功的上游，在 TTL 内优先回到同一家，只有它失败或冷却时才切换。好处是能复用
-上游的 KV / prompt cache，长对话的首字延迟和缓存读会明显更稳；代价是负载不再均匀，
-热门会话会集中在一家，而且某家变慢时要等失败或 TTL 到期才会迁走。适合长上下文对话，
-不适合纯短请求的高吞吐场景。
+每个模型可以在右侧详情里选择 `auto` / `session` / `turn` / `off` / `strict`：
+`auto` 只在观察到缓存读 ≥ 1024 或连续命中同一上游 2 次后才固定（gpt/deepseek 1 小时、
+Claude/其它 5 分钟）；`session` / `strict` 固定 30 天；`turn` 只在同一轮工具结果内固定 10 分钟；
+`off` 完全不固定。这样短请求仍按原策略分流，长对话则复用上游 KV / prompt cache，首字延迟和
+缓存读更稳。代价是负载会向热门会话倾斜，可用 `GET /affinity/status` 查看、`POST /affinity/clear` 清空。
+
+## Prompt Cache 账本
+
+设置页新增「缓存账本」页：统计 **所有 Agent 会话**（DSH / Claude Code / Pi / Codex 的会话账本），
+不只本机路由经过的请求；按模型、上游、会话汇总 `cache_read` / `cache_write` / 输入 / 输出，
+并单独标出其中走本机路由的子集。命中率 = `cache_read ÷ (input + cache_read + cache_write)`、
+节省 token = `cache_read`，同时给出粘性会话数量。
+接口：`GET /stats/cache-ledger?range=today`（或 `hours=24` / `range=all`）。
+
+> 缓存写说明：Agent 会话记录普遍只记缓存读，不记缓存写——DSH 的 usage 只有 `cacheReadTokens`，
+> Claude 的 `cache_creation_input_tokens`、Pi 的 `cacheWrite`、Codex 的 `cache_write_input_tokens`
+> 实测都是 0，所以全量账本里「缓存写」显示 `—` 是数据源缺失，不是统计失败；本机路由流水里的
+> `cache_write` 请在「请求记录」查看。
 
 ## 耗时与缓存用量口径
 
@@ -303,6 +328,15 @@ $env:LLM_ROUTER_STATE = "C:\path\to\llm-router\.llmrouter\config.state.json"
 $env:LLM_ROUTER_PORT = "18010"       # 避开已经在跑的 8010
 npm run dev
 ```
+
+## 数据层与运行架构
+
+- **请求流水双层结构**：`config.history.jsonl` 仍是原文（追加写、可直接 grep / 迁移）；旁边新增 `config.history.sqlite3` 作为索引（WAL、`busy_timeout=3s`，表 `journal` 保存耗时可查询字段，`fp` 去重；`meta.last_offset` 做增量同步）。JSONL 轮转时索引自动重建。接口：`GET /journal/db/status`、`POST /journal/db/sync`。
+- **统一采集器**：进程内只有一个 10 秒采集循环（`collector.rs`），负责预热会话对账、MCP 工具排行、今日全量统计和 SQLite 增量同步；`/sessions/scan`、`/sessions/tools`、`/stats/series`、`/health/upstreams` 命中同一份内存缓存，多个页面共享结果，不再各扫一遍会话文件。接口：`GET /collector/status`。
+- **Agent 配置事务**：所有 Agent 写入走 `计划 → diff → 应用 → 校验 → 回滚`，`POST /agents/configure` 的响应带 `transaction`（含 `steps`、逐文件 `diff`、`verified`）；写入失败或回读校验失败会自动按备份回滚，并在结果卡片里显示事务步骤与增删行数。
+- **请求瀑布增强**：展开请求详情后按每次尝试画独立轨道（累计起点、成功绿/失败红、排队/收尾补齐），头部显示总耗时、首字、生成速度和尝试次数。
+- **控制台拆分**：`webui.html` 只保留页面骨架，样式/脚本拆到 `webui.css` / `webui.js`，由 `/assets/webui.css`、`/assets/webui.js` 提供；`relay/build.ps1` 会把三者内联成中继用的单文件 `relay/public/index.html`。
+- **更新通道**：设置页「更新通道」支持 stable / beta，调用 GitHub Releases 检查新版本（`GET /update/check?channel=stable`），显示版本说明与安装包下载链接；后台每 6 小时检查一次，正式版不包含 prerelease。
 
 ## 导入 / 导出（设置页最下方卡片）
 

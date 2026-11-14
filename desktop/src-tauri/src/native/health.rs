@@ -209,6 +209,10 @@ pub async fn report(
         .and_then(|s| s.parse::<usize>().ok())
         .unwrap_or(4000)
         .min(20000);
+    let cache_key = format!("health|{}|{}|{}", range, hours as i64, limit);
+    if let Some(v) = super::collector::get(&cache_key, 5) {
+        return ok(v);
+    }
     // range=today 按本机时区当天 00:00 起算；range=all 不按时间过滤；否则用滚动小时窗。
     let (cutoff, range_label) = match range.as_str() {
         "today" => {
@@ -346,7 +350,7 @@ pub async fn report(
         })
     });
 
-    ok(json!({
+    let out = json!({
         "ok": true,
         "hours": hours,
         "range": range_label,
@@ -358,7 +362,9 @@ pub async fn report(
         "threshold": super::state::FAILURE_THRESHOLD,
         "cooldown_seconds": super::state::COOLDOWN_SECONDS,
         "upstreams": rows,
-    }))
+    });
+    super::collector::put(cache_key, out.clone());
+    ok(out)
 }
 
 /// POST /health/upstreams/clear  body: {"id": "..."} 或 {"all": true}

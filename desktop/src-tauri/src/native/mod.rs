@@ -1,10 +1,13 @@
 pub mod admin;
+pub mod affinity;
 pub mod agents;
 pub mod anthropic;
 pub mod checkin;
+pub mod collector;
 pub mod health;
 pub mod insights;
 pub mod journal;
+pub mod journal_index;
 pub mod proxy;
 pub mod relay;
 pub mod scheduler;
@@ -12,6 +15,7 @@ pub mod sessions;
 pub mod state;
 pub mod stats;
 pub mod transfer;
+pub mod update;
 
 use std::hash::{Hash, Hasher};
 use std::sync::{Arc, OnceLock};
@@ -29,6 +33,8 @@ use tower_http::compression::CompressionLayer;
 use state::AppState;
 
 const WEBUI: &str = include_str!("../../../../webui.html");
+const WEBUI_CSS: &str = include_str!("../../../../webui.css");
+const WEBUI_JS: &str = include_str!("../../../../webui.js");
 
 fn webui_etag() -> &'static str {
     static ETAG_VALUE: OnceLock<String> = OnceLock::new();
@@ -67,12 +73,45 @@ async fn index(headers: HeaderMap) -> Response {
         .into_response()
 }
 
+async fn webui_css() -> Response {
+    (
+        StatusCode::OK,
+        [(CONTENT_TYPE, "text/css; charset=utf-8"), (CACHE_CONTROL, "no-cache")],
+        WEBUI_CSS,
+    )
+        .into_response()
+}
+
+async fn webui_js() -> Response {
+    (
+        StatusCode::OK,
+        [(CONTENT_TYPE, "text/javascript; charset=utf-8"), (CACHE_CONTROL, "no-cache")],
+        WEBUI_JS,
+    )
+        .into_response()
+}
+
 async fn health() -> Response {
     axum::Json(serde_json::json!({"status": "ok", "version": state::VERSION})).into_response()
 }
 
 async fn favicon() -> Response {
     StatusCode::NO_CONTENT.into_response()
+}
+
+async fn journal_db_status(State(state): State<Arc<AppState>>) -> Response {
+    axum::Json(journal_index::status(&state)).into_response()
+}
+
+async fn journal_db_sync(State(state): State<Arc<AppState>>) -> Response {
+    match journal_index::sync(&state) {
+        Ok(n) => axum::Json(serde_json::json!({"ok": true, "added": n})).into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            axum::Json(serde_json::json!({"ok": false, "error": e})),
+        )
+            .into_response(),
+    }
 }
 
 /// SSE：请求完成 / 状态保存时推一个极小事件，前端收到立刻刷一次，轮询只做兜底。
@@ -102,11 +141,17 @@ pub async fn serve(state: Arc<AppState>, port: u16) -> Result<(), String> {
         .map(|f| f.remote_access.unwrap_or(false))
         .unwrap_or(false);
     let bind_host = if remote { "0.0.0.0" } else { "127.0.0.1" };
+    // 启动时把 JSONL 中尚未入索引的部分补齐；失败不阻塞服务，后续查询仍会重试。
+    if let Err(e) = journal_index::sync(&state) {
+        eprintln!("[journal-index] 初始化失败: {e}");
+    }
     let app = Router::new()
         .route("/", get(index))
         .route("/ui", get(index))
         .route("/webui", get(index))
         .route("/webui.html", get(index))
+        .route("/assets/webui.css", get(webui_css))
+        .route("/assets/webui.js", get(webui_js))
         .route("/favicon.ico", get(favicon))
         .route("/health", get(health))
         .route("/healthz", get(health))
@@ -153,6 +198,10 @@ pub async fn serve(state: Arc<AppState>, port: u16) -> Result<(), String> {
         .route("/admin/auto-configure", post(admin::auto_configure))
         .route("/admin/rename-group", post(admin::rename_group))
         .route("/admin/journal/index", get(admin::journal_index))
+        .route("/journal/db/status", get(journal_db_status))
+        .route("/journal/db/sync", post(journal_db_sync))
+        .route("/collector/status", get(collector::status))
+        .route("/update/check", get(update::check))
         .route("/admin/journal", get(admin::journal_query))
         .route("/admin/journal/entry", get(admin::journal_entry))
         .route("/admin/history", get(admin::journal_query))
@@ -168,6 +217,10 @@ pub async fn serve(state: Arc<AppState>, port: u16) -> Result<(), String> {
         .route("/data/export", post(transfer::export_data))
         .route("/data/import", post(transfer::import_data))
         .route("/stats/series", get(insights::series))
+        .route("/stats/today", get(insights::today))
+        .route("/stats/cache-ledger", get(insights::cache_ledger))
+        .route("/affinity/status", get(affinity::status_handler))
+        .route("/affinity/clear", post(affinity::clear_handler))
         .route("/health/upstreams", get(health::report))
         .route("/health/upstreams/clear", post(health::clear))
         .route("/sessions/scan", get(sessions::scan))
@@ -204,6 +257,10 @@ pub async fn serve(state: Arc<AppState>, port: u16) -> Result<(), String> {
     state
         .port
         .store(actual_port, std::sync::atomic::Ordering::Relaxed);
+
+    // 统一采集器：一个后台循环预热会话扫描、工具排行与今日全量统计，页面共享缓存。
+    collector::start(state.clone());
+    update::start(state.clone());
 
     // 统计每 5 秒批量落盘一次，请求路径上不再同步写 stats.json。
     {

@@ -6,10 +6,11 @@
 <meta name="color-scheme" content="dark">
 <title>llm-router HUD</title>
 <style>
-  :root{--bg:#0b111b;--panel:rgba(17,25,38,.96);--line:rgba(255,255,255,.09);--fg:#e6edf6;--dim:#8b9bb0;--accent:#4f9cf9;--ok:#3fb950;--bad:#f85149}
+  :root{--bg:#0b111b;--panel:#111926;--line:rgba(255,255,255,.09);--fg:#e6edf6;--dim:#8b9bb0;--accent:#4f9cf9;--ok:#3fb950;--bad:#f85149}
   *{box-sizing:border-box}
   html,body{height:100%;margin:0;background:transparent;overflow:hidden;font:12px/1.35 -apple-system,BlinkMacSystemFont,"Segoe UI",system-ui,"PingFang SC","Microsoft YaHei",sans-serif;color:var(--fg)}
-  .hud{height:100%;padding:10px 13px 11px;border:1px solid var(--line);border-radius:14px;background:radial-gradient(420px 180px at 12% -30%,rgba(79,156,249,.24),transparent 70%),linear-gradient(160deg,rgba(24,35,53,.98),var(--panel));box-shadow:0 14px 38px rgba(0,0,0,.42);display:flex;flex-direction:column;gap:7px;overflow:hidden}
+  .hud{height:100%;padding:10px 13px 11px;border:1px solid var(--line);border-radius:14px;background:radial-gradient(420px 180px at 12% -30%,rgba(79,156,249,.24),transparent 70%),linear-gradient(160deg,#182335,var(--panel));box-shadow:0 14px 38px rgba(0,0,0,.42);display:flex;flex-direction:column;gap:7px;overflow:hidden}
+.hud>header,.hud>.hero,.hud>.routes,.hud>.grid,.hud>.foot{flex:none}
   header{display:flex;align-items:center;gap:7px;-webkit-app-region:drag;cursor:grab;user-select:none}
   .dot{width:7px;height:7px;border-radius:50%;background:var(--ok);box-shadow:0 0 0 0 rgba(63,185,80,.5);animation:pulse 2.2s ease-in-out infinite}
   .dot.bad{background:var(--bad);animation:none}
@@ -20,40 +21,69 @@
   header #open:hover{background:rgba(79,156,249,.25)}
   .hero{display:flex;align-items:baseline;gap:8px;margin-top:-1px}
   .hero b{font-size:31px;line-height:1;letter-spacing:-.6px;font-variant-numeric:tabular-nums;background:linear-gradient(90deg,#dce9ff,#77b3ff);-webkit-background-clip:text;background-clip:text;color:transparent}
-  .hero span{font-size:11px;color:var(--dim)}
+  .hero-side{display:flex;flex-direction:column;gap:2px;padding-bottom:2px}
+  .hero-side span{font-size:10.5px;color:var(--dim)}
+  .hero-side span:last-child{font-size:9.5px;color:#7fb2e8;font-variant-numeric:tabular-nums}
   .grid{display:grid;grid-template-columns:repeat(3,1fr);gap:6px}
   .cell{background:rgba(255,255,255,.035);border:1px solid rgba(255,255,255,.055);border-radius:8px;padding:6px 7px;min-width:0}
   .cell b{display:block;font-size:15px;line-height:1.1;font-variant-numeric:tabular-nums;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
   .cell span{display:block;font-size:9.5px;color:var(--dim);margin-top:2px;white-space:nowrap}
   .foot{display:flex;gap:9px;font-size:9.5px;color:var(--dim);margin-top:auto;white-space:nowrap;overflow:hidden}
   .foot b{color:#b8c6d8;font-weight:600}
+  .routes{border:1px solid var(--line);border-radius:9px;background:rgba(255,255,255,.035);padding:6px 8px;display:flex;flex-direction:column;gap:4px;min-height:76px}
+  .routes-head{display:flex;justify-content:space-between;font-size:9px;color:var(--dim);letter-spacing:.4px}
+  #routeRows{display:flex;flex-direction:column;gap:4px;min-width:0}
+  .route-row{display:flex;flex-direction:column;gap:2px;min-width:0}
+  .route-line{display:flex;align-items:center;gap:6px;font-size:9.5px;min-width:0}
+  .route-tag{flex:none;padding:1px 5px;border-radius:5px;font-size:8.5px;letter-spacing:.3px}
+  .route-tag.now{color:#8fc1ff;background:rgba(79,156,249,.18)}
+  .route-tag.prev{color:#a8b6c8;background:rgba(255,255,255,.06)}
+  .route-model{font-weight:600;color:#dce8f7;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:110px}
+  .route-time{margin-left:0;color:var(--dim);font-size:8.5px;font-variant-numeric:tabular-nums}
+  .route-path{display:flex;align-items:center;gap:3px;flex-wrap:wrap;max-height:26px;overflow:hidden}
+  .hop{display:inline-flex;align-items:center;gap:3px;max-width:156px;padding:1px 5px;border-radius:5px;background:rgba(255,255,255,.045);border:1px solid rgba(255,255,255,.06);font-size:8.5px;color:#aebed0;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+  .hop.ok{border-color:rgba(63,185,80,.26);color:#9fdca6}
+  .hop.bad{border-color:rgba(248,81,73,.3);color:#ffb4ae}
+  .hop.src{color:#d7c6ff;border-color:rgba(160,120,255,.24)}
+  .route-badge{margin-left:auto;padding:1px 5px;border-radius:5px;font-size:8px;white-space:nowrap}
+  .route-badge.ok{color:#9fdca6;background:rgba(63,185,80,.12)}
+  .route-badge.bad{color:#ffb4ae;background:rgba(248,81,73,.12)}
+  .hop .st{font-size:8px;opacity:.9}
+  .hop-arrow{color:#5d7187;font-size:9px}
+  .route-empty{color:var(--dim);font-size:8.5px}
   @keyframes pulse{0%,100%{box-shadow:0 0 0 0 rgba(63,185,80,.45)}50%{box-shadow:0 0 0 5px rgba(63,185,80,0)}}
 </style>
 </head>
 <body>
 <div class="hud">
   <header data-tauri-drag-region>
-    <span class="dot" id="dot"></span>
+    <span class="dot" id="dot" title="连接中"></span>
     <b>llm-router</b>
     <span id="clock">--:--:--</span>
     <button id="open" title="打开完整控制台">↗</button>
     <button id="close" title="隐藏 HUD">×</button>
   </header>
-  <div class="hero"><b id="calls">—</b><span>今日请求</span></div>
+  <div class="hero"><b id="calls">—</b><div class="hero-side"><span>今日所有请求</span><span id="routeShare">过 LLM Router —</span></div></div>
+  <div class="routes">
+    <div class="routes-head"><span>调用路由</span><span>当前 / 上一轮</span></div>
+    <div id="routeRows"></div>
+  </div>
   <div class="grid">
-    <div class="cell"><b id="rate">—</b><span>成功率</span></div>
-    <div class="cell"><b id="p50">—</b><span>P50 耗时</span></div>
-    <div class="cell"><b id="first">—</b><span>首字 P50</span></div>
+    <div class="cell"><b id="rate">—</b><span>成功率 · 全部</span></div>
+    <div class="cell"><b id="p50">—</b><span>P50 耗时 · 全部</span></div>
+    <div class="cell"><b id="first">—</b><span>首字 P50 · 路由</span></div>
   </div>
   <div class="foot">
     <span>输入 <b id="input">—</b></span>
     <span>输出 <b id="output">—</b></span>
     <span>缓存读 <b id="cache">—</b></span>
+    <span>缓存写 <b id="cacheWrite">—</b></span>
   </div>
 </div>
 <script>
 const $ = (id) => document.getElementById(id);
 const invoke = window.__TAURI__ && window.__TAURI__.core && window.__TAURI__.core.invoke;
+const int = (n) => Number(n || 0).toLocaleString("zh-CN");
 const fmt = (n) => {
   n = Number(n) || 0;
   if (n >= 1000000) return (n / 1000000).toFixed(n % 1000000 ? 1 : 0) + "M";
@@ -65,20 +95,51 @@ const ms = (v) => {
   if (!Number.isFinite(v) || v <= 0) return "—";
   return v < 1000 ? Math.round(v) + "ms" : (v / 1000).toFixed(1) + "s";
 };
+const esc = (v) => String(v == null ? "" : v).replace(/[&<>"']/g, (c) => ({"&":"&amp;","<":"&lt;",">":"&gt;","\"":"&quot;","'":"&#39;"}[c]));
+const hostOf = (url) => { try { return new URL(url).host; } catch (e) { return ""; } };
+function routeRow(route) {
+  if (!route) return `<div class="route-row"><div class="route-line"><span class="route-tag prev">上一轮</span><span class="route-empty">暂无请求记录</span></div></div>`;
+  const list = Array.isArray(route.routes) ? route.routes : [];
+  const sourceLabel = { dsh: "DSH", claude: "Claude", pi: "Pi" }[route.source] || route.source || "Agent";
+  const hops = [`<span class="hop src">${esc(sourceLabel)}</span>`].concat(list.slice(0, 3).map((r, i) => {
+    const name = r.upstream || hostOf(r.base_url) || "未知上游";
+    const ok = r.ok !== false;
+    const status = r.status == null ? "" : String(r.status);
+    const tip = [r.base_url, r.error].filter(Boolean).join(" · ");
+    return `${i || 1 ? '<span class="hop-arrow">→</span>' : ""}<span class="hop ${ok ? "ok" : "bad"}" title="${esc(tip)}">${esc(name)}<span class="st">${ok ? "✓" : "✕"}${status}</span></span>`;
+  })).join("");
+  const extra = list.length > 3 ? `<span class="hop">+${list.length - 3}</span>` : "";
+  const model = route.model || route.effective_model || "未知模型";
+  const vendor = model.includes("/") ? model.split("/")[0] : "";
+  const vendorHop = vendor && !list.some(r => (r.upstream || "") === vendor) ? `<span class="hop-arrow">→</span><span class="hop">${esc(vendor)}</span>` : "";
+  const badge = route.routed ? `<span class="route-badge ok">走 llm-router</span>` : `<span class="route-badge bad">未走 llm-router</span>`;
+  return `<div class="route-row"><div class="route-line"><span class="route-tag ${route.active ? "now" : "prev"}">${route.active ? "当前" : "上一轮"}</span><span class="route-model" title="${esc(model)}">${esc(model)}</span>${badge}<span class="route-time">${esc(route.time || "")}</span></div><div class="route-path">${hops}${vendorHop}${extra}</div></div>`;
+}
+function renderRoutes(d) {
+  $("routeRows").innerHTML = routeRow(d.route);
+}
 async function refresh() {
   if (!invoke) { $("clock").textContent = "需要桌面版"; return; }
   try {
     const d = await invoke("hud_stats");
-    $("calls").textContent = fmt(d.calls);
-    $("rate").textContent = d.calls ? (d.success_rate == null ? "—" : d.success_rate.toFixed(1) + "%") : "—";
-    $("p50").textContent = ms(d.p50_ms);
+    const allCalls = Number(d.all_calls != null ? d.all_calls : d.calls) || 0;
+    const routedCalls = Number(d.routed_calls) || 0;
+    $("calls").textContent = int(allCalls);
+    $("routeShare").textContent = "过 LLM Router " + int(routedCalls) + " · " + (allCalls ? (routedCalls / allCalls * 100).toFixed(1) + "%" : "0%");
+    $("rate").textContent = d.all_calls ? (d.all_success_rate == null ? "—" : d.all_success_rate.toFixed(1) + "%") : "—";
+    $("p50").textContent = ms(d.all_p50_ms);
     $("first").textContent = ms(d.first_p50_ms);
-    $("input").textContent = fmt(d.input);
-    $("output").textContent = fmt(d.output);
-    $("cache").textContent = fmt(d.cache_read);
-    $("dot").classList.toggle("bad", !!d.calls && (d.failed || 0) > 0);
+    $("input").textContent = fmt(d.all_input != null ? d.all_input : d.input);
+    $("output").textContent = fmt(d.all_output != null ? d.all_output : d.output);
+    $("cache").textContent = fmt(d.all_cache_read != null ? d.all_cache_read : d.cache_read);
+    $("cacheWrite").textContent = fmt(d.all_cache_write != null ? d.all_cache_write : d.cache_write);
+    $("dot").classList.remove("bad");
+    $("dot").title = "已连接";
     $("clock").textContent = d.updated || new Date().toLocaleTimeString("zh-CN", { hour12: false });
+    renderRoutes(d);
   } catch (e) {
+    $("dot").classList.add("bad");
+    $("dot").title = "连接失败";
     $("clock").textContent = "读取失败";
   }
 }

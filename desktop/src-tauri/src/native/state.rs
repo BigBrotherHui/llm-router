@@ -7,6 +7,8 @@ use std::time::{Instant, SystemTime};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
 
+use super::affinity;
+
 pub const VERSION: &str = "2.10.0-native";
 
 fn default_true() -> bool {
@@ -279,6 +281,8 @@ pub struct AppState {
     pub events_tx: tokio::sync::broadcast::Sender<Value>,
     /// 流水写入队列：请求路径不碰磁盘，独立线程顺序 append。
     pub journal_tx: OnceLock<std::sync::mpsc::Sender<Value>>,
+    /// 会话粘性状态（config.affinity.json）；默认 auto。
+    pub affinity: Mutex<affinity::Store>,
 }
 
 impl AppState {
@@ -293,6 +297,7 @@ impl AppState {
             .connect_timeout(std::time::Duration::from_secs(10))
             .build()
             .unwrap_or_else(|_| reqwest::Client::new());
+        let affinity_path = affinity::path_for(&state_path);
         Self {
             file: RwLock::new(file),
             state_path,
@@ -315,6 +320,7 @@ impl AppState {
             stats_dirty: AtomicBool::new(false),
             events_tx: tokio::sync::broadcast::channel(128).0,
             journal_tx: OnceLock::new(),
+            affinity: Mutex::new(affinity::Store::load(affinity_path)),
         }
     }
 
@@ -635,6 +641,7 @@ pub fn snapshot(state: &AppState) -> Value {
             .count();
         let mut val = json!({
             "strategy": route.strategy,
+            "affinity": route.extra.get("affinity").and_then(Value::as_str).unwrap_or("auto"),
             "entries": route.entries,
             "members": members,
             "upstream_names": upstream_names,
@@ -698,6 +705,7 @@ fn catalog_entry<'a>(map: &'a mut HashMap<String, Value>, group: &str) -> &'a mu
             "offered_only": [],
             "configured": false,
             "strategy": Value::Null,
+            "affinity": "auto",
         })
     })
 }
@@ -738,6 +746,7 @@ fn build_catalog(file: &StateFile) -> Vec<Value> {
         let e = catalog_entry(&mut map, group);
         e["configured"] = json!(true);
         e["strategy"] = json!(route.strategy);
+        e["affinity"] = json!(route.extra.get("affinity").and_then(Value::as_str).unwrap_or("auto"));
         for ent in &route.entries {
             if let Some(up) = file.find_upstream(&ent.upstream) {
                 let ups = e["upstreams"].as_array_mut().unwrap();

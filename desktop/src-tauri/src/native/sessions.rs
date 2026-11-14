@@ -7,17 +7,17 @@
 //!
 //! 全部只读：不改任何 Agent 的配置，也不写任何文件。
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io::{BufRead, BufReader, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::sync::{Arc, Mutex, OnceLock};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use axum::extract::{Query, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::Json;
-use chrono::Timelike;
+use chrono::{TimeZone, Timelike};
 use serde::Deserialize;
 use serde_json::{json, Value};
 
@@ -31,6 +31,10 @@ const FILE_LIMIT: usize = 400;
 const ROW_LIMIT: usize = 200;
 /// 返回给前端的会话条目上限。
 const SESSION_LIMIT: usize = 60;
+
+/// HUD 用的今日会话总览缓存：会话文件扫描较慢，30 秒内复用。
+static TODAY_CACHE: OnceLock<Mutex<Option<(Instant, TodayTotals)>>> = OnceLock::new();
+static LAST_ROUND_CACHE: OnceLock<Mutex<Option<(Instant, Value)>>> = OnceLock::new();
 
 fn ok(v: Value) -> Response {
     Json(v).into_response()
@@ -73,7 +77,7 @@ fn iso_ms(s: &str) -> i64 {
         .unwrap_or(0)
 }
 
-#[derive(Deserialize, Default)]
+#[derive(Deserialize, Default, Clone)]
 pub struct ScanQuery {
     /// 时间窗（小时），0 或缺省后用默认 168 小时；负数表示不限时间
     pub hours: Option<i64>,
@@ -85,8 +89,23 @@ pub struct ScanQuery {
     pub limit: Option<usize>,
 }
 
-/// 按 (来源, provider, model) 聚合的一行账。
-#[derive(Clone)]
+/// HUD 用的“今日全部流量”快照：包含所有 Agent 会话，不只是经过 llm-router 的部分。
+#[derive(Clone, Default)]
+pub struct TodayTotals {
+    pub total: u64,
+    pub routed: u64,
+    pub input: u64,
+    pub output: u64,
+    pub cache_read: u64,
+    pub cache_write: u64,
+    pub routed_input: u64,
+    pub routed_output: u64,
+    pub routed_cache_read: u64,
+    pub routed_cache_write: u64,
+    pub durations: Vec<f64>,
+    pub routed_durations: Vec<f64>,
+}
+
 struct Agg {
     source: String,
     agent: String,
@@ -102,6 +121,8 @@ struct Agg {
     total: u64,
     first_ms: i64,
     last_ms: i64,
+    durations: Vec<f64>,
+    sessions: HashSet<String>,
 }
 
 impl Agg {
@@ -121,6 +142,8 @@ impl Agg {
             total: 0,
             first_ms: 0,
             last_ms: 0,
+            durations: Vec::new(),
+            sessions: HashSet::new(),
         }
     }
 
@@ -132,7 +155,13 @@ impl Agg {
         cache_read: u64,
         cache_write: u64,
         total: u64,
+        duration_ms: Option<f64>,
     ) {
+        if let Some(d) = duration_ms {
+            if d > 0.0 {
+                self.durations.push(d / 1000.0);
+            }
+        }
         self.rounds += 1;
         self.input += input;
         self.output += output;
@@ -177,18 +206,31 @@ struct Sess {
     ended_ms: i64,
     rounds: u64,
     routed_rounds: u64,
+    input: u64,
+    output: u64,
+    cache_read: u64,
+    cache_write: u64,
     models: HashMap<String, u64>,
+    all_models: HashMap<String, u64>,
+    providers: HashSet<String>,
     external_top: String,
 }
 
 type AggMap = HashMap<String, Agg>;
 type SessList = Vec<Sess>;
 
-fn bump(aggs: &mut AggMap, key: &str, make: impl FnOnce() -> Agg, at_ms: i64, u: [u64; 5]) {
+fn bump(
+    aggs: &mut AggMap,
+    key: &str,
+    make: impl FnOnce() -> Agg,
+    at_ms: i64,
+    u: [u64; 5],
+    duration_ms: Option<f64>,
+) {
     let e = aggs
         .entry(key.to_string())
         .or_insert_with(|| make());
-    e.add(at_ms, u[0], u[1], u[2], u[3], u[4]);
+    e.add(at_ms, u[0], u[1], u[2], u[3], u[4], duration_ms);
 }
 
 fn num(v: &Value) -> u64 {
@@ -450,6 +492,7 @@ impl<'a> Ctx<'a> {
         model: &str,
         at_ms: i64,
         usage: [u64; 5],
+        duration_ms: Option<f64>,
     ) {
         let provider = if provider.trim().is_empty() {
             "(未记录)"
@@ -477,14 +520,22 @@ impl<'a> Ctx<'a> {
             || Agg::new(source, agent, provider, model),
             at_ms,
             usage,
+            duration_ms,
         );
         if let Some(e) = self.aggs.get_mut(&key) {
             e.routed = routed;
             if e.base_url.is_empty() {
                 e.base_url = base.clone();
             }
+            e.sessions.insert(sess.id.clone());
         }
         sess.rounds += 1;
+        sess.input += usage[0];
+        sess.output += usage[1];
+        sess.cache_read += usage[2];
+        sess.cache_write += usage[3];
+        sess.providers.insert(provider.to_string());
+        *sess.all_models.entry(model.to_string()).or_insert(0) += 1;
         if routed {
             sess.routed_rounds += 1;
         } else {
@@ -506,7 +557,392 @@ impl<'a> Ctx<'a> {
 
 /// DeepSeek Harness：~/.dsh/sessions/<project>/<session>/session.v4.jsonl.zstd
 /// 记录形如 {"type":"assistant/message","time":<ms>,"data":{"message":{"source":{provider,model}},"usage":{inputTokens,...}}}
+fn blank_stat(id: &str, name: &str) -> SrcStat {
+    SrcStat { id: id.to_string(), name: name.to_string(), ..Default::default() }
+}
+
+/// 今日所有 Agent 会话轮数，以及其中真正走本机 llm-router 的轮数。
+/// 返回 (全部轮数, 过路由轮数)，后者是前者的子集。
+/// 今日所有 Agent 会话的全量统计：token 总量、轮数、可测耗时样本。
+/// 会话记录只保留成功轮，因此成功率仍由本机 8010 流水给出；这里负责
+/// 展示“全部请求”的 token/耗时，避免 HUD 只看见经过 llm-router 的 38 轮。
+pub fn today_totals(port: u16) -> TodayTotals {
+    let cache = TODAY_CACHE.get_or_init(|| Mutex::new(None));
+    {
+        let guard = cache.lock().unwrap();
+        if let Some((at, t)) = guard.as_ref() {
+            if at.elapsed() < Duration::from_secs(30) {
+                return t.clone();
+            }
+        }
+    }
+
+    let home = home();
+    let bases = collect_bases(&home);
+    let now = chrono::Local::now();
+    let secs = now.time().num_seconds_from_midnight() as i64;
+    let since_ms = (now.timestamp() - secs) * 1000;
+    let mut aggs: AggMap = HashMap::new();
+    let mut sessions: SessList = Vec::new();
+    {
+        let mut ctx = Ctx { bases: &bases, port, since_ms, aggs: &mut aggs, sessions: &mut sessions };
+        let mut st = blank_stat("dsh", "DeepSeek Harness");
+        scan_dsh(&mut ctx, &home, &mut st);
+        let mut st = blank_stat("claude", "Claude Code");
+        scan_claude(&mut ctx, &home, &mut st);
+        let mut st = blank_stat("pi", "Pi");
+        scan_pi(&mut ctx, &home, &mut st);
+        let mut st = blank_stat("codex", "Codex");
+        scan_codex(&mut ctx, &home, &mut st);
+    }
+    let mut t = TodayTotals::default();
+    for a in aggs.values() {
+        t.total += a.rounds;
+        t.input += a.input;
+        t.output += a.output;
+        t.cache_read += a.cache_read;
+        t.cache_write += a.cache_write;
+        t.durations.extend(a.durations.iter().copied());
+        if a.routed {
+            t.routed += a.rounds;
+            t.routed_input += a.input;
+            t.routed_output += a.output;
+            t.routed_cache_read += a.cache_read;
+            t.routed_cache_write += a.cache_write;
+            t.routed_durations.extend(a.durations.iter().copied());
+        }
+    }
+    *cache.lock().unwrap() = Some((Instant::now(), t.clone()));
+    t
+}
+
+#[derive(Default)]
+struct LedgerAgg {
+    calls: u64,
+    input: u64,
+    output: u64,
+    cache_read: u64,
+    cache_write: u64,
+    routed_calls: u64,
+    routed_input: u64,
+    routed_output: u64,
+    routed_cache_read: u64,
+    routed_cache_write: u64,
+    sessions: HashSet<String>,
+    upstreams: HashSet<String>,
+    last_at: f64,
+}
+
+impl LedgerAgg {
+    fn add_agg(&mut self, a: &Agg) {
+        self.calls += a.rounds;
+        self.input += a.input;
+        self.output += a.output;
+        self.cache_read += a.cache_read;
+        self.cache_write += a.cache_write;
+        if a.routed {
+            self.routed_calls += a.rounds;
+            self.routed_input += a.input;
+            self.routed_output += a.output;
+            self.routed_cache_read += a.cache_read;
+            self.routed_cache_write += a.cache_write;
+        }
+        self.sessions.extend(a.sessions.iter().cloned());
+        if !a.provider.is_empty() {
+            self.upstreams.insert(a.provider.clone());
+        }
+        self.last_at = self.last_at.max(a.last_ms as f64 / 1000.0);
+    }
+
+    fn add_sess(&mut self, s: &Sess) {
+        self.calls += s.rounds;
+        self.input += s.input;
+        self.output += s.output;
+        self.cache_read += s.cache_read;
+        self.cache_write += s.cache_write;
+        self.sessions.insert(s.id.clone());
+        self.upstreams.extend(s.providers.iter().cloned());
+        self.last_at = self.last_at.max(s.ended_ms as f64 / 1000.0);
+    }
+
+    fn json(&self, label: &str) -> Value {
+        let prompt = self.input + self.cache_read + self.cache_write;
+        json!({
+            "label": label,
+            "calls": self.calls,
+            "routed_calls": self.routed_calls,
+            "input": self.input,
+            "output": self.output,
+            "cache_read": self.cache_read,
+            "cache_write": self.cache_write,
+            "routed_input": self.routed_input,
+            "routed_output": self.routed_output,
+            "routed_cache_read": self.routed_cache_read,
+            "routed_cache_write": self.routed_cache_write,
+            "prompt_tokens": prompt,
+            "hit_rate": if prompt > 0 { (self.cache_read as f64 / prompt as f64 * 1000.0).round() / 10.0 } else { 0.0 },
+            "saved_tokens": self.cache_read,
+            "sessions": self.sessions.len(),
+            "upstreams": self.upstreams.iter().cloned().collect::<Vec<_>>(),
+            "last_at": self.last_at,
+        })
+    }
+}
+
+/// 所有 Agent 会话的缓存账本。和路由流水无关：DSH / Claude / Pi / Codex
+/// 各自写的会话记录里只要有 usage，就进入这里；`routed` 只是其中一个子集。
+pub fn session_cache_ledger(port: u16, since_ms: i64) -> Value {
+    let home = home();
+    let bases = collect_bases(&home);
+    let mut aggs: AggMap = HashMap::new();
+    let mut sessions: SessList = Vec::new();
+    {
+        let mut ctx = Ctx { bases: &bases, port, since_ms, aggs: &mut aggs, sessions: &mut sessions };
+        let mut st = blank_stat("dsh", "DeepSeek Harness");
+        scan_dsh(&mut ctx, &home, &mut st);
+        let mut st = blank_stat("claude", "Claude Code");
+        scan_claude(&mut ctx, &home, &mut st);
+        let mut st = blank_stat("pi", "Pi");
+        scan_pi(&mut ctx, &home, &mut st);
+        let mut st = blank_stat("codex", "Codex");
+        scan_codex(&mut ctx, &home, &mut st);
+    }
+
+    let mut totals = LedgerAgg::default();
+    let mut models: HashMap<String, LedgerAgg> = HashMap::new();
+    let mut upstreams: HashMap<String, LedgerAgg> = HashMap::new();
+    for a in aggs.values() {
+        totals.add_agg(a);
+        if !a.model.is_empty() {
+            models.entry(a.model.clone()).or_default().add_agg(a);
+        }
+        if !a.provider.is_empty() {
+            upstreams.entry(a.provider.clone()).or_default().add_agg(a);
+        }
+    }
+
+    let mut model_rows: Vec<Value> = models.into_iter().map(|(k, v)| v.json(&k)).collect();
+    model_rows.sort_by_key(|r| -r["cache_read"].as_i64().unwrap_or(0));
+    let mut upstream_rows: Vec<Value> = upstreams.into_iter().map(|(k, v)| v.json(&k)).collect();
+    upstream_rows.sort_by_key(|r| -r["cache_read"].as_i64().unwrap_or(0));
+
+    let mut session_rows: Vec<Value> = sessions
+        .iter()
+        .map(|s| {
+            let mut row = LedgerAgg::default();
+            row.add_sess(s);
+            let model = s
+                .all_models
+                .iter()
+                .max_by_key(|(_, n)| **n)
+                .map(|(m, _)| m.clone())
+                .unwrap_or_default();
+            let mut val = row.json(&s.id);
+            val["source"] = json!(s.source);
+            val["agent"] = json!(s.agent);
+            val["project"] = json!(s.project);
+            val["model"] = json!(model);
+            val["switches"] = json!(s.providers.len().saturating_sub(1));
+            val
+        })
+        .collect();
+    // 「按会话（最近 100）」必须按最后活动时间倒序，不能按缓存读大小排。
+    session_rows.sort_by(|a, b| {
+        let at = a["last_at"].as_f64().unwrap_or(0.0);
+        let bt = b["last_at"].as_f64().unwrap_or(0.0);
+        bt.partial_cmp(&at).unwrap_or(std::cmp::Ordering::Equal)
+    });
+
+    let total_label = if since_ms <= 0 { "全部" } else { "今天 00:00 起" };
+    json!({
+        "totals": totals.json(total_label),
+        "models": model_rows,
+        "upstreams": upstream_rows,
+        "sessions": session_rows,
+    })
+}
+
+fn epoch_ms(v: &Value) -> i64 {
+    v.get("time")
+        .and_then(|x| x.as_i64().or_else(|| x.as_f64().map(|f| f as i64)))
+        .unwrap_or(0)
+}
+
+fn route_value(
+    source: &str,
+    provider: &str,
+    model: &str,
+    at_ms: i64,
+    active: bool,
+    port: u16,
+    bases: &HashMap<String, String>,
+    retry: Option<&(i64, String, String)>,
+) -> Value {
+    let base = bases.get(provider).cloned().unwrap_or_default();
+    let routed = is_router_name(provider) || is_router_url(&base, port);
+    let mut routes: Vec<Value> = Vec::new();
+    if let Some((_, rp, err)) = retry {
+        if rp != provider {
+            routes.push(json!({
+                "upstream": rp,
+                "base_url": bases.get(rp).cloned().unwrap_or_default(),
+                "model": "",
+                "ok": false,
+                "status": Value::Null,
+                "elapsed_seconds": Value::Null,
+                "error": err,
+            }));
+        }
+    }
+    routes.push(json!({
+        "upstream": provider,
+        "base_url": base,
+        "model": model,
+        "ok": true,
+        "status": Value::Null,
+        "elapsed_seconds": Value::Null,
+        "error": "",
+    }));
+    let time = chrono::Local
+        .timestamp_millis_opt(at_ms)
+        .single()
+        .map(|t| t.format("%H:%M:%S").to_string())
+        .unwrap_or_default();
+    json!({
+        "source": source,
+        "provider": provider,
+        "model": model,
+        "base_url": bases.get(provider).cloned().unwrap_or_default(),
+        "routed": routed,
+        "active": active,
+        "at": at_ms,
+        "time": time,
+        "routes": routes,
+    })
+}
+
+fn dsh_last_round(home: &Path, port: u16, bases: &HashMap<String, String>) -> Option<(i64, Value)> {
+    let root = home.join(".dsh").join("sessions");
+    let mut files: Vec<PathBuf> = Vec::new();
+    if let Ok(projects) = std::fs::read_dir(&root) {
+        for p in projects.flatten() {
+            if p.path().is_dir() {
+                walk_files(&p.path(), 0, &mut files);
+            }
+        }
+    }
+    files.sort_by_key(|f| std::cmp::Reverse(mtime_ms(f)));
+    let path = files.first()?;
+    let f = std::fs::File::open(path).ok()?;
+    let dec = zstd::stream::read::Decoder::new(BufReader::new(f)).ok()?;
+    let mut last_msg: Option<(i64, String, String, i64)> = None;
+    let mut last_ctx: Option<(i64, String, String)> = None;
+    let mut last_retry: Option<(i64, String, String)> = None;
+    for line in BufReader::new(dec).lines().flatten() {
+        let Ok(v) = serde_json::from_str::<Value>(&line) else { continue };
+        let typ = v.get("type").and_then(Value::as_str).unwrap_or("");
+        let data = v.get("data").unwrap_or(&Value::Null);
+        let at = epoch_ms(&v);
+        if typ == "assistant/message" {
+            let msg = data.get("message").unwrap_or(&Value::Null);
+            let src = msg.get("source").unwrap_or(&Value::Null);
+            let provider = src.get("provider").and_then(Value::as_str).unwrap_or("");
+            let model = src.get("model").and_then(Value::as_str).unwrap_or("");
+            if !provider.is_empty() {
+                last_msg = Some((at, provider.to_string(), model.to_string(), pick_num(data, &["turn"]) as i64));
+            }
+        } else if typ == "request/context" {
+            let provider = data.get("provider").and_then(Value::as_str).unwrap_or("");
+            let model = data.get("model").and_then(Value::as_str).unwrap_or("");
+            if !provider.is_empty() {
+                last_ctx = Some((at, provider.to_string(), model.to_string()));
+            }
+        } else if typ == "llm/retry" {
+            let provider = data.get("provider").and_then(Value::as_str).unwrap_or("");
+            let err = data
+                .get("failure")
+                .and_then(|f| f.get("message"))
+                .and_then(Value::as_str)
+                .unwrap_or("");
+            if !provider.is_empty() {
+                last_retry = Some((at, provider.to_string(), err.to_string()));
+            }
+        }
+    }
+    let (at, provider, model, active, retry) = match (&last_ctx, &last_msg) {
+        (Some(c), Some(m)) if c.0 >= m.0 => (c.0, c.1.clone(), c.2.clone(), true, None),
+        (_, Some(m)) => {
+            let r = last_retry.as_ref().filter(|r| r.0 <= m.0 && r.0 >= m.0.saturating_sub(120_000) && r.1 != m.1);
+            (m.0, m.1.clone(), m.2.clone(), false, r)
+        }
+        (Some(c), None) => (c.0, c.1.clone(), c.2.clone(), true, None),
+        _ => return None,
+    };
+    let _ = last_msg.as_ref().map(|m| m.3);
+    Some((at, route_value("dsh", &provider, &model, at, active, port, bases, retry)))
+}
+
+fn latest_file(root: &Path, depth: usize) -> Option<PathBuf> {
+    let mut files: Vec<PathBuf> = Vec::new();
+    walk_files(root, depth, &mut files);
+    files.sort_by_key(|f| std::cmp::Reverse(mtime_ms(f)));
+    files.into_iter().next()
+}
+
+fn claude_last_round(home: &Path, port: u16, bases: &HashMap<String, String>) -> Option<(i64, Value)> {
+    let path = latest_file(&home.join(".claude").join("projects"), 3)?;
+    let at = mtime_ms(&path);
+    let mut found = None;
+    tail_lines(&path, 4 * 1024 * 1024, &mut |line| {
+        let Ok(v) = serde_json::from_str::<Value>(line) else { return };
+        if v.get("type").and_then(Value::as_str) != Some("assistant") { return; }
+        let msg = v.get("message").unwrap_or(&Value::Null);
+        let model = msg.get("model").and_then(Value::as_str).unwrap_or("");
+        if !model.is_empty() { found = Some(model.to_string()); }
+    });
+    found.map(|model| (at, route_value("claude", "anthropic", &model, at, false, port, bases, None)))
+}
+
+fn pi_last_round(home: &Path, port: u16, bases: &HashMap<String, String>) -> Option<(i64, Value)> {
+    let path = latest_file(&home.join(".pi").join("agent").join("sessions"), 3)?;
+    let at = mtime_ms(&path);
+    let mut found = None;
+    tail_lines(&path, 4 * 1024 * 1024, &mut |line| {
+        let Ok(v) = serde_json::from_str::<Value>(line) else { return };
+        if v.get("type").and_then(Value::as_str) != Some("message") { return; }
+        let msg = v.get("message").unwrap_or(&Value::Null);
+        if msg.get("role").and_then(Value::as_str) != Some("assistant") { return; }
+        let provider = msg.get("provider").and_then(Value::as_str).unwrap_or("pi");
+        let model = msg.get("model").and_then(Value::as_str).unwrap_or("");
+        if !model.is_empty() { found = Some((provider.to_string(), model.to_string())); }
+    });
+    found.map(|(provider, model)| (at, route_value("pi", &provider, &model, at, false, port, bases, None)))
+}
+
+/// 最近一轮对话实际使用的路由（含没有经过 llm-router 的调用）。
+/// `active` 为 true 表示会话里已经发出 request/context 但还没有对应回复，通常就是当前正在跑的请求。
+pub fn last_round(port: u16) -> Value {
+    let cache = LAST_ROUND_CACHE.get_or_init(|| Mutex::new(None));
+    let mut guard = cache.lock().unwrap();
+    if let Some((at, value)) = guard.as_ref() {
+        if at.elapsed() < Duration::from_secs(3) {
+            return value.clone();
+        }
+    }
+    let home = home();
+    let bases = collect_bases(&home);
+    let mut found: Vec<(i64, Value)> = Vec::new();
+    if let Some(v) = dsh_last_round(&home, port, &bases) { found.push(v); }
+    if let Some(v) = claude_last_round(&home, port, &bases) { found.push(v); }
+    if let Some(v) = pi_last_round(&home, port, &bases) { found.push(v); }
+    found.sort_by_key(|(at, _)| std::cmp::Reverse(*at));
+    let value = found.into_iter().next().map(|(_, v)| v).unwrap_or(Value::Null);
+    *guard = Some((Instant::now(), value.clone()));
+    value
+}
+
 fn scan_dsh(ctx: &mut Ctx, home: &Path, st: &mut SrcStat) {
+
     let root = home.join(".dsh").join("sessions");
     st.root = root.to_string_lossy().to_string();
     if !root.is_dir() {
@@ -556,7 +992,13 @@ fn scan_dsh(ctx: &mut Ctx, home: &Path, st: &mut SrcStat) {
             ended_ms: 0,
             rounds: 0,
             routed_rounds: 0,
+            input: 0,
+            output: 0,
+            cache_read: 0,
+            cache_write: 0,
             models: HashMap::new(),
+            all_models: HashMap::new(),
+            providers: HashSet::new(),
             external_top: String::new(),
         };
         st.files += 1;
@@ -582,6 +1024,7 @@ fn scan_dsh(ctx: &mut Ctx, home: &Path, st: &mut SrcStat) {
         };
         let mut read = 0u64;
         let mut first = true;
+        let mut step_starts: HashMap<(i64, i64), i64> = HashMap::new();
         for line in BufReader::new(lines).lines() {
             let Ok(line) = line else { break };
             read += line.len() as u64 + 1;
@@ -593,6 +1036,20 @@ fn scan_dsh(ctx: &mut Ctx, home: &Path, st: &mut SrcStat) {
                         if let Some(id) = v.get("id").and_then(|c| c.as_str()) {
                             sess.id = id.to_string();
                         }
+                    }
+                }
+            }
+            if line.contains("step/start") {
+                if let Ok(v) = serde_json::from_str::<Value>(&line) {
+                    if v.get("type").and_then(|t| t.as_str()) == Some("step/start") {
+                        let d = v.get("data").cloned().unwrap_or(Value::Null);
+                        let turn = d.get("turn").and_then(|x| x.as_i64()).unwrap_or(0);
+                        let step = d.get("step").and_then(|x| x.as_i64()).unwrap_or(0);
+                        let at = v.get("time").and_then(|t| t.as_i64()).unwrap_or(0);
+                        if turn > 0 && step > 0 && at > 0 {
+                            step_starts.insert((turn, step), at);
+                        }
+                        continue;
                     }
                 }
             }
@@ -610,6 +1067,12 @@ fn scan_dsh(ctx: &mut Ctx, home: &Path, st: &mut SrcStat) {
                 continue;
             }
             let d = v.get("data").cloned().unwrap_or(Value::Null);
+            let turn = d.get("turn").and_then(|x| x.as_i64()).unwrap_or(0);
+            let step = d.get("step").and_then(|x| x.as_i64()).unwrap_or(0);
+            let duration = step_starts
+                .remove(&(turn, step))
+                .filter(|start| at > *start)
+                .map(|start| (at - start) as f64);
             let src = d
                 .get("message")
                 .and_then(|m| m.get("source"))
@@ -625,7 +1088,7 @@ fn scan_dsh(ctx: &mut Ctx, home: &Path, st: &mut SrcStat) {
                 pick_num(&u, &["cacheWriteTokens", "cache_write"]),
                 pick_num(&u, &["totalTokens", "total"]),
             ];
-            ctx.round("dsh", "DeepSeek Harness", &mut sess, provider, model, at, usage);
+            ctx.round("dsh", "DeepSeek Harness", &mut sess, provider, model, at, usage, duration);
         }
         if read >= FILE_CAP {
             st.truncated = true;
@@ -680,7 +1143,13 @@ fn scan_claude(ctx: &mut Ctx, home: &Path, st: &mut SrcStat) {
             ended_ms: 0,
             rounds: 0,
             routed_rounds: 0,
+            input: 0,
+            output: 0,
+            cache_read: 0,
+            cache_write: 0,
             models: HashMap::new(),
+            all_models: HashMap::new(),
+            providers: HashSet::new(),
             external_top: String::new(),
         };
         st.files += 1;
@@ -722,7 +1191,7 @@ fn scan_claude(ctx: &mut Ctx, home: &Path, st: &mut SrcStat) {
                     .and_then(|x| x.as_str())
                     .filter(|s| !s.is_empty())
                     .unwrap_or("anthropic");
-                ctx.round("claude", "Claude Code", &mut sess, provider, model, at, usage);
+                ctx.round("claude", "Claude Code", &mut sess, provider, model, at, usage, None);
             }
         });
         st.bytes += n;
@@ -778,7 +1247,13 @@ fn scan_pi(ctx: &mut Ctx, home: &Path, st: &mut SrcStat) {
             ended_ms: 0,
             rounds: 0,
             routed_rounds: 0,
+            input: 0,
+            output: 0,
+            cache_read: 0,
+            cache_write: 0,
             models: HashMap::new(),
+            all_models: HashMap::new(),
+            providers: HashSet::new(),
             external_top: String::new(),
         };
         st.files += 1;
@@ -836,7 +1311,7 @@ fn scan_pi(ctx: &mut Ctx, home: &Path, st: &mut SrcStat) {
                 pick_num(&u, &["cacheWrite"]),
                 pick_num(&u, &["totalTokens", "total"]),
             ];
-            ctx.round("pi", "Pi", &mut sess, &provider, model, at, usage);
+            ctx.round("pi", "Pi", &mut sess, &provider, model, at, usage, None);
         });
         st.bytes += n;
         if n >= FILE_CAP {
@@ -890,7 +1365,13 @@ fn scan_codex(ctx: &mut Ctx, home: &Path, st: &mut SrcStat) {
             ended_ms: 0,
             rounds: 0,
             routed_rounds: 0,
+            input: 0,
+            output: 0,
+            cache_read: 0,
+            cache_write: 0,
             models: HashMap::new(),
+            all_models: HashMap::new(),
+            providers: HashSet::new(),
             external_top: String::new(),
         };
         st.files += 1;
@@ -950,7 +1431,7 @@ fn scan_codex(ctx: &mut Ctx, home: &Path, st: &mut SrcStat) {
                     } else {
                         meta_provider.as_str()
                     };
-                    ctx.round("codex", "Codex", &mut sess, provider, &cur_model, at, usage);
+                    ctx.round("codex", "Codex", &mut sess, provider, &cur_model, at, usage, None);
                 }
                 _ => {}
             }
@@ -972,25 +1453,15 @@ fn scan_codex(ctx: &mut Ctx, home: &Path, st: &mut SrcStat) {
 
 fn journal_window(state: &AppState, since_ms: i64) -> Value {
     let path = state.history_path();
+    let since = if since_ms > 0 { since_ms as f64 / 1000.0 } else { 0.0 };
+    let entries = super::journal_index::entries(state, since, None);
     let mut rounds = 0u64;
     let mut input = 0u64;
     let mut output = 0u64;
     let mut cache_read = 0u64;
     let mut cache_write = 0u64;
     let mut by_model: HashMap<String, (u64, u64, u64)> = HashMap::new();
-    let mut seen_from = i64::MAX;
-    let _ = tail_lines(&path, 32 * 1024 * 1024, &mut |line| {
-        let Ok(v) = serde_json::from_str::<Value>(line) else {
-            return;
-        };
-        let at = v
-            .get("at")
-            .and_then(|x| x.as_f64())
-            .map(|f| (f * 1000.0) as i64)
-            .unwrap_or(0);
-        if since_ms > 0 && at > 0 && at < since_ms {
-            return;
-        }
+    for v in &entries {
         let u = v.get("usage").cloned().unwrap_or(Value::Null);
         let i = pick_num(&u, &["input", "prompt_tokens"]);
         let o = pick_num(&u, &["output", "completion_tokens"]);
@@ -1001,15 +1472,12 @@ fn journal_window(state: &AppState, since_ms: i64) -> Value {
         output += o;
         cache_read += cr;
         cache_write += cw;
-        if at > 0 && at < seen_from {
-            seen_from = at;
-        }
         let model = v.get("model").and_then(|x| x.as_str()).unwrap_or("(未知)");
         let e = by_model.entry(model.to_string()).or_insert((0, 0, 0));
         e.0 += 1;
         e.1 += i;
         e.2 += o;
-    });
+    }
     let mut models: Vec<Value> = by_model
         .into_iter()
         .map(|(m, (r, i, o))| json!({"model": m, "rounds": r, "input": i, "output": o}))
@@ -1082,6 +1550,10 @@ pub async fn scan(State(state): State<Arc<AppState>>, Query(q): Query<ScanQuery>
     let row_limit = q.limit.unwrap_or(ROW_LIMIT).clamp(10, 500);
     if wanted.is_empty() {
         return bad("sources 参数为空，请至少选一个数据源（dsh,claude,pi,codex）");
+    }
+    let cache_key = super::collector::scan_key(&q);
+    if let Some(v) = super::collector::get(&cache_key, 15) {
+        return Json(v).into_response();
     }
 
     let home = home();
@@ -1240,7 +1712,7 @@ pub async fn scan(State(state): State<Arc<AppState>>, Query(q): Query<ScanQuery>
         })
         .collect();
 
-    ok(json!({
+    let value = json!({
         "ok": true,
         "port": port,
         "base_url": format!("http://127.0.0.1:{port}/v1"),
@@ -1284,13 +1756,15 @@ pub async fn scan(State(state): State<Arc<AppState>>, Query(q): Query<ScanQuery>
         "journal": journal,
         "sessions": sess_json,
         "sessions_total": sessions.len(),
-    }))
+    });
+    super::collector::put(cache_key, value.clone());
+    Json(value).into_response()
 }
 
 
 // ───────────────────── MCP / 工具调用排行榜 ─────────────────────
 
-#[derive(Deserialize, Default)]
+#[derive(Deserialize, Default, Clone)]
 pub struct ToolQuery {
     pub hours: Option<i64>,
     pub range: Option<String>,
@@ -1569,6 +2043,10 @@ pub async fn tools(State(_state): State<Arc<AppState>>, Query(q): Query<ToolQuer
         .map(|s| s.split(',').map(|x| x.trim().to_ascii_lowercase()).filter(|x| !x.is_empty()).collect())
         .unwrap_or_else(|| vec!["dsh".to_string(), "claude".to_string()]);
     let limit = q.limit.unwrap_or(50).clamp(5, 200);
+    let cache_key = super::collector::tools_key(&q);
+    if let Some(v) = super::collector::get(&cache_key, 15) {
+        return Json(v).into_response();
+    }
     let home = home();
     let mut aggs: HashMap<String, ToolAgg> = HashMap::new();
     let mut dsh_stat = (0u64, 0u64);
@@ -1619,7 +2097,7 @@ pub async fn tools(State(_state): State<Arc<AppState>>, Query(q): Query<ToolQuer
     let rows_total = rows.len();
     rows.truncate(limit);
 
-    ok(json!({
+    let value = json!({
         "ok": true,
         "range": window_label,
         "since_ms": since_ms,
@@ -1639,7 +2117,9 @@ pub async fn tools(State(_state): State<Arc<AppState>>, Query(q): Query<ToolQuer
         },
         "rows": rows,
         "rows_total": rows_total,
-    }))
+    });
+    super::collector::put(cache_key, value.clone());
+    Json(value).into_response()
 }
 
 /// provider → baseURL 的映射快照（调试 / 排查用）。

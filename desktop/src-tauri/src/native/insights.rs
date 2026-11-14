@@ -26,6 +26,12 @@ pub struct SeriesQuery {
     pub bucket: Option<i64>,
 }
 
+#[derive(Deserialize, Default)]
+pub struct LedgerQuery {
+    pub range: Option<String>,
+    pub hours: Option<f64>,
+}
+
 struct Bucket {
     start: f64,
     calls: u64,
@@ -162,6 +168,10 @@ pub async fn series(State(state): State<Arc<AppState>>, Query(q): Query<SeriesQu
 
     let span = (now_ts - since).max(60.0);
     let bucket_secs = q.bucket.unwrap_or_else(|| auto_bucket(span)).max(60);
+    let cache_key = format!("series|{}|{}|{}", range, q.hours.unwrap_or(0.0), bucket_secs);
+    if let Some(v) = super::collector::get(&cache_key, 8) {
+        return Json(v).into_response();
+    }
     // 对齐到桶边界，图表的 x 轴刻度更自然。
     let start = (since / bucket_secs as f64).floor() * bucket_secs as f64;
     let count = (((now_ts - start) / bucket_secs as f64).ceil() as usize + 1).clamp(1, 240);
@@ -175,7 +185,7 @@ pub async fn series(State(state): State<Arc<AppState>>, Query(q): Query<SeriesQu
     let mut models: HashMap<String, (u64, u64, u64, Vec<f64>)> = HashMap::new();
     let mut upstreams: HashMap<String, (u64, u64, u64, Vec<f64>, Vec<f64>)> = HashMap::new();
 
-    let entries = super::journal::recent(&state);
+    let entries = super::journal_index::entries(&state, since, None);
     let mut earliest = f64::MAX;
     let mut latest: f64 = 0.0;
 
@@ -339,7 +349,7 @@ pub async fn series(State(state): State<Arc<AppState>>, Query(q): Query<SeriesQu
         "first_p50_ms": percentile_ms(&total_first, 0.50),
     });
 
-    Json(json!({
+    let out = json!({
         "ok": true,
         "generated_at": now.format("%Y-%m-%d %H:%M:%S").to_string(),
         "range": range_label,
@@ -353,17 +363,122 @@ pub async fn series(State(state): State<Arc<AppState>>, Query(q): Query<SeriesQu
         "partial": earliest != f64::MAX && earliest > start + bucket_secs as f64,
         "earliest": if earliest == f64::MAX { 0.0 } else { earliest },
         "latest": latest,
-    }))
-    .into_response()
+    });
+    super::collector::put(cache_key, out.clone());
+    Json(out).into_response()
+}
+
+fn ledger_window(q: &LedgerQuery) -> (f64, String) {
+    let now = chrono::Local::now();
+    let now_ts = now.timestamp() as f64 + now.time().nanosecond() as f64 / 1_000_000_000.0;
+    let mut range = q
+        .range
+        .as_deref()
+        .map(|s| s.trim().to_ascii_lowercase())
+        .unwrap_or_default();
+    if range.is_empty() && q.hours.is_none() {
+        range = "today".to_string();
+    }
+    match range.as_str() {
+        "today" => {
+            let secs = now.time().num_seconds_from_midnight() as f64
+                + now.time().nanosecond() as f64 / 1_000_000_000.0;
+            (now_ts - secs, "today".to_string())
+        }
+        "all" => (0.0, "all".to_string()),
+        _ => {
+            let h = q.hours.unwrap_or(24.0).max(0.0);
+            if h <= 0.0 {
+                (0.0, "all".to_string())
+            } else {
+                (now_ts - h * 3600.0, format!("{}h", h))
+            }
+        }
+    }
+}
+
+/// Prompt Cache 账本：按模型 / 上游 / 会话统计缓存读写与命中率，
+/// 同时把粘性路由的会话数带出来，方便对照「固定上游后缓存是否更稳」。
+pub async fn cache_ledger(State(state): State<Arc<AppState>>, Query(q): Query<LedgerQuery>) -> Response {
+    let (since, range_label) = ledger_window(&q);
+    let cache_key = format!("ledger|{}|{}", range_label, q.hours.unwrap_or(0.0));
+    if let Some(v) = super::collector::get(&cache_key, 15) {
+        return Json(v).into_response();
+    }
+    let port = {
+        let p = state.port.load(std::sync::atomic::Ordering::Relaxed);
+        if p == 0 { 8010 } else { p }
+    };
+    // ledger_window() 返回的是秒；session_cache_ledger() 的 since_ms 需要毫秒，
+    // 否则「今天」会把全部历史会话都算进来（最近 100 条也会错）。
+    let since_ms = if since <= 0.0 { 0 } else { (since * 1000.0).round() as i64 };
+    let mut out = super::sessions::session_cache_ledger(port, since_ms);
+    out["ok"] = json!(true);
+    out["generated_at"] = json!(chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string());
+    out["range"] = json!(range_label);
+    out["since"] = json!(since);
+    out["affinity_sticks"] = json!(state.affinity.lock().map(|s| s.count()).unwrap_or(0));
+    super::collector::put(cache_key, out.clone());
+    Json(out).into_response()
 }
 
 /// 托盘迷你 HUD 用的今日摘要：只读流水尾部，字段足够画四格小面板。
+fn route_view(entry: &Value, bases: &HashMap<String, String>) -> Value {
+    let mut routes: Vec<Value> = Vec::new();
+    if let Some(trail) = entry.get("trail").and_then(Value::as_array) {
+        for t in trail {
+            let upstream = t.get("upstream").and_then(Value::as_str).unwrap_or("");
+            routes.push(json!({
+                "upstream": upstream,
+                "base_url": bases.get(upstream).cloned().unwrap_or_default(),
+                "model": t.get("model").cloned().unwrap_or(Value::Null),
+                "ok": t.get("ok").and_then(Value::as_bool).unwrap_or(false),
+                "status": t.get("status").cloned().unwrap_or(Value::Null),
+                "elapsed_seconds": t.get("elapsed_seconds").cloned().unwrap_or(Value::Null),
+                "error": t.get("error").cloned().unwrap_or(Value::Null),
+            }));
+        }
+    }
+    if routes.is_empty() {
+        let upstream = entry.get("upstream").and_then(Value::as_str).unwrap_or("");
+        routes.push(json!({
+            "upstream": upstream,
+            "base_url": bases.get(upstream).cloned().unwrap_or_default(),
+            "model": entry.get("effective_model").or_else(|| entry.get("model")).cloned().unwrap_or(Value::Null),
+            "ok": entry.get("ok").and_then(Value::as_bool).unwrap_or(false),
+            "status": entry.get("status").cloned().unwrap_or(Value::Null),
+            "elapsed_seconds": entry.get("elapsed_seconds").cloned().unwrap_or(Value::Null),
+            "error": entry.get("error").cloned().unwrap_or(Value::Null),
+        }));
+    }
+    json!({
+        "at": entry.get("at").cloned().unwrap_or(Value::Null),
+        "time": entry.get("time").cloned().unwrap_or(Value::Null),
+        "model": entry.get("model").cloned().unwrap_or(Value::Null),
+        "effective_model": entry.get("effective_model").cloned().unwrap_or(Value::Null),
+        "ok": entry.get("ok").and_then(Value::as_bool).unwrap_or(false),
+        "elapsed_seconds": entry.get("elapsed_seconds").cloned().unwrap_or(Value::Null),
+        "routes": routes,
+    })
+}
+
+pub async fn today(State(state): State<Arc<AppState>>) -> Response {
+    Json(today_summary(&state)).into_response()
+}
+
 pub fn today_summary(state: &AppState) -> Value {
     let now = chrono::Local::now();
     let now_ts = now.timestamp() as f64 + now.time().nanosecond() as f64 / 1_000_000_000.0;
     let secs = now.time().num_seconds_from_midnight() as f64
         + now.time().nanosecond() as f64 / 1_000_000_000.0;
     let since = now_ts - secs;
+    let port = {
+        let p = state.port.load(std::sync::atomic::Ordering::Relaxed);
+        if p == 0 { 8010 } else { p }
+    };
+    let totals = super::sessions::today_totals(port);
+    let session_total = totals.total;
+    let session_routed = totals.routed;
 
     let mut calls: u64 = 0;
     let mut ok: u64 = 0;
@@ -374,8 +489,34 @@ pub fn today_summary(state: &AppState) -> Value {
     let mut cache_write: u64 = 0;
     let mut elapsed: Vec<f64> = Vec::new();
     let mut first: Vec<f64> = Vec::new();
+    let bases: HashMap<String, String> = state
+        .file
+        .read()
+        .map(|f| {
+            f.upstreams
+                .iter()
+                .map(|u| (u.name.clone(), u.base_url.clone()))
+                .collect()
+        })
+        .unwrap_or_default();
+    let entries = super::journal_index::entries(state, 0.0, None);
+    let route_entries: Vec<&Value> = entries
+        .iter()
+        .filter(|e| e.get("at").and_then(Value::as_f64).unwrap_or(0.0) > 0.0)
+        .collect();
+    let last_route = route_entries
+        .last()
+        .map(|e| route_view(e, &bases))
+        .unwrap_or(Value::Null);
+    let prev_route = if route_entries.len() >= 2 {
+        route_view(route_entries[route_entries.len() - 2], &bases)
+    } else {
+        Value::Null
+    };
+    let latest = super::sessions::last_round(port);
+    let route = if latest.is_null() { last_route.clone() } else { latest };
 
-    for e in super::journal::recent(state).iter() {
+    for e in entries.iter() {
         let at = e.get("at").and_then(|v| v.as_f64()).unwrap_or(0.0);
         if at <= 0.0 || at < since {
             continue;
@@ -403,7 +544,28 @@ pub fn today_summary(state: &AppState) -> Value {
         }
     }
 
+    let session_extra = session_total.saturating_sub(session_routed);
+    let all_calls = calls + session_extra;
+    let all_input = input + totals.input.saturating_sub(totals.routed_input);
+    let all_output = output + totals.output.saturating_sub(totals.routed_output);
+    let all_cache_read = cache_read + totals.cache_read.saturating_sub(totals.routed_cache_read);
+    let all_cache_write = cache_write + totals.cache_write.saturating_sub(totals.routed_cache_write);
+    let all_ok = session_extra + ok;
+    let all_failed = failed;
+    let mut all_elapsed = elapsed.clone();
+    all_elapsed.extend(totals.durations.iter().copied());
     json!({
+        "all_calls": all_calls,
+        "all_ok": all_ok,
+        "all_failed": all_failed,
+        "all_success_rate": if all_calls > 0 { (all_ok as f64 / all_calls as f64 * 1000.0).round() / 10.0 } else { 0.0 },
+        "all_input": all_input,
+        "all_output": all_output,
+        "all_cache_read": all_cache_read,
+        "all_cache_write": all_cache_write,
+        "all_p50_ms": percentile_ms(&all_elapsed, 0.50),
+        "all_p95_ms": percentile_ms(&all_elapsed, 0.95),
+        "routed_calls": calls,
         "calls": calls,
         "ok": ok,
         "failed": failed,
@@ -415,6 +577,9 @@ pub fn today_summary(state: &AppState) -> Value {
         "p50_ms": percentile_ms(&elapsed, 0.50),
         "p95_ms": percentile_ms(&elapsed, 0.95),
         "first_p50_ms": percentile_ms(&first, 0.50),
+        "last": last_route,
+        "prev": prev_route,
+        "route": route,
         "updated": now.format("%H:%M:%S").to_string(),
     })
 }

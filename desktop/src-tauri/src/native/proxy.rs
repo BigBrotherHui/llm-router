@@ -100,6 +100,8 @@ fn journal_entry(
     elapsed: f64,
     first_chunk: Option<f64>,
     chunks: usize,
+    session_id: &str,
+    session_source: &str,
 ) -> Value {
     let mut e = json!({
         "at": chrono::Utc::now().timestamp() as f64,
@@ -115,6 +117,8 @@ fn journal_entry(
         "stream": stream,
         "attempts": attempts.len(),
         "route_source": "配置",
+        "session_id": session_id,
+        "session_source": session_source,
         "error": error,
         "usage": super::stats::with_normalized_usage(usage),
         "trail": attempts,
@@ -135,6 +139,8 @@ struct StreamJournalGuard {
     started_all: Instant,
     shared: Arc<Mutex<StreamUsage>>,
     written: bool,
+    session_id: String,
+    session_source: String,
 }
 
 impl Drop for StreamJournalGuard {
@@ -157,8 +163,13 @@ impl Drop for StreamJournalGuard {
             self.started_all.elapsed().as_secs_f64(),
             acc.first_chunk_seconds,
             acc.chunks,
+            &self.session_id,
+            &self.session_source,
         );
         super::state::append_journal(&self.state, e);
+        let usage = super::stats::normalize_usage(&acc.usage);
+        let cache_read = usage.get("cache_read").and_then(Value::as_u64).unwrap_or(0);
+        super::affinity::remember(&self.state, &self.requested, &self.session_id, &self.up.id, cache_read);
     }
 }
 
@@ -270,6 +281,11 @@ fn auth_headers(up: &Upstream) -> HeaderMap {
     headers
 }
 
+fn attach_headers(mut resp: Response, headers: &HeaderMap) -> Response {
+    resp.headers_mut().extend(headers.clone());
+    resp
+}
+
 fn error_response(status: StatusCode, message: &str, attempts: &[Value]) -> Response {
     (
         status,
@@ -286,7 +302,7 @@ fn error_response(status: StatusCode, message: &str, attempts: &[Value]) -> Resp
 
 pub async fn chat_completions(
     State(state): State<Arc<AppState>>,
-    _headers: HeaderMap,
+    headers: HeaderMap,
     body: Bytes,
 ) -> Response {
     let payload: Value = match serde_json::from_slice(&body) {
@@ -302,9 +318,25 @@ pub async fn chat_completions(
         return error_response(StatusCode::BAD_REQUEST, "请求里缺少 model", &[]);
     }
     let stream = payload.get("stream").and_then(|v| v.as_bool()).unwrap_or(false);
-    let candidates = resolve(&state, &requested);
+    let (session, session_source) = super::affinity::session_key(&headers, &payload);
+    let session_id = session.unwrap_or_default();
+    let affinity_mode = super::affinity::mode_for(&state, &requested);
+    let raw_candidates = resolve(&state, &requested);
+    let (candidates, sticky_upstream) =
+        super::affinity::apply(&state, &requested, &session_id, &affinity_mode, raw_candidates);
     if candidates.is_empty() {
         return error_response(StatusCode::SERVICE_UNAVAILABLE, "没有可用的上游", &[]);
+    }
+    let mut response_headers = HeaderMap::new();
+    if !session_id.is_empty() {
+        if let Ok(v) = session_id.parse() {
+            response_headers.insert("x-llm-router-session", v);
+        }
+    }
+    if let Some(id) = &sticky_upstream {
+        if let Ok(v) = id.parse() {
+            response_headers.insert("x-llm-router-affinity", v);
+        }
     }
 
     let mut attempts: Vec<Value> = Vec::new();
@@ -392,6 +424,8 @@ pub async fn chat_completions(
                             started_all,
                             shared,
                             written: false,
+                            session_id: session_id.clone(),
+                            session_source: session_source.clone(),
                         };
                         let body_stream = async_stream::stream! {
                             // guard 被 generator 持有，流结束/客户端断开时 Drop 里补写完整流水。
@@ -432,12 +466,13 @@ pub async fn chat_completions(
                                 yield Ok::<_, std::io::Error>(Bytes::from(rewrite_sse_line(&buffer, &requested_name)));
                             }
                         };
-                        return Response::builder()
+                        let resp = Response::builder()
                             .status(StatusCode::OK)
                             .header("content-type", content_type)
                             .header("cache-control", "no-cache")
                             .body(Body::from_stream(body_stream))
                             .unwrap();
+                        return attach_headers(resp, &response_headers);
                     }
                     let bytes = match resp.bytes().await {
                         Ok(b) => b,
@@ -456,16 +491,40 @@ pub async fn chat_completions(
                     super::state::record_upstream_result(&state, &up.id, true, "");
                     push_attempt!(up, real_model, true, status.as_u16(), started.elapsed().as_secs_f64(), "");
                     let elapsed = started_all.elapsed().as_secs_f64();
+                    let normalized = super::stats::normalize_usage(&usage);
                     super::state::append_journal(
                         &state,
-                        journal_entry(up, &requested, real_model, 200, true, false, &attempts, "", &usage, elapsed, Some(elapsed), 1),
+                        journal_entry(
+                            up,
+                            &requested,
+                            real_model,
+                            200,
+                            true,
+                            false,
+                            &attempts,
+                            "",
+                            &usage,
+                            elapsed,
+                            Some(elapsed),
+                            1,
+                            &session_id,
+                            &session_source,
+                        ),
+                    );
+                    super::affinity::remember(
+                        &state,
+                        &requested,
+                        &session_id,
+                        &up.id,
+                        normalized.get("cache_read").and_then(Value::as_u64).unwrap_or(0),
                     );
                     state.bump_total();
-                    return Response::builder()
+                    let resp = Response::builder()
                         .status(StatusCode::OK)
                         .header("content-type", content_type)
                         .body(Body::from(body))
                         .unwrap();
+                    return attach_headers(resp, &response_headers);
                 }
                 let text = resp.text().await.unwrap_or_default();
                 super::state::record_upstream_result(&state, &up.id, false, &truncate(&text, 200));
@@ -508,6 +567,8 @@ pub async fn chat_completions(
             elapsed,
             None,
             0,
+            &session_id,
+            &session_source,
         ),
     );
     error_response(last_status, &last_message, &attempts)

@@ -1,8 +1,11 @@
 param(
-  [string]$RepoRoot = "C:\Users\Administrator\.zcode\workspace\default\llm-router"
+  [string]$RepoRoot = ""
 )
 
 $ErrorActionPreference = "Stop"
+if (-not $RepoRoot) {
+  $RepoRoot = (Resolve-Path (Join-Path $PSScriptRoot "..")).Path
+}
 $Relay = Join-Path $RepoRoot "relay"
 
 # 1) 精简版 → public/m/
@@ -43,6 +46,17 @@ $wrapper = @'
 '@
 $src = Join-Path $RepoRoot "webui.html"
 $html = [System.IO.File]::ReadAllText($src)
+# 单文件发布：把拆分出来的 CSS / JS 内联回 HTML，relay 静态页不需要额外路由。
+$cssPath = Join-Path $RepoRoot "webui.css"
+$jsPath = Join-Path $RepoRoot "webui.js"
+if (Test-Path $cssPath) {
+  $css = [System.IO.File]::ReadAllText($cssPath)
+  $html = $html.Replace('<link rel="stylesheet" href="/assets/webui.css">', "<style>`n$css`n</style>")
+}
+if (Test-Path $jsPath) {
+  $js = [System.IO.File]::ReadAllText($jsPath)
+  $html = $html.Replace('<script src="/assets/webui.js"></script>', "<script>`n$js`n</script>")
+}
 if ($html -match "<head[^>]*>") {
   $html = [regex]::Replace($html, "<head[^>]*>", { param($m) $m.Value + $wrapper }, 1)
 } else {

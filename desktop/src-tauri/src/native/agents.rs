@@ -86,6 +86,13 @@ fn bad(msg: &str) -> Response {
     (StatusCode::BAD_REQUEST, Json(json!({"ok": false, "error": msg}))).into_response()
 }
 
+fn bad_with(mut v: Value) -> Response {
+    if let Some(o) = v.as_object_mut() {
+        o.insert("ok".into(), json!(false));
+    }
+    (StatusCode::BAD_REQUEST, Json(v)).into_response()
+}
+
 fn home() -> PathBuf {
     std::env::var_os("USERPROFILE")
         .or_else(|| std::env::var_os("HOME"))
@@ -2374,6 +2381,104 @@ fn write_plan(
     })
 }
 
+/// 简化行级 diff：只列出新增/删除的整行，足够给用户确认“会改什么”。
+fn diff_text(before: &str, after: &str) -> (usize, usize, String) {
+    let b: Vec<&str> = before.lines().collect();
+    let a: Vec<&str> = after.lines().collect();
+    let bset: HashSet<&str> = b.iter().copied().collect();
+    let aset: HashSet<&str> = a.iter().copied().collect();
+    let mut lines: Vec<String> = Vec::new();
+    let mut removed = 0usize;
+    let mut added = 0usize;
+    for line in &b {
+        if !aset.contains(line) {
+            removed += 1;
+            if lines.len() < 400 {
+                lines.push(format!("- {line}"));
+            }
+        }
+    }
+    for line in &a {
+        if !bset.contains(line) {
+            added += 1;
+            if lines.len() < 400 {
+                lines.push(format!("+ {line}"));
+            }
+        }
+    }
+    if lines.len() >= 400 {
+        lines.push("…（diff 过长，只显示前 400 行）".into());
+    }
+    (added, removed, lines.join("\n"))
+}
+
+fn plan_diff(plan: &WritePlan) -> Vec<Value> {
+    plan.files
+        .iter()
+        .map(|(path, after)| {
+            let before = std::fs::read_to_string(path).unwrap_or_default();
+            let existed = path.exists();
+            let (added, removed, text) = diff_text(&before, after);
+            json!({
+                "path": path.to_string_lossy(),
+                "existed": existed,
+                "before_bytes": before.len(),
+                "after_bytes": after.len(),
+                "added_lines": added,
+                "removed_lines": removed,
+                "changed": before != *after,
+                "text": text,
+            })
+        })
+        .collect()
+}
+
+/// 应用后逐个文件回读，确认磁盘内容与计划完全一致；这是事务的“校验”阶段。
+fn verify_plan(plan: &WritePlan) -> (bool, Vec<Value>) {
+    let mut all_ok = true;
+    let checks: Vec<Value> = plan
+        .files
+        .iter()
+        .map(|(path, expected)| {
+            let actual = std::fs::read_to_string(path).unwrap_or_default();
+            let ok = actual == *expected;
+            if !ok {
+                all_ok = false;
+            }
+            json!({
+                "path": path.to_string_lossy(),
+                "ok": ok,
+                "bytes": actual.len(),
+            })
+        })
+        .collect();
+    (all_ok, checks)
+}
+
+/// 失败时按写入顺序回滚已落盘的文件；备份是 persist 在写前建的。
+fn rollback_applied(applied: &[(PathBuf, PathBuf)]) -> usize {
+    let mut n = 0usize;
+    for (path, backup) in applied.iter().rev() {
+        let created = std::fs::read_to_string(backup)
+            .map(|s| s.trim() == NEW_FILE_MARKER)
+            .unwrap_or(false);
+        let res = if created {
+            if path.exists() {
+                std::fs::remove_file(path).map(|_| ())
+            } else {
+                Ok(())
+            }
+        } else {
+            std::fs::copy(backup, path).map(|_| ())
+        };
+        if res.is_ok() {
+            let _ = std::fs::remove_file(backup);
+            n += 1;
+        }
+    }
+    n
+}
+
 pub async fn list(State(state): State<Arc<AppState>>) -> Response {
     ok(json!({
         "ok": true,
@@ -2436,19 +2541,53 @@ pub async fn configure(State(state): State<Arc<AppState>>, Json(p): Json<Value>)
         Ok(v) => v,
         Err(e) => return bad(&e),
     };
+    let diffs = plan_diff(&plan);
     let mut backups: Vec<String> = Vec::new();
+    let mut applied: Vec<(PathBuf, PathBuf)> = Vec::new();
     let mut previews: Vec<String> = Vec::new();
     for (path, content) in &plan.files {
-        let (backup, preview_raw) = match persist(path, content, dry_run) {
-            Ok(v) => v,
-            Err(e) => return bad(&e),
-        };
-        if let Some(b) = backup {
-            backups.push(b);
+        match persist(path, content, dry_run) {
+            Ok((Some(b), _)) => {
+                backups.push(b.clone());
+                applied.push((path.clone(), PathBuf::from(b)));
+            }
+            Ok((None, Some(p))) => {
+                previews.push(format!("===== {} =====\n{}", path.display(), p));
+            }
+            Ok((None, None)) => {}
+            Err(e) => {
+                let rolled = rollback_applied(&applied);
+                return bad_with(json!({
+                    "error": e,
+                    "transaction": {
+                        "id": format!("txn-{}", chrono::Utc::now().timestamp_millis()),
+                        "steps": [
+                            {"name": "plan", "ok": true, "files": plan.files.len()},
+                            {"name": "diff", "ok": true, "files": diffs},
+                            {"name": "apply", "ok": false, "error": e},
+                            {"name": "rollback", "ok": true, "performed": true, "restored": rolled}
+                        ]
+                    }
+                }));
+            }
         }
-        if let Some(p) = preview_raw {
-            previews.push(format!("===== {} =====\n{}", path.display(), p));
-        }
+    }
+    let (verified, checks) = if dry_run { (true, Vec::new()) } else { verify_plan(&plan) };
+    if !dry_run && !verified {
+        let rolled = rollback_applied(&applied);
+        return bad_with(json!({
+            "error": "写入后校验失败，已自动回滚",
+            "transaction": {
+                "id": format!("txn-{}", chrono::Utc::now().timestamp_millis()),
+                "steps": [
+                    {"name": "plan", "ok": true, "files": plan.files.len()},
+                    {"name": "diff", "ok": true, "files": diffs},
+                    {"name": "apply", "ok": true, "files": applied.len()},
+                    {"name": "verify", "ok": false, "checks": checks},
+                    {"name": "rollback", "ok": true, "performed": true, "restored": rolled}
+                ]
+            }
+        }));
     }
     // 占位 Key 不是秘密，只有用户自己填了 Key 才做脱敏，避免把 provider 名也打码。
     let preview = if previews.is_empty() {
@@ -2484,9 +2623,30 @@ pub async fn configure(State(state): State<Arc<AppState>>, Json(p): Json<Value>)
             all = json!({ agent.id.clone(): rec });
         }
         if let Err(e) = save_applied(&state, &all) {
-            return bad(&e);
+            let rolled = rollback_applied(&applied);
+            return bad_with(json!({"error": e, "transaction": {"steps": [
+                {"name": "plan", "ok": true},
+                {"name": "diff", "ok": true, "files": diffs},
+                {"name": "apply", "ok": true, "files": applied.len()},
+                {"name": "verify", "ok": true, "checks": checks},
+                {"name": "record", "ok": false, "error": e},
+                {"name": "rollback", "ok": true, "performed": true, "restored": rolled}
+            ]}}));
         }
     }
+    let transaction = json!({
+        "id": format!("txn-{}", chrono::Utc::now().timestamp_millis()),
+        "mode": if dry_run { "plan" } else { "apply" },
+        "steps": [
+            {"name": "plan", "ok": true, "files": plan.files.len(), "keys": plan.changed_keys},
+            {"name": "diff", "ok": true, "files": diffs},
+            {"name": "apply", "ok": !dry_run, "skipped": dry_run, "files": applied.len()},
+            {"name": "verify", "ok": verified, "skipped": dry_run, "checks": checks},
+            {"name": "rollback", "ok": true, "performed": false}
+        ],
+        "diff": diffs,
+        "verified": verified
+    });
     ok(json!({
         "ok": true,
         "agent_id": agent.id,
@@ -2503,6 +2663,7 @@ pub async fn configure(State(state): State<Arc<AppState>>, Json(p): Json<Value>)
         "pin_default": pin_default,
         "pinned_default": pin_default && id == "dsh-tui" && !dsh_patch_paths().is_empty(),
         "preview": preview,
+        "transaction": transaction,
     }))
 }
 
