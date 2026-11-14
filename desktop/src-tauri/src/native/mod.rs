@@ -8,6 +8,7 @@ pub mod relay;
 pub mod scheduler;
 pub mod state;
 pub mod stats;
+pub mod transfer;
 
 use std::hash::{Hash, Hasher};
 use std::sync::{Arc, OnceLock};
@@ -159,6 +160,9 @@ pub async fn serve(state: Arc<AppState>, port: u16) -> Result<(), String> {
         .route("/agents/scan", get(agents::list))
         .route("/agents/configure", post(agents::configure))
         .route("/agents/restore", post(agents::restore))
+        .route("/data/summary", get(transfer::summary))
+        .route("/data/export", post(transfer::export_data))
+        .route("/data/import", post(transfer::import_data))
         .layer(DefaultBodyLimit::max(64 * 1024 * 1024))
         .layer(CompressionLayer::new().compress_when(
             DefaultPredicate::new().and(NotForContentType::new("text/event-stream")),

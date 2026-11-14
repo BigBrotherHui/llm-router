@@ -19,6 +19,8 @@
   默认参数、测速、请求流水查询
 - 本机 Agent 扫描与一键接入：`GET /agents`、`GET /agents/scan`、
   `POST /agents/configure`、`POST /agents/restore`（内置规则 + npm 全局包动态发现，Pi 双文件写入）
+- 勾选式导入 / 导出：`GET /data/summary`、`POST /data/export`、`POST /data/import`
+  （请求记录 / 上游来源 / 模型路由 / 签到，四类任选，支持 merge / replace、预览、脱敏、自动备份）
 - 启动页 / 移动端「服务地址」连接
 
 ## 目录
@@ -29,7 +31,7 @@ desktop/
 └─ src-tauri/
    ├─ src/main.rs                # 入口
    ├─ src/lib.rs                 # Tauri 生命周期 + 内嵌 HTTP 服务启动
-   ├─ src/native/                # Rust 原生后端（state / proxy / admin / agents / anthropic / stats / journal）
+   ├─ src/native/                # Rust 原生后端（state / proxy / admin / agents / anthropic / transfer / stats / journal）
    ├─ tauri.conf.json
    └─ capabilities/default.json
 ```
@@ -120,12 +122,44 @@ $env:LLM_ROUTER_PORT = "18010"       # 避开已经在跑的 8010
 npm run dev
 ```
 
+## 导入 / 导出（设置页最下方卡片）
+
+四个 checkbox 分别对应：
+
+| 类别 | 导出内容 | 落盘位置 |
+| --- | --- | --- |
+| 请求记录 | `config.history.jsonl` 全部流水 + `config.stats.json` 统计快照 | 同上 |
+| 上游来源 | `config.state.json` 的 `upstreams`（含 Key、分组、勾选模型） | 同上 |
+| 模型路由 | `models` 路由表 + `suppressed_models` | 同上 |
+| 签到 | `checkin_settings`、每个上游的 `checkin` / `checkin_state`、`config.checkin.json` 签到流水 | 同上 |
+
+- 导出成单个 `llm-router-backup-时间戳.json`，字段 `format: "llm-router-backup"` / `format_version: 1`。
+  「请求记录最近 N 条」填 0 即全量（本机流水约 10MB），只想留个底就填 2000。
+- **导出包含明文 API Key 与签到 token**，别传公共仓库；勾「Key 打码」会把 `api_keys` 和
+  `checkin.token` 换成掩码串（打码后的包再导回去，Key 也变成掩码，需要重新填）。
+- 导入支持「合并」（按上游 id / 路由名更新，流水追加、签到流水去重）和「覆盖」（用包里的替换）。
+  「预览变更」只回报会改多少条、不碰文件；正式导入前给每个要改的文件留
+  `<原名>.bak-import-时间戳` 备份，需要回滚直接把备份改名回去。
+- 旧版 `migrate.py export` 生成的 `bundle.json`（`schema: "llm-router-migrate/1"`）也能直接导，
+  会自动把 `state.upstreams` / `models` / `checkin_settings` + `checkin_log` 映射过来；
+  旧包没有请求流水，导入时即使勾了「请求记录」也不会清空现有流水。
+- 只在 `127.0.0.1` / `localhost` / 桌面壳 `?native=1` 显示；中继 Worker 不代理 `/data/*`。
+
+对应接口：
+
+```
+GET  /data/summary                      # 四类数据当前条数 + 文件路径
+POST /data/export  {parts, journal_limit, mask_secrets}
+POST /data/import  {payload, parts, mode: "merge"|"replace", dry_run}
+```
+
 ## 原生迁移进度
 
 已实现：上游增删改 / 拉取模型 / 勾选与分组 / 模型路由保存、排序、额度 / 默认参数 /
 测速（短请求）/ `/stats` 统计读取 / 请求流水查询 / `/v1/models` /
 `/v1/chat/completions`（priority、round_robin、random，流式 + 失败切换 + 模型名回写）/
 `/v1/messages`（Anthropic 适配 + SSE）/ 本机 Agent 扫描、一键导入、备份恢复 /
+请求记录 / 上游 / 模型路由 / 签到 四类数据的勾选式导入导出（预览、合并/覆盖、脱敏、自动备份）/
 签到页配置读取与保存 + New API / One API 常见签到路径 + 每日自动签到调度
 （基准时刻 + 随机窗口，服务重启后当天未签会补签）。
 

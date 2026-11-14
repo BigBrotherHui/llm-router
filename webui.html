@@ -876,6 +876,43 @@
           margin-top:6px;max-height:280px;overflow:auto"></pre>
         <div id="pxNotes" class="hint" style="margin-top:8px"></div>
       </div>
+
+      <div class="card" style="margin-top:14px" id="transferCard">
+        <h2>导入 / 导出</h2>
+        <div class="hint" style="margin:-6px 0 12px">
+          按类别打包成一个 JSON 文件，换机器、备份、回滚都用它。
+          <b>导出文件含明文 API Key 和签到 token，别传公共仓库</b>；只想存档核对就勾「Key 打码」
+          （打码后的包再导回去，Key 就变成打码串了）。
+          导入前会给每个要改的文件留一份 <code>*.bak-import-时间戳</code> 备份。
+        </div>
+        <div class="row" style="gap:14px;flex-wrap:wrap;margin-bottom:10px" id="transferParts">
+          <label class="row" style="gap:6px;cursor:pointer"><input type="checkbox" data-part="journal" checked> 请求记录</label>
+          <label class="row" style="gap:6px;cursor:pointer"><input type="checkbox" data-part="upstreams" checked> 上游来源</label>
+          <label class="row" style="gap:6px;cursor:pointer"><input type="checkbox" data-part="models" checked> 模型路由</label>
+          <label class="row" style="gap:6px;cursor:pointer"><input type="checkbox" data-part="checkin" checked> 签到</label>
+        </div>
+        <div class="row" style="gap:10px;align-items:flex-end;flex-wrap:wrap">
+          <label class="cap-cell" style="max-width:190px">
+            <span class="cap-k">请求记录最近 N 条（0=全部）</span>
+            <input type="number" min="0" step="100" id="transferJournalLimit" value="0">
+          </label>
+          <label class="row" style="gap:6px;cursor:pointer"><input type="checkbox" id="transferMask"> Key 打码</label>
+          <button class="primary" id="transferExport">导出 JSON</button>
+          <button class="mini" id="transferCopy">复制到剪贴板</button>
+          <span class="hint" id="transferSummary"></span>
+        </div>
+        <div style="border-top:1px solid var(--line);margin:14px 0"></div>
+        <div class="row" style="gap:10px;align-items:center;flex-wrap:wrap">
+          <select id="transferMode" style="font-size:13px;max-width:220px">
+            <option value="merge">合并（保留现有，按 id 更新）</option>
+            <option value="replace">覆盖（用文件里的替换）</option>
+          </select>
+          <input type="file" id="transferFile" accept=".json,application/json" style="font-size:12px;max-width:260px">
+          <button class="mini" id="transferPreview">预览变更</button>
+          <button class="primary" id="transferImport">导入</button>
+        </div>
+        <div id="transferResult" style="margin-top:10px"></div>
+      </div>
     </section>
 
     <!-- ============ 日志 ============ -->
@@ -3877,6 +3914,7 @@ function renderSettings() {
   loadWindowBehavior();
   loadRemoteAccess();
   loadRelay();
+  loadTransferSummary();
 }
 
 let winBehaviorLoaded = false;
@@ -5311,6 +5349,158 @@ $("#agentRestore").onclick = async () => {
 if (!AGENT_LOCAL) {
   const b = document.querySelector('#tabs .tab[data-tab="agent"]');
   if (b) b.style.display = "none";
+}
+
+/* ================= 设置页：勾选式导入 / 导出 ================= */
+let transferLoaded = false;
+let transferPayload = null;
+
+function transferParts() {
+  return Array.from(document.querySelectorAll("#transferParts input[type=checkbox]"))
+    .filter(x => x.checked).map(x => x.dataset.part);
+}
+function transferResultHtml(inner) { $("#transferResult").innerHTML = inner; }
+
+async function loadTransferSummary(force) {
+  if (!AGENT_LOCAL || (transferLoaded && !force)) return;
+  try {
+    const r = await api("/data/summary", undefined, "GET");
+    const c = r.counts || {};
+    $("#transferSummary").textContent =
+      `当前：请求 ${c.journal ?? 0} 条 / 上游 ${c.upstreams ?? 0} 个 / ` +
+      `路由 ${c.models ?? 0} 条 / 签到 ${c.checkin_entries ?? 0} 条`;
+    transferLoaded = true;
+  } catch (e) {
+    const card = $("#transferCard");
+    if (card) card.style.display = "none";   // 中继页 / 后端不支持时静默隐藏
+    transferLoaded = true;
+  }
+}
+
+function transferFilename() {
+  const d = new Date(), p = n => String(n).padStart(2, "0");
+  return `llm-router-backup-${d.getFullYear()}${p(d.getMonth() + 1)}${p(d.getDate())}` +
+    `-${p(d.getHours())}${p(d.getMinutes())}${p(d.getSeconds())}.json`;
+}
+function downloadJson(obj, name) {
+  const blob = new Blob([JSON.stringify(obj, null, 2)], { type: "application/json" });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url; a.download = name;
+  document.body.appendChild(a); a.click(); a.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 30000);
+}
+async function buildTransferBundle() {
+  const parts = transferParts();
+  if (!parts.length) throw new Error("至少勾选一项");
+  return await api("/data/export", {
+    parts,
+    journal_limit: Math.max(0, Number($("#transferJournalLimit").value) || 0),
+    mask_secrets: $("#transferMask").checked
+  }, "POST");
+}
+function transferCountsHtml(bundle) {
+  const c = bundle.counts || {};
+  return `请求 ${c.journal ?? 0} 条 / 上游 ${c.upstreams ?? 0} 个 / ` +
+    `路由 ${c.models ?? 0} 条 / 签到 ${c.checkin_entries ?? 0} 条` +
+    (bundle.mask_secrets ? "（Key 已打码）" : "");
+}
+
+$("#transferExport").onclick = async () => {
+  const btn = $("#transferExport");
+  btn.disabled = true; btn.textContent = "导出中…";
+  try {
+    const bundle = await buildTransferBundle();
+    downloadJson(bundle, transferFilename());
+    transferResultHtml(`<div class="hint">已导出 <b>${esc((bundle.parts || []).join("、"))}</b>：` +
+      `${transferCountsHtml(bundle)}</div>`);
+    toast("备份已导出", "ok");
+  } catch (e) {
+    transferResultHtml(`<div class="hint" style="color:var(--bad)">导出失败：${esc(e.message || e)}</div>`);
+    toast("导出失败：" + (e.message || e), "bad");
+  } finally {
+    btn.disabled = false; btn.textContent = "导出 JSON";
+  }
+};
+
+$("#transferCopy").onclick = async () => {
+  try {
+    const bundle = await buildTransferBundle();
+    const text = JSON.stringify(bundle, null, 2);
+    if (navigator.clipboard && navigator.clipboard.writeText) {
+      await navigator.clipboard.writeText(text);
+      toast("备份 JSON 已复制到剪贴板", "ok");
+    } else {
+      transferResultHtml(`<pre class="mono" style="background:var(--bg);padding:8px;border:1px solid var(--line);border-radius:6px;white-space:pre-wrap;max-height:320px;overflow:auto">${esc(text)}</pre>`);
+      toast("剪贴板不可用，已显示在结果区", "bad");
+    }
+  } catch (e) {
+    toast("复制失败：" + (e.message || e), "bad");
+  }
+};
+
+$("#transferFile").onchange = async () => {
+  const f = $("#transferFile").files[0];
+  transferPayload = null;
+  if (!f) { transferResultHtml(""); return; }
+  try {
+    transferPayload = JSON.parse(await f.text());
+    const parts = Array.isArray(transferPayload.parts)
+      ? transferPayload.parts
+      : Object.keys(transferPayload.data || {});
+    transferResultHtml(`<div class="hint">已读取 <code>${esc(f.name)}</code>` +
+      `（${(f.size / 1024).toFixed(1)} KiB），含：${esc(parts.join("、"))}。` +
+      `点「预览变更」先看会改什么，再点「导入」。</div>`);
+  } catch (e) {
+    transferResultHtml(`<div class="hint" style="color:var(--bad)">文件解析失败：${esc(e.message || e)}</div>`);
+  }
+};
+
+function transferAppliedHtml(r) {
+  const a = r.applied || {};
+  const rows = Object.keys(a).map(k =>
+    `<div class="row" style="gap:8px"><code style="min-width:150px">${esc(k)}</code>` +
+    `<span>${esc(typeof a[k] === "boolean" ? (a[k] ? "是" : "否") : String(a[k]))}</span></div>`
+  ).join("");
+  const backups = (r.backups || []).map(b => `<code>${esc(b)}</code>`).join("<br>");
+  return `<div class="card" style="margin:0">
+    <div class="row" style="gap:8px"><strong>${r.dry_run ? "预览（未写入）" : "导入完成"}</strong>
+      <span class="badge" style="color:${r.dry_run ? "var(--warn)" : "var(--ok)"}">${esc(r.mode || "")}</span>
+      ${r.legacy ? '<span class="badge">旧版 migrate.py 包</span>' : ""}</div>
+    <div class="hint" style="margin:6px 0">类别：${esc((r.parts || []).join("、"))}</div>
+    ${rows}
+    ${backups ? `<div class="hint" style="margin-top:8px">写入前已备份：<br>${backups}</div>` : ""}
+  </div>`;
+}
+
+async function doTransferImport(dryRun) {
+  if (!transferPayload) { toast("请先选择备份 JSON 文件", "bad"); return; }
+  const parts = transferParts();
+  if (!parts.length) { toast("至少勾选一项", "bad"); return; }
+  if (!dryRun && !confirm(`确认${$("#transferMode").value === "replace" ? "覆盖" : "合并"}导入：${parts.join("、")}？\n写入前会自动备份原文件。`)) return;
+  try {
+    const r = await api("/data/import", {
+      payload: transferPayload,
+      parts,
+      mode: $("#transferMode").value,
+      dry_run: dryRun
+    }, "POST");
+    transferResultHtml(transferAppliedHtml(r));
+    toast(dryRun ? "预览完成，未写入" : "导入完成", "ok");
+    if (!dryRun) {
+      await loadTransferSummary(true);
+      try { await refresh(); } catch (e) {}
+    }
+  } catch (e) {
+    transferResultHtml(`<div class="hint" style="color:var(--bad)">导入失败：${esc(e.message || e)}</div>`);
+    toast("导入失败：" + (e.message || e), "bad");
+  }
+}
+$("#transferPreview").onclick = () => doTransferImport(true);
+$("#transferImport").onclick = () => doTransferImport(false);
+if (!AGENT_LOCAL) {
+  const card = $("#transferCard");
+  if (card) card.style.display = "none";
 }
 
 (async function boot() {
