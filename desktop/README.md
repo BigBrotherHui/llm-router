@@ -273,9 +273,13 @@ GET /sessions/bases
 | 指标 | 绿 | 黄 | 红 |
 | --- | --- | --- | --- |
 | 首字（`getFirstResponseTimeColor`） | < 5 s | 5–10 s | ≥ 10 s |
-| 总耗时（输出 ≥ 100 tok，`getThroughputColor`） | ≥ 30 tok/s | 15–30 tok/s | < 15 tok/s |
-| 总耗时（输出 < 100 tok，`getTimeColor`） | < 10 s | 10–30 s | ≥ 30 s |
+| 总耗时·绝对耗时（`getTimeColor`） | < 10 s | 10–30 s | ≥ 30 s |
+| 总耗时·吞吐（`getThroughputColor`） | ≥ 30 tok/s | 15–30 tok/s | < 15 tok/s |
 | TPS 徽标（`getThroughputColor`） | ≥ 30 tok/s | 15–30 tok/s | < 15 tok/s |
+
+总耗时取上面两档里**更差**的那一个（New API 只按吞吐判，会让「跑了 29 秒但吐了很多字」的请求显示成绿色，
+也会出现同一行里 TPS 徽标是红的、总耗时却是绿的自相矛盾）。输出 < 100 tok 时只看绝对耗时。
+吞吐优先用生成窗口 `输出 ÷ (总耗时 − 首字)`（和 TPS 徽标同一个分母），窗口不可用才退回全链路 `输出 ÷ 总耗时`。
 
 列表每行左侧还有一根 3px 双色竖条（New API 那个指标条的同款思路）：上段=首字、下段=总耗时，
 不用读数字也能一眼看出这行快不快。鼠标悬浮指标条/数字会显示当前档位和对应阈值。

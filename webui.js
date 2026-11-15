@@ -2496,18 +2496,36 @@ function latToneByAsc(value, steps) {
   return "lat-bad";
 }
 
-function latTone(kind, seconds, outTokens) {
+const LAT_RANK = { "lat-ok": 0, "lat-warn": 1, "lat-bad": 2 };
+
+/// 取两档里更差的那个：光看吞吐会让「跑了 29 秒但吐了很多字」的请求显示成绿色，
+/// 光看绝对耗时又会把「等了很久但一次性吐完」的慢解析藏起来，两个都算才不误导。
+function worseTone(a, b) {
+  const ra = LAT_RANK[a];
+  const rb = LAT_RANK[b];
+  if (ra == null) return b;
+  if (rb == null) return a;
+  return ra >= rb ? a : b;
+}
+
+function tpsTone(tps) {
+  if (!Number.isFinite(tps)) return "lat-unknown";
+  if (tps >= LAT_TPS_STEPS[0]) return "lat-ok";
+  if (tps >= LAT_TPS_STEPS[1]) return "lat-warn";
+  return "lat-bad";
+}
+
+function latTone(kind, seconds, outTokens, genSeconds) {
   const secs = seconds == null ? null : Number(seconds);
   if (secs == null || !Number.isFinite(secs)) return "lat-unknown";
   if (kind === "first") return latToneByAsc(secs, LAT_FIRST_STEPS);
+  const timeTone = latToneByAsc(secs, LAT_TOTAL_STEPS);
   const out = Number(outTokens) || 0;
-  if (out >= 100 && secs > 0) {
-    const tps = out / secs;
-    if (tps >= LAT_TPS_STEPS[0]) return "lat-ok";
-    if (tps >= LAT_TPS_STEPS[1]) return "lat-warn";
-    return "lat-bad";
-  }
-  return latToneByAsc(secs, LAT_TOTAL_STEPS);
+  if (out < 100 || secs <= 0) return timeTone;
+  // 生成窗口可用时用它算吞吐（和列表里那枚 TPS 徽标同一个分母），否则退回全链路。
+  const gen = genSeconds == null ? null : Number(genSeconds);
+  const tps = gen != null && Number.isFinite(gen) && gen >= 0.05 && out / gen <= 1000 ? out / gen : out / secs;
+  return worseTone(timeTone, tpsTone(tps));
 }
 
 function latToneLabel(kind, seconds, outTokens) {
@@ -2518,9 +2536,10 @@ function latToneLabel(kind, seconds, outTokens) {
   }
   const out = Number(outTokens) || 0;
   if (out >= 100 && secs > 0) {
-    return `总耗时 ${fmtLat(secs)}，输出 ${fmtNum(out)} tok → ${fmtTps(out / secs)} tok/s：≥30 绿 / ≥15 黄 / <15 红`;
+    return `总耗时 ${fmtLat(secs)}，输出 ${fmtNum(out)} tok → 全链路 ${fmtTps(out / secs)} tok/s；` +
+      `绝对耗时 <10s 绿 / <30s 黄 / ≥30s 红，吞吐 ≥30 绿 / ≥15 黄 / <15 红，取更差的一档`;
   }
-  return `总耗时 ${fmtLat(secs)}（输出不足 100 tok，按绝对耗时）：<10s 绿 / <30s 黄 / ≥30s 红`;
+  return `总耗时 ${fmtLat(secs)}（输出不足 100 tok，只看绝对耗时）：<10s 绿 / <30s 黄 / ≥30s 红`;
 }
 
 function tpsBadge(h) {
@@ -2551,10 +2570,11 @@ function elapsedHint(h) {
   const warn = over
     ? ` <span class="badge warn" title="首字是毫秒精度，总耗时按 New API 面板口径取整到整秒，二者量纲不同：实测总耗时 ${raw != null ? fmtLat(raw) : "—"}">首字 > 总耗时</span>`
     : "";
-  const totalTone = latTone("total", h.elapsed_seconds, out);
+  const genSecs = h.first_chunk_seconds != null && h.elapsed_seconds != null ? h.elapsed_seconds - h.first_chunk_seconds : null;
+  const totalTone = latTone("total", h.elapsed_seconds, out, genSecs);
   const firstTone = latTone("first", h.first_chunk_seconds, out);
   const bar = `<span class="lat-bar" title="上段：首字 ${h.first_chunk_seconds != null ? fmtLat(h.first_chunk_seconds) : "—"}；下段：总耗时 ${fmtLat(h.elapsed_seconds)}"><i class="${firstTone}"></i><i class="${totalTone}"></i></span>`;
-  return `<span class="lat-group">${bar}<span class="hint ${totalTone}" title="${esc(title)}　·　${esc(latToneLabel("total", h.elapsed_seconds, out))}">总耗时 ${fmtLat(h.elapsed_seconds)}</span>${extra}${warn}</span>`;
+  return `<span class="lat-group">${bar}<span class="hint ${totalTone}" title="${esc(title)}　·　${esc(latToneLabel("total", h.elapsed_seconds, out, genSecs))}">总耗时 ${fmtLat(h.elapsed_seconds)}</span>${extra}${warn}</span>`;
 }
 function tpsDetail(h) {
   const t = tpsOf(h);
@@ -2814,7 +2834,7 @@ function renderSide() {
         <div class="req-sec">
           <h5>耗时</h5>
           <div class="hint" style="line-height:1.8">
-            总耗时：<code class="${latTone("total", h.elapsed_seconds, (h.usage || {}).output)}">${fmtLat(h.elapsed_seconds)}</code>（从收到请求到响应结束，含上游重试与流式输出全过程）${h.elapsed_raw_seconds != null && h.elapsed_seconds != null && Math.abs(h.elapsed_raw_seconds - h.elapsed_seconds) >= 0.45 ? `　实测：<code>${fmtLat(h.elapsed_raw_seconds)}</code>（未取整；New API 面板的 use_time 是整秒差，所以列表里显示整数秒）` : ""}<br>
+            总耗时：<code class="${latTone("total", h.elapsed_seconds, (h.usage || {}).output, h.first_chunk_seconds != null && h.elapsed_seconds != null ? h.elapsed_seconds - h.first_chunk_seconds : null)}">${fmtLat(h.elapsed_seconds)}</code>（从收到请求到响应结束，含上游重试与流式输出全过程）${h.elapsed_raw_seconds != null && h.elapsed_seconds != null && Math.abs(h.elapsed_raw_seconds - h.elapsed_seconds) >= 0.45 ? `　实测：<code>${fmtLat(h.elapsed_raw_seconds)}</code>（未取整；New API 面板的 use_time 是整秒差，所以列表里显示整数秒）` : ""}<br>
             首字延迟：<code class="${latTone("first", h.first_chunk_seconds, (h.usage || {}).output)}">${h.first_chunk_seconds != null ? fmtLat(h.first_chunk_seconds) : "—"}</code>（首个内容块到达，只有新版本流式流水才有）<br>
             ${h.metric_source ? `计时来源：<code>${{ magpie: "Magpie 网关用量日志", header: "DSH request/header 时刻", step: "DSH step/start", "newapi-gw": "New API：请求头 + 网关上传/自身开销", "newapi-header": "New API：仅按 request/header 推算" }[h.metric_source] || esc(h.metric_source)}</code><br>` : ""}
             request/header：<code>${h.request_header_seconds != null ? fmtLat(h.request_header_seconds) : "—"}</code>（DSH 写请求头的时刻，相对 step/start；DSH 只在配置变更时才写这条事件，所以大多数轮没有）<br>
