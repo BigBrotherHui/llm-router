@@ -4,13 +4,16 @@ pub mod agents;
 pub mod anthropic;
 pub mod checkin;
 pub mod collector;
+pub mod files;
 pub mod health;
 pub mod insights;
 pub mod journal;
 pub mod journal_index;
+pub mod pdf;
 pub mod proxy;
 pub mod relay;
 pub mod scheduler;
+pub mod search;
 pub mod sessions;
 pub mod state;
 pub mod stats;
@@ -29,6 +32,7 @@ use axum::routing::{get, post};
 use axum::Router;
 use tower_http::compression::predicate::{DefaultPredicate, NotForContentType, Predicate};
 use tower_http::compression::CompressionLayer;
+use tower_http::cors::{Any, CorsLayer};
 
 use state::AppState;
 
@@ -208,6 +212,12 @@ pub async fn serve(state: Arc<AppState>, port: u16) -> Result<(), String> {
         .route("/v1/models", get(proxy::list_models))
         .route("/v1/chat/completions", post(proxy::chat_completions))
         .route("/v1/messages", post(anthropic::messages))
+        // Files API（DeepSeek 官方前端方言）：上传/查询/删除附件。
+        .route("/v1/files", post(files::upload))
+        .route(
+            "/v1/files/{id}",
+            get(files::retrieve).delete(files::delete),
+        )
         .route("/agents", get(agents::list))
         .route("/agents/scan", get(agents::list))
         .route("/agents/configure", post(agents::configure))
@@ -231,6 +241,19 @@ pub async fn serve(state: Arc<AppState>, port: u16) -> Result<(), String> {
         .layer(CompressionLayer::new().compress_when(
             DefaultPredicate::new().and(NotForContentType::new("text/event-stream")),
         ))
+        // 最后挂 = 最外层：浏览器直连（chat-demo 这类纯静态前端）能拿到 CORS 头，
+        // 预检 OPTIONS 也在这里被消化。鉴权仍在上游 API Key，不依赖 Cookie，
+        // 所以允许任意来源、不开 allow_credentials（两者不能同时生效）。
+        .layer(
+            CorsLayer::new()
+                .allow_origin(Any)
+                .allow_methods(Any)
+                .allow_headers(Any)
+                .expose_headers([
+                    axum::http::HeaderName::from_static("x-llm-router-session"),
+                    axum::http::HeaderName::from_static("x-llm-router-affinity"),
+                ]),
+        )
         .with_state(state.clone());
 
     // 请求的端口被占（比如别的程序或旧实例）时，从 +1 开始往后找空闲端口，

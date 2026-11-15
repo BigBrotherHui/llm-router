@@ -1985,6 +1985,7 @@ dependencies = [
  "base64 0.22.1",
  "bytes",
  "chrono",
+ "flate2",
  "futures-util",
  "rand 0.8.8",
  "reqwest 0.12.28",

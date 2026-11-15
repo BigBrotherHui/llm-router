@@ -27,7 +27,9 @@ rand = "0.8"
 chrono = "0.4"
 async-stream = "0.3"
 base64 = "0.22"
-tower-http = { version = "0.6", features = ["compression-gzip"] }
+# 附件支撑：PDF 文本抽取需要解压 FlateDecode 内容流（已在依赖树里，显式声明即可）。
+flate2 = "1"
+tower-http = { version = "0.6", features = ["compression-gzip", "cors"] }
 tokio-tungstenite = { version = "0.24", default-features = false, features = ["connect", "rustls-tls-webpki-roots"] }
 rusqlite = { version = "0.32", features = ["bundled"] }
 
