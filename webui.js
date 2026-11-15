@@ -2270,6 +2270,7 @@ let lastSideHash = "";          // 内容没变就不重建，省得把展开状
 const REQ_PAGE = 100;
 let reqPage = 1;
 // 当前这一页流水数据（含 total），以及各维度的筛选项
+let journalSeq = 0;
 let journalPage = null;
 let journalIndex = null;
 // 展开详情时按需取回的完整记录（列表本身不带正文，省流量）
@@ -2336,15 +2337,21 @@ async function loadJournal() {
   if (f.group) qs.set("group", f.group);
   if (f.upstream) qs.set("upstream", f.upstream);
   if (f.model) qs.set("model", f.model);
+  // 口径/筛选切得快时会有多个请求在途，先到的旧响应不能覆盖后发的新结果。
+  const seq = ++journalSeq;
   try {
+    let got;
     if (source === "router") {
-      journalPage = await api("/admin/journal?" + qs.toString(), undefined, "GET");
+      got = await api("/admin/journal?" + qs.toString(), undefined, "GET");
     } else {
       if (!f.day && !f.month) qs.set("range", "all");
       qs.set("metric", timingMode());
-      journalPage = await api("/sessions/records?" + qs.toString(), undefined, "GET");
+      got = await api("/sessions/records?" + qs.toString(), undefined, "GET");
     }
+    if (seq !== journalSeq) return journalPage;
+    journalPage = got;
   } catch (e) {
+    if (seq !== journalSeq) return journalPage;
     journalPage = { entries: [], total: 0, error: e.message, scope: source === "router" ? "router" : "all" };
   }
   // 上游下拉跟着当前分组走：只有选过分组才列上游，避免全量时列一长串。
@@ -4331,8 +4338,26 @@ function dayKeyOfTs(at) {
   return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())}`;
 }
 
+// 实时增量插入后要重取一次列表：见 applyJournalDelta 里的说明。
+let liveReloadTimer = null;
+function scheduleLiveReload() {
+  if (liveReloadTimer) return;
+  liveReloadTimer = setTimeout(async () => {
+    liveReloadTimer = null;
+    if (curTab !== "req" || document.hidden) return;
+    try { await loadJournal(); } catch (e) { return; }
+    lastSideHash = "";
+    renderSide();
+    renderTabNums();
+  }, 1000);
+}
+
 function applyJournalDelta(entry) {
   if (!journalPage || curTab !== "req") return;
+  // 「全部 Agent 会话」的第一行是服务端按当前口径换算过的（首字/耗时会被换成
+  // New API / Magpie 的算法）；这条增量是原始流水，直接插进去会和其余行不是一个口径，
+  // 所以这里不插，改为稍后整页重取。
+  if (journalPage.scope === "all") { scheduleLiveReload(); return; }
   const f = curJournalFilter();
   const day = dayKeyOfTs(entry.at);
   if (f.day && day && day !== f.day) return;

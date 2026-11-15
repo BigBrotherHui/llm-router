@@ -357,7 +357,14 @@ pub async fn report(
         }
         let port = state.port.load(std::sync::atomic::Ordering::Relaxed);
         let since_ms = if cutoff > 0.0 { (cutoff * 1000.0).round() as i64 } else { 0 };
-        let ext = super::sessions::session_cache_ledger(port, since_ms, 2, metric);
+        // 「全部请求」时把本机流水的延迟样本一起并进外部分位数里，
+        // 否则只有少数本机样本时总览 P50 会与缓存账本对不上。
+        let (extra_dur, extra_fc): (&[f64], &[f64]) = if route_filter == 0 {
+            (&total_agg.latencies, &total_agg.first_chunks)
+        } else {
+            (&[], &[])
+        };
+        let ext = super::sessions::session_cache_ledger(port, since_ms, 2, metric, extra_dur, extra_fc);
         external_totals = ext.get("totals").cloned().unwrap_or(Value::Null);
         if let Some(list) = ext.get("upstreams").and_then(|v| v.as_array()) {
             for u in list {
@@ -427,13 +434,15 @@ pub async fn report(
                 let ok = old_ok + ext_calls;
                 let att = old_attempts + ext_calls;
                 obj.insert("success_rate".into(), json!(if att > 0 { (ok as f64 / att as f64 * 1000.0).round() / 10.0 } else { 0.0 }));
-                if obj.get("p50_seconds").map(|v| v.is_null()).unwrap_or(true) && !ext_p50.is_null() {
+                // ext 已经把本机流水的延迟样本并进去了（见上面的 extra_dur/extra_fc），
+                // 所以「全部请求」的分位数直接用它，避免只剩 3 个本机样本时的 1.02 s。
+                if !ext_p50.is_null() {
                     obj.insert("p50_seconds".into(), ext_p50.clone());
                 }
-                if obj.get("p95_seconds").map(|v| v.is_null()).unwrap_or(true) && !ext_p95.is_null() {
+                if !ext_p95.is_null() {
                     obj.insert("p95_seconds".into(), ext_p95.clone());
                 }
-                if obj.get("first_chunk_p50_seconds").map(|v| v.is_null()).unwrap_or(true) && !ext_fc.is_null() {
+                if !ext_fc.is_null() {
                     obj.insert("first_chunk_p50_seconds".into(), ext_fc.clone());
                 }
             }

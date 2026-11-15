@@ -40,7 +40,17 @@ static LAST_ROUND_CACHE: OnceLock<Mutex<Option<(Instant, Value)>>> = OnceLock::n
 /// 我们的会话记录里没有「网关收包」时刻，只能靠它把 magpie 口径对齐到面板上的数。
 struct MagpieSnap {
     at: Instant,
-    map: HashMap<String, MagpieHit>,
+    view: MagpieView,
+}
+
+/// Magpie 快照的两个索引：
+/// - `by_fp`  按「输入|输出|缓存读」token 指纹 —— 网关没记 session 时的兜底；
+/// - `by_sess` 按会话 id 聚成一串，配合「网关收包时刻落在这一轮的时间窗内」定位，
+///   两道一起用才不会把两轮指纹相同的请求串到一起。
+#[derive(Default, Clone)]
+pub struct MagpieView {
+    pub by_fp: HashMap<String, MagpieHit>,
+    pub by_sess: HashMap<String, Vec<MagpieHit>>,
 }
 
 /// 一轮请求在 Magpie 网关侧的实测值（全部毫秒）。
@@ -52,6 +62,9 @@ pub struct MagpieHit {
     ms: f64,
     sent: f64,
     own: f64,
+    in_tok: u64,
+    out_tok: u64,
+    cache_read: u64,
     /// 网关收到请求的绝对时刻（epoch ms）。有了它就不必依赖 DSH 的 request/header 事件
     /// （那条事件只在配置变更时才写，绝大多数轮次没有），New API 口径直接用网关收包时刻当锚点。
     at_ms: i64,
@@ -121,7 +134,7 @@ fn refresh_magpie() {
     if all.is_empty() {
         return;
     }
-    let mut map: HashMap<String, MagpieHit> = HashMap::new();
+    let mut view = MagpieView::default();
     for r in all.iter() {
         let input = r.get("in").and_then(|x| x.as_u64());
         let output = r.get("out").and_then(|x| x.as_u64());
@@ -135,6 +148,9 @@ fn refresh_magpie() {
                     ms: m,
                     sent: r.get("sent_ms").and_then(|x| x.as_f64()).unwrap_or(0.0),
                     own: r.get("own_ms").and_then(|x| x.as_f64()).unwrap_or(0.0),
+                    in_tok: i,
+                    out_tok: o,
+                    cache_read,
                     at_ms: r
                         .get("t")
                         .and_then(|x| x.as_str())
@@ -142,25 +158,31 @@ fn refresh_magpie() {
                         .map(|d| d.timestamp_millis())
                         .unwrap_or(0),
                 };
-                map.insert(magpie_key(i, o, cache_read), hit);
+                view.by_fp.insert(magpie_key(i, o, cache_read), hit);
                 if let Some(sid) = r.get("session").and_then(|x| x.as_str()) {
-                    map.insert(format!("{sid}|{}", magpie_key(i, o, cache_read)), hit);
+                    view.by_fp.insert(format!("{sid}|{}", magpie_key(i, o, cache_read)), hit);
+                    if hit.at_ms > 0 {
+                        view.by_sess.entry(sid.to_string()).or_default().push(hit);
+                    }
                 }
             }
         }
     }
     if let Some(cell) = MAGPIE_SNAP.get() {
         if let Ok(mut g) = cell.lock() {
+            for list in view.by_sess.values_mut() {
+                list.sort_by_key(|h| h.at_ms);
+            }
             *g = Some(MagpieSnap {
                 at: Instant::now(),
-                map,
+                view,
             });
         }
     }
 }
 
 /// 返回 Magpie 实测值快照；过期就在后台线程刷一次（本机网关没开时返回空表，不报错）。
-pub fn magpie_offsets() -> HashMap<String, MagpieHit> {
+pub fn magpie_offsets() -> MagpieView {
     let cell = MAGPIE_SNAP.get_or_init(|| Mutex::new(None));
     let stale = {
         match cell.lock() {
@@ -190,8 +212,8 @@ pub fn magpie_offsets() -> HashMap<String, MagpieHit> {
         }
     }
     match cell.lock() {
-        Ok(g) => g.as_ref().map(|s| s.map.clone()).unwrap_or_default(),
-        Err(_) => HashMap::new(),
+        Ok(g) => g.as_ref().map(|s| s.view.clone()).unwrap_or_default(),
+        Err(_) => MagpieView::default(),
     }
 }
 
@@ -658,7 +680,7 @@ struct Ctx<'a> {
     route_filter: u8,
     metric: u8,
     /// magpie / newapi 口径用：网关实测值快照，每次扫描只取一次
-    magpie: HashMap<String, MagpieHit>,
+    magpie: MagpieView,
     aggs: &'a mut AggMap,
     sessions: &'a mut SessList,
     records: Option<&'a mut Vec<Value>>,
@@ -706,12 +728,32 @@ impl<'a> Ctx<'a> {
         let mut duration_ms = duration_ms;
         let mut first_chunk_ms = first_chunk_ms;
         let mut metric_source = "step";
+        let fp = magpie_key(usage[0], usage[1], usage[2]);
         let hit = if source == "dsh" && usage[1] > 0 {
-            let key = magpie_key(usage[0], usage[1], usage[2]);
-            self.magpie
-                .get(&format!("{}|{key}", sess.id))
-                .or_else(|| self.magpie.get(&key))
-                .copied()
+            // 一、先在「同一会话 + 时间窗」里找：网关收包时刻必须落在这一轮的
+            //     step/start 到收尾之后 2 秒之间，窗口内再对一遍 token 指纹。
+            //     两道一起用，两轮 token 完全相同（缓存命中场景很常见）也不会串。
+            let mut window_hit = None;
+            let mut exact = None;
+            if let (Some(start), Some(list)) = (step_start_ms, self.magpie.by_sess.get(&sess.id)) {
+                for g in list.iter() {
+                    if g.at_ms < start || g.at_ms > at_ms + 2000 {
+                        continue;
+                    }
+                    window_hit = Some(*g);
+                    if g.in_tok == usage[0] && g.out_tok == usage[1] && g.cache_read == usage[2] {
+                        exact = Some(*g);
+                    }
+                }
+            }
+            exact.or(window_hit).or_else(|| {
+                // 二、退回纯 token 指纹（网关那一行没记 session 时）
+                self.magpie
+                    .by_fp
+                    .get(&format!("{}|{fp}", sess.id))
+                    .or_else(|| self.magpie.by_fp.get(&fp))
+                    .copied()
+            })
         } else {
             None
         };
@@ -737,31 +779,37 @@ impl<'a> Ctx<'a> {
                 // 所以起点 = DSH 发出请求头（request/header）+ 上传请求体 + 网关自身开销。
                 // 没有 request/header 就只能退回 step/start，数字会偏大，这里如实标成 newapi-step。
                 // 优先级：网关收包时刻（最准，197/197 轮都有）> request/header > step/start。
-                let mut base = 0.0;
+                // 起点用绝对时刻算：网关收包 t + 上传请求体 sent + 网关自身开销 own
+                // = 面板 RelayInfo.StartTime，也就是 New API 计时的零点。
+                let mut origin = 0.0;
                 if let (Some(g), Some(start)) = (hit, step_start_ms) {
                     if g.at_ms > 0 && g.at_ms >= start {
-                        // 网关收包 → 读完请求体，还要再加上网关自身开销
-                        base = (g.at_ms - start) as f64 + g.sent + g.own;
+                        origin = g.at_ms as f64 + g.sent + g.own;
                         metric_source = "newapi-gw";
                     }
                 }
-                if base <= 0.0 {
-                    if let Some(h) = header_ms {
-                        base = h;
-                        metric_source = "newapi-header";
+                if origin > 0.0 {
+                    if let Some(start) = step_start_ms {
+                        let start = start as f64;
+                        if let Some(f) = first_chunk_ms.as_mut() {
+                            *f = (*f + start - origin).max(0.0);
+                        }
+                        if let Some(d) = duration_ms.as_mut() {
+                            *d = (*d + start - origin).max(0.0);
+                        }
                     }
-                }
-                if base > 0.0 {
+                } else if let Some(h) = header_ms {
+                    metric_source = "newapi-header";
                     if let Some(f) = first_chunk_ms.as_mut() {
-                        *f = (*f - base).max(0.0);
+                        *f = (*f - h).max(0.0);
                     }
                     if let Some(d) = duration_ms.as_mut() {
-                        *d = (*d - base).max(0.0);
+                        *d = (*d - h).max(0.0);
                     }
                 }
-                // 面板上的 use_time 是 Unix() 秒差，等价于向下取整到整秒。
+                // 面板上的 use_time 是 Unix() 秒差（两个整秒相减），期望上等于四舍五入到整秒。
                 if let Some(d) = duration_ms.as_mut() {
-                    *d = (*d / 1000.0).floor() * 1000.0;
+                    *d = (*d / 1000.0).round() * 1000.0;
                 }
             }
             _ => {}
@@ -894,7 +942,7 @@ pub fn today_totals(port: u16) -> TodayTotals {
     let mut aggs: AggMap = HashMap::new();
     let mut sessions: SessList = Vec::new();
     {
-        let mut ctx = Ctx { bases: &bases, port, since_ms, route_filter: 0, metric: 0, magpie: HashMap::new(), aggs: &mut aggs, sessions: &mut sessions, records: None };
+        let mut ctx = Ctx { bases: &bases, port, since_ms, route_filter: 0, metric: 0, magpie: MagpieView::default(), aggs: &mut aggs, sessions: &mut sessions, records: None };
         let mut st = blank_stat("dsh", "DeepSeek Harness");
         scan_dsh(&mut ctx, &home, &mut st);
         let mut st = blank_stat("claude", "Claude Code");
@@ -1025,7 +1073,14 @@ impl LedgerAgg {
 
 /// 所有 Agent 会话的缓存账本。和路由流水无关：DSH / Claude / Pi / Codex
 /// 各自写的会话记录里只要有 usage，就进入这里；`routed` 只是其中一个子集。
-pub fn session_cache_ledger(port: u16, since_ms: i64, route: u8, metric: u8) -> Value {
+pub fn session_cache_ledger(
+    port: u16,
+    since_ms: i64,
+    route: u8,
+    metric: u8,
+    extra_durations: &[f64],
+    extra_first: &[f64],
+) -> Value {
     let home = home();
     let bases = collect_bases(&home);
     let mut aggs: AggMap = HashMap::new();
@@ -1033,7 +1088,7 @@ pub fn session_cache_ledger(port: u16, since_ms: i64, route: u8, metric: u8) -> 
     {
         let mut ctx = Ctx {
             bases: &bases, port, since_ms, route_filter: route, metric,
-            magpie: if metric <= 1 { magpie_offsets() } else { HashMap::new() },
+            magpie: if metric <= 1 { magpie_offsets() } else { MagpieView::default() },
             aggs: &mut aggs, sessions: &mut sessions, records: None,
         };
         let mut st = blank_stat("dsh", "DeepSeek Harness");
@@ -1058,6 +1113,11 @@ pub fn session_cache_ledger(port: u16, since_ms: i64, route: u8, metric: u8) -> 
             upstreams.entry(a.provider.clone()).or_default().add_agg(a);
         }
     }
+
+    // 本机路由流水不是 Agent 会话，账本默认不统计；健康看板在「全部请求」口径下把
+    // 本机流水的延迟样本并进来，避免少量本机样本把 P50 拉成与账本冲突的值。
+    totals.durations.extend_from_slice(extra_durations);
+    totals.first_chunks.extend_from_slice(extra_first);
 
     let mut model_rows: Vec<Value> = models.into_iter().map(|(k, v)| v.json(&k)).collect();
     model_rows.sort_by_key(|r| -r["cache_read"].as_i64().unwrap_or(0));
@@ -1112,7 +1172,7 @@ pub fn session_records(port: u16, since_ms: i64, route: u8, metric: u8, day: &st
     {
         let mut ctx = Ctx {
             bases: &bases, port, since_ms, route_filter: route, metric,
-            magpie: if metric <= 1 { magpie_offsets() } else { HashMap::new() },
+            magpie: if metric <= 1 { magpie_offsets() } else { MagpieView::default() },
             aggs: &mut aggs, sessions: &mut sessions, records: Some(&mut records),
         };
         let mut st = blank_stat("dsh", "DeepSeek Harness");
@@ -1238,7 +1298,7 @@ fn self_magpie_empty(metric: u8) -> bool {
     }
     let cell = MAGPIE_SNAP.get_or_init(|| Mutex::new(None));
     match cell.lock() {
-        Ok(g) => g.as_ref().map(|s| s.map.is_empty()).unwrap_or(true),
+        Ok(g) => g.as_ref().map(|s| s.view.by_fp.is_empty()).unwrap_or(true),
         Err(_) => true,
     }
 }
@@ -2134,7 +2194,7 @@ pub async fn scan(State(state): State<Arc<AppState>>, Query(q): Query<ScanQuery>
                 since_ms,
                 route_filter,
                 metric,
-                magpie: HashMap::new(),
+                magpie: MagpieView::default(),
                 aggs: &mut aggs,
                 sessions: &mut sessions,
                 records: None,
@@ -2152,7 +2212,7 @@ pub async fn scan(State(state): State<Arc<AppState>>, Query(q): Query<ScanQuery>
                 since_ms,
                 route_filter,
                 metric,
-                magpie: HashMap::new(),
+                magpie: MagpieView::default(),
                 aggs: &mut aggs,
                 sessions: &mut sessions,
                 records: None,
@@ -2170,7 +2230,7 @@ pub async fn scan(State(state): State<Arc<AppState>>, Query(q): Query<ScanQuery>
                 since_ms,
                 route_filter,
                 metric,
-                magpie: HashMap::new(),
+                magpie: MagpieView::default(),
                 aggs: &mut aggs,
                 sessions: &mut sessions,
                 records: None,
@@ -2188,7 +2248,7 @@ pub async fn scan(State(state): State<Arc<AppState>>, Query(q): Query<ScanQuery>
                 since_ms,
                 route_filter,
                 metric,
-                magpie: HashMap::new(),
+                magpie: MagpieView::default(),
                 aggs: &mut aggs,
                 sessions: &mut sessions,
                 records: None,

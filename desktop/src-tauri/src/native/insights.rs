@@ -417,7 +417,8 @@ pub async fn cache_ledger(State(state): State<Arc<AppState>>, Query(q): Query<Le
     // ledger_window() 返回的是秒；session_cache_ledger() 的 since_ms 需要毫秒，
     // 否则「今天」会把全部历史会话都算进来（最近 100 条也会错）。
     let since_ms = if since <= 0.0 { 0 } else { (since * 1000.0).round() as i64 };
-    let mut out = super::sessions::session_cache_ledger(port, since_ms, route, metric);
+    // 账本页只看 Agent 会话，不并入本机流水样本（本机流水请在「请求记录」页看）。
+    let mut out = super::sessions::session_cache_ledger(port, since_ms, route, metric, &[], &[]);
     out["ok"] = json!(true);
     out["generated_at"] = json!(chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string());
     out["range"] = json!(range_label);

@@ -724,14 +724,14 @@
             <tr>
               <td><b>New API</b><br><span class="hint">one-api / new-api 系面板</span></td>
               <td>第一个 SSE <code>data:</code> 帧（含 <code>role</code> / <code>block-start</code> 这类不带内容的帧），从网关读完请求体、选完渠道开始算</td>
-              <td>网关开始处理 → 写回完成，<b>向下取整到整秒</b>（<code>Unix()</code> 秒差）</td>
-              <td>会话记录里没有 New API 的计时，所以用 Magpie 网关的账本反推：<code>首字 = ttft_ms − sent_ms − own_ms</code>，再把总耗时按整秒截断（实测算术误差中位 2&nbsp;ms）；拿不到网关数据的轮次退回 <code>request/header</code>，再没有才用 <code>step/start</code></td>
+              <td>网关开始处理 → 写回完成，<b>取整到整秒</b>（<code>Unix()</code> 秒差），所以总耗时永远显示成 <code>15.00 s</code> 这种整数秒</td>
+              <td>会话记录里没有 New API 的计时，用 Magpie 网关的账本反推：起点取网关的绝对收包时刻 <code>t + sent_ms + own_ms</code>，再算首字与总耗时（<b>实测首字误差中位 2&nbsp;ms、总耗时与面板整秒一致</b>）；拿不到网关数据的轮次退回 <code>request/header</code>，再没有才用 <code>step/start</code></td>
             </tr>
             <tr>
               <td><b>Magpie</b><br><span class="hint">本地网关 3425</span></td>
               <td>上游第一个<b>有内容</b>的字节（跳过空帧），网关从收到请求头开始算，含把请求体传给上游的时间</td>
               <td>首字 + 纯解码段，到最后一个字节，毫秒精度</td>
-              <td>按<b>会话 + 输入/输出/缓存读 token</b>去 Magpie 用量日志对账，对上直接取它的 <code>ttft_ms</code> / <code>ms</code>（实测误差 0 ms）；对不上回退到 <code>request/header</code> 推算，再没有就退回 step 口径</td>
+              <td>按<b>会话 + 时间窗 + 输入/输出/缓存读 token</b>去 Magpie 用量日志对账，对上直接取它的 <code>ttft_ms</code> / <code>ms</code>（实测误差 0 ms）；对不上回退到 <code>request/header</code> 推算，再没有就退回 step 口径</td>
             </tr>
             <tr>
               <td><b>当前计时</b><br><span class="hint">本程序原先的算法</span></td>
@@ -744,7 +744,7 @@
         </div>
         <div class="hint" style="margin-top:8px">
           三套口径都从 DSH 会话里的同一批时间戳换算，原始记录不改：
-          <b>New API</b> = 网关 ttft 减去网关上传与自身开销、总耗时整秒截断；<b>Magpie</b> = 网关实测 ttft/ms（对不上时用 <code>request/header</code> 推算）；<b>当前计时</b> = 首帧 + 到最后一个流帧。
+          <b>New API</b> = 网关绝对收包时刻 + 上传 + 网关开销当起点、总耗时取整到整秒；<b>Magpie</b> = 网关实测 ttft/ms（对不上时用 <code>request/header</code> 推算）；<b>当前计时</b> = 首帧 + 到最后一个流帧。
           第一档与第二档都会读 <code>GET /v1/magpie/usage/requests</code>（本机没开 Magpie 时自动回退），
           请求页工具栏会显示「网关实测 N / M 轮」，展开单条请求还能看到这条记录用的是哪套时间。
         </div>
