@@ -2487,6 +2487,25 @@ function tpsBadge(h) {
     : `全链路速度 ${fmtTps(t.overall)} tok/s = 输出 ${fmtNum(t.out)} tok ÷ 总耗时 ${fmtLat(t.elapsed)}；首字延迟缺失或生成窗口过短，无法单独算生成速度`;
   return `<span class="badge" title="${tip}">TPS ${fmtTps(shown)} tok/s</span>`;
 }
+// New API 口径把总耗时按面板 use_time 取整到整秒，而首字保留毫秒精度，
+// 于是会出现「总耗时 1.00 s、首字 1.09 s」这种看起来矛盾的组合。
+// 这里把取整前的实测值一并显示，并对「首字 > 总耗时」加一枚提示徽标。
+function elapsedHint(h) {
+  const raw = h.elapsed_raw_seconds;
+  const rounded = raw != null && h.elapsed_seconds != null && Math.abs(raw - h.elapsed_seconds) >= 0.45;
+  const over = h.first_chunk_seconds != null && h.elapsed_seconds != null && h.first_chunk_seconds > h.elapsed_seconds;
+  // 「首字 > 总耗时」是取整造成的观感问题，这时必须把实测值摆出来，否则看着像 bug。
+  const showRaw = rounded || over;
+  const base = "总耗时：从收到请求到整个响应结束（含重试、含流式输出全过程）";
+  const title = showRaw && raw != null
+    ? base + "。当前口径（New API）按上游面板 use_time 取整到整秒，实测 " + fmtLat(raw)
+    : base;
+  const extra = showRaw && raw != null ? ` <span class="hint" style="opacity:.72">（实测 ${fmtLat(raw)}）</span>` : "";
+  const warn = over
+    ? ` <span class="badge warn" title="首字是毫秒精度，总耗时按 New API 面板口径取整到整秒，二者量纲不同：实测总耗时 ${raw != null ? fmtLat(raw) : "—"}">首字 > 总耗时</span>`
+    : "";
+  return `<span class="hint" title="${esc(title)}">总耗时 ${fmtLat(h.elapsed_seconds)}</span>${extra}${warn}`;
+}
 function tpsDetail(h) {
   const t = tpsOf(h);
   if (!t) return `输出速度：<code>—</code>（这条流水没有输出 token 或耗时）`;
@@ -2727,7 +2746,7 @@ function renderSide() {
         <div class="grow"></div>
         ${use.total != null ? `<span class="badge">${fmtNum(use.total)} tok</span>` : ""}
         ${tpsBadge(h)}
-        <span class="hint" title="总耗时：从收到请求到整个响应结束（含重试、含流式输出全过程）">总耗时 ${fmtLat(h.elapsed_seconds)}</span>
+        ${elapsedHint(h)}
         ${h.first_chunk_seconds != null ? `<span class="hint" title="首字延迟：从收到请求到第一个内容块到达">首字 ${fmtLat(h.first_chunk_seconds)}</span>` : ""}
         ${h.stream ? `<span class="badge blue">流式</span>` : ""}
         ${requestPathSummary(h, trail)}
@@ -2745,7 +2764,7 @@ function renderSide() {
         <div class="req-sec">
           <h5>耗时</h5>
           <div class="hint" style="line-height:1.8">
-            总耗时：<code>${fmtLat(h.elapsed_seconds)}</code>（从收到请求到响应结束，含上游重试与流式输出全过程）<br>
+            总耗时：<code>${fmtLat(h.elapsed_seconds)}</code>（从收到请求到响应结束，含上游重试与流式输出全过程）${h.elapsed_raw_seconds != null && h.elapsed_seconds != null && Math.abs(h.elapsed_raw_seconds - h.elapsed_seconds) >= 0.45 ? `　实测：<code>${fmtLat(h.elapsed_raw_seconds)}</code>（未取整；New API 面板的 use_time 是整秒差，所以列表里显示整数秒）` : ""}<br>
             首字延迟：<code>${h.first_chunk_seconds != null ? fmtLat(h.first_chunk_seconds) : "—"}</code>（首个内容块到达，只有新版本流式流水才有）<br>
             ${h.metric_source ? `计时来源：<code>${{ magpie: "Magpie 网关用量日志", header: "DSH request/header 时刻", step: "DSH step/start", "newapi-gw": "New API：请求头 + 网关上传/自身开销", "newapi-header": "New API：仅按 request/header 推算" }[h.metric_source] || esc(h.metric_source)}</code><br>` : ""}
             request/header：<code>${h.request_header_seconds != null ? fmtLat(h.request_header_seconds) : "—"}</code>（DSH 写请求头的时刻，相对 step/start；DSH 只在配置变更时才写这条事件，所以大多数轮没有）<br>

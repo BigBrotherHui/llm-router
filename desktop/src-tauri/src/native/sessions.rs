@@ -25,6 +25,10 @@ use super::state::AppState;
 
 /// 单个会话文件最多解压/读取的字节数（防止 100MB 级的 rollout 把内存吃满）。
 const FILE_CAP: u64 = 48 * 1024 * 1024;
+/// DSH 的 session.v4.jsonl.zstd 是「追加写 + 多个 zstd 帧」，最新轮次在文件尾部。
+/// 按 FILE_CAP 截头读会把最近的内容整个丢掉（实测今天只统计到 343/743 轮、
+/// 输入 token 也只有一半），所以必须整份流式解压；上限只作病态文件的保险。
+const DSH_CAP: u64 = 1536 * 1024 * 1024;
 /// 单个来源最多处理的文件数。
 const FILE_LIMIT: usize = 400;
 /// 返回给前端的明细行上限。
@@ -728,6 +732,7 @@ impl<'a> Ctx<'a> {
         let mut duration_ms = duration_ms;
         let mut first_chunk_ms = first_chunk_ms;
         let mut metric_source = "step";
+        let mut raw_seconds: Option<f64> = None;
         let fp = magpie_key(usage[0], usage[1], usage[2]);
         let hit = if source == "dsh" && usage[1] > 0 {
             // 一、先在「同一会话 + 时间窗」里找：网关收包时刻必须落在这一轮的
@@ -808,6 +813,9 @@ impl<'a> Ctx<'a> {
                     }
                 }
                 // 面板上的 use_time 是 Unix() 秒差（两个整秒相减），期望上等于四舍五入到整秒。
+                // 取整前的实测值单独留一份：首字是毫秒精度，取整后可能出现
+                // 「首字 1.09 s > 总耗时 1.00 s」的观感问题，界面上用它作对照。
+                raw_seconds = duration_ms.map(|ms| ms / 1000.0);
                 if let Some(d) = duration_ms.as_mut() {
                     *d = (*d / 1000.0).round() * 1000.0;
                 }
@@ -893,6 +901,7 @@ impl<'a> Ctx<'a> {
                 "ok": true,
                 "status": 200,
                 "elapsed_seconds": if duration_ms.is_some() { json!(secs) } else { Value::Null },
+                "elapsed_raw_seconds": raw_seconds.map(|x| json!(x)).unwrap_or(Value::Null),
                 "first_chunk_seconds": first_chunk_ms.map(|ms| json!(ms / 1000.0)).unwrap_or(Value::Null),
                 "request_header_seconds": header_ms.map(|ms| json!(ms / 1000.0)).unwrap_or(Value::Null),
                 "metric_source": metric_source,
@@ -1551,7 +1560,7 @@ fn scan_dsh(ctx: &mut Ctx, home: &Path, st: &mut SrcStat) {
                 .and_then(|f| {
                     zstd::stream::read::Decoder::new(BufReader::new(f)).map_err(|e| e.to_string())
                 }) {
-                Ok(d) => Box::new(d.take(FILE_CAP)),
+                Ok(d) => Box::new(d.take(DSH_CAP)),
                 Err(e) => {
                     st.note = format!("zstd 解压失败: {e}");
                     continue;
@@ -1599,16 +1608,21 @@ fn scan_dsh(ctx: &mut Ctx, home: &Path, st: &mut SrcStat) {
                     }
                 }
             }
+            // 注意：必须先确认这一行「就是」request/header 才能 continue。
+            // 会话正文里出现「request/header」字样（例如讨论本功能时的对话内容）时，
+            // 之前无条件 continue 会把整条 assistant/message 跳过（实测一天少统计 73 轮）。
             if line.contains("request/header") {
-                if let (Some(key), Ok(v)) = (pending, serde_json::from_str::<Value>(&line)) {
+                if let Ok(v) = serde_json::from_str::<Value>(&line) {
                     if v.get("type").and_then(|t| t.as_str()) == Some("request/header") {
-                        if let Some(at) = v.get("time").and_then(|t| t.as_i64()) {
+                        if let (Some(key), Some(at)) =
+                            (pending, v.get("time").and_then(|t| t.as_i64()))
+                        {
                             // 同一轮可能在重试时写多条 header，取最早那条（第一条发出前的时刻）
                             header_starts.entry(key).or_insert(at);
                         }
+                        continue;
                     }
                 }
-                continue;
             }
             if !line.contains("assistant/message") {
                 continue;
@@ -1693,7 +1707,7 @@ fn scan_dsh(ctx: &mut Ctx, home: &Path, st: &mut SrcStat) {
             ];
             ctx.round("dsh", "DeepSeek Harness", &mut sess, provider, model, at, usage, duration, first_chunk, header_ms, start);
         }
-        if read >= FILE_CAP {
+        if read >= DSH_CAP {
             st.truncated = true;
         }
         st.bytes += read;
@@ -2517,7 +2531,7 @@ fn scan_dsh_tools(
             match std::fs::File::open(&path).map_err(|e| e.to_string()).and_then(|f| {
                 zstd::stream::read::Decoder::new(BufReader::new(f)).map_err(|e| e.to_string())
             }) {
-                Ok(d) => Box::new(d.take(FILE_CAP)),
+                Ok(d) => Box::new(d.take(DSH_CAP)),
                 Err(_) => continue,
             }
         } else {

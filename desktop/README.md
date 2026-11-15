@@ -193,6 +193,9 @@ POST /health/upstreams/clear  {"id":"..."} 或 {"all":true}
 请求记录页顶部「数据口径」默认是 **全部 Agent 会话**：直接读 DSH / Claude Code / Pi / Codex 的会话记录，
 每一条模型调用算一行，分类按 `provider / 模型`（与「会话对账」一致），不再只看经过本机 `8010` 的请求。
 切到「本机路由流水」才回到 `config.history.jsonl` 的客户端请求口径。
+口径与上游面板对得上：穷举解压 `~/.dsh/sessions/**` 统计 `assistant/message` 与 `/sessions/records` 的 `total`
+逐轮一致（实测 920 = 920，输入/输出/缓存读完全相同），按小时与 Magpie 网关 `calls` 的偏差也在 1% 内
+（差额来自不走 Magpie 的直连轮次与 Magpie 自己的 `retried`/`canceled` 计数方式）。
 
 DSH 行会从 `step/start` 到首个 `stream[].time` 计算首字延迟，从 `step/start` 到 `assistant/message` 计算总耗时；
 Claude / Pi / Codex 的会话记录没有首字时间时显示 `—`。表格里的 TPS 仍按「输出 token ÷ (总耗时 − 首字)」计算。
@@ -258,6 +261,9 @@ GET /sessions/bases
 - `首字 = 第一个流帧绝对时刻 − 起点`；`总耗时 = 最后一个流帧绝对时刻 − 起点`，再按 New API 的 `Unix()` 秒差口径**四舍五入到整秒**
   ——所以 New API 口径的「总耗时」总是整秒（15.00 s、16.00 s），跟面板显示的一个样。
 - 实测 159 轮配对：`首字` 与「网关 `ttft_ms − sent_ms − own_ms`」的误差 **中位 2 ms**；`总耗时` 与面板整秒值 **中位误差 0 s**。
+- 取整会让「总耗时」比「首字」还小（真实 2.33 s 取整成 2.00 s，首字 2.27 s）。请求列表遇到这种情况会把
+  取整前的实测值一并显示：`总耗时 2.00 s（实测 2.33 s）`，并加一枚 `首字 > 总耗时` 徽标（悬浮看解释）；
+  请求详情里的「耗时」段也会列出实测值。接口字段是 `elapsed_raw_seconds`（未取整的秒）。
 
 `Magpie` 口径的取值：
 
