@@ -1172,7 +1172,19 @@ pub fn session_cache_ledger(
 
 /// 逐轮会话记录：给「请求记录」页展示所有 Agent 的每次调用，
 /// 而不是只看经过本机 8010 的 config.history.jsonl。
-pub fn session_records(port: u16, since_ms: i64, route: u8, metric: u8, day: &str, month: &str, group: &str, upstream: &str, model: &str, limit: usize, offset: usize) -> Value {
+/// 扫描四家 Agent 会话，产出与 journal 对齐的逐轮记录（已按筛选过滤、按时间倒序）。
+/// 返回 (记录, 可选日期, 可选月份)——日期/月份取自过滤前的全集，用来填筛选下拉框。
+fn scan_records(
+    port: u16,
+    since_ms: i64,
+    route: u8,
+    metric: u8,
+    day: &str,
+    month: &str,
+    group: &str,
+    upstream: &str,
+    model: &str,
+) -> (Vec<Value>, Vec<String>, Vec<String>) {
     let home = home();
     let bases = collect_bases(&home);
     let mut records: Vec<Value> = Vec::new();
@@ -1221,6 +1233,11 @@ pub fn session_records(port: u16, since_ms: i64, route: u8, metric: u8, day: &st
         let bt = b["at"].as_f64().unwrap_or(0.0);
         bt.partial_cmp(&at).unwrap_or(std::cmp::Ordering::Equal)
     });
+    (records, days, months)
+}
+
+pub fn session_records(port: u16, since_ms: i64, route: u8, metric: u8, day: &str, month: &str, group: &str, upstream: &str, model: &str, limit: usize, offset: usize) -> Value {
+    let (records, days, months) = scan_records(port, since_ms, route, metric, day, month, group, upstream, model);
     let total = records.len();
     let mut calls = 0u64; let mut input = 0u64; let mut output = 0u64;
     let mut cache_read = 0u64; let mut cache_write = 0u64;
@@ -1298,6 +1315,259 @@ pub fn session_records(port: u16, since_ms: i64, route: u8, metric: u8, day: &st
         "days": days.iter().map(|d| json!({"key": d})).collect::<Vec<_>>(),
         "months": months.iter().map(|m| json!({"key": m})).collect::<Vec<_>>(),
     })
+}
+
+/// 图表口径（全部 Agent 会话）：把逐轮记录聚合成时间序列 / 延迟直方图 / 模型分布，
+/// 输出形状与 insights::series 完全一致，前端不用为两种口径写两套分支。
+/// Agent 会话记录里没有失败信息，所以 failed / success_rate 一律为 null，
+/// 并用 failed_known=false 让前端去掉「失败」那条线，而不是画一条假的 0 线。
+pub fn session_series(
+    port: u16,
+    since_ms: i64,
+    bucket_secs: i64,
+    route: u8,
+    metric: u8,
+    day: &str,
+    month: &str,
+    group: &str,
+    upstream: &str,
+    model: &str,
+) -> Value {
+    let (records, _days, _months) = scan_records(port, since_ms, route, metric, day, month, group, upstream, model);
+    let now_ts = now_ms() as f64 / 1000.0;
+    let bucket_secs = bucket_secs.max(60);
+    let since = (since_ms as f64 / 1000.0).max(0.0).min(now_ts);
+    // since_ms <= 0 就是不设下限（全部历史）：桶的起点要跟着最早一条记录走，
+    // 否则起点是 1970-01-01，整张图会挤进最后一根桶、刻度变成 1970 年的日期。
+    let data_min = records
+        .iter()
+        .filter_map(|r| r["at"].as_f64())
+        .filter(|v| *v > 0.0)
+        .fold(f64::MAX, f64::min);
+    let base = if since > 0.0 {
+        since
+    } else if data_min != f64::MAX {
+        data_min
+    } else {
+        now_ts
+    };
+    // 桶边界按本机时区对齐：本机 00:00 对应的 UTC 秒是 (本地零点 - 偏移)，所以
+    // 先把偏移加回去再按桶宽取整、最后减回来。直接按 UTC 取整时，桶宽 >= 1 天
+    // 会让整条轴偏一个时区（实测「整月」窗口第一根桶标签显示成上个月最后一天）。
+    let tz_offset = chrono::Local::now().offset().local_minus_utc() as f64;
+    let start =
+        ((base + tz_offset) / bucket_secs as f64).floor() * bucket_secs as f64 - tz_offset;
+    let count = (((now_ts - start) / bucket_secs as f64).ceil() as usize + 1).clamp(1, 240);
+
+    struct SeriesBucket {
+        at: f64,
+        calls: u64,
+        input: u64,
+        output: u64,
+        cache_read: u64,
+        cache_write: u64,
+        elapsed: Vec<f64>,
+        first: Vec<f64>,
+    }
+    let blank = |at: f64| SeriesBucket {
+        at,
+        calls: 0,
+        input: 0,
+        output: 0,
+        cache_read: 0,
+        cache_write: 0,
+        elapsed: Vec::new(),
+        first: Vec::new(),
+    };
+    let mut buckets: Vec<SeriesBucket> = (0..count)
+        .map(|i| blank(start + i as f64 * bucket_secs as f64))
+        .collect();
+    let mut totals = blank(start);
+    let mut model_rows: HashMap<String, (u64, u64, u64, Vec<f64>)> = HashMap::new();
+    let mut up_rows: HashMap<String, (u64, Vec<f64>, Vec<f64>)> = HashMap::new();
+    let mut total_elapsed: Vec<f64> = Vec::new();
+    let mut total_first: Vec<f64> = Vec::new();
+    let mut earliest = f64::MAX;
+    let mut latest: f64 = 0.0;
+
+    for r in records.iter() {
+        let at = r["at"].as_f64().unwrap_or(0.0);
+        if at <= 0.0 || at < since {
+            continue;
+        }
+        earliest = earliest.min(at);
+        latest = latest.max(at);
+        let u = &r["usage"];
+        let input = u["input"].as_u64().unwrap_or(0);
+        let output = u["output"].as_u64().unwrap_or(0);
+        let cache_read = u["cache_read"].as_u64().unwrap_or(0);
+        let cache_write = u["cache_write"].as_u64().unwrap_or(0);
+        let elapsed = r["elapsed_seconds"].as_f64().unwrap_or(0.0);
+        let first = r["first_chunk_seconds"].as_f64().unwrap_or(0.0);
+        let model_name = r["effective_model"]
+            .as_str()
+            .filter(|s| !s.is_empty())
+            .or_else(|| r["model"].as_str())
+            .unwrap_or("")
+            .to_string();
+        let up = r["upstream"].as_str().unwrap_or("").to_string();
+
+        let idx = (((at - start) / bucket_secs as f64).floor() as isize)
+            .clamp(0, buckets.len() as isize - 1) as usize;
+        for b in [&mut buckets[idx], &mut totals] {
+            b.calls += 1;
+            b.input += input;
+            b.output += output;
+            b.cache_read += cache_read;
+            b.cache_write += cache_write;
+            if elapsed > 0.0 {
+                b.elapsed.push(elapsed);
+            }
+            if first > 0.0 {
+                b.first.push(first);
+            }
+        }
+        if elapsed > 0.0 {
+            total_elapsed.push(elapsed);
+        }
+        if first > 0.0 {
+            total_first.push(first);
+        }
+        if !model_name.is_empty() {
+            let m = model_rows.entry(model_name).or_insert_with(|| (0, 0, 0, Vec::new()));
+            m.0 += 1;
+            m.1 += input;
+            m.2 += output;
+            if elapsed > 0.0 {
+                m.3.push(elapsed);
+            }
+        }
+        if !up.is_empty() {
+            let e = up_rows.entry(up).or_insert_with(|| (0, Vec::new(), Vec::new()));
+            e.0 += 1;
+            if elapsed > 0.0 {
+                e.1.push(elapsed);
+            }
+            if first > 0.0 {
+                e.2.push(first);
+            }
+        }
+    }
+
+    let bucket_json = |b: &SeriesBucket| {
+        json!({
+            "at": b.at,
+            "label": series_bucket_label(b.at, bucket_secs),
+            "calls": b.calls,
+            "ok": b.calls,
+            "failed": Value::Null,
+            "success_rate": Value::Null,
+            "input": b.input,
+            "output": b.output,
+            "cache_read": b.cache_read,
+            "cache_write": b.cache_write,
+            "avg_ms": if b.elapsed.is_empty() { 0.0 } else { (b.elapsed.iter().sum::<f64>() / b.elapsed.len() as f64 * 1000.0 * 10.0).round() / 10.0 },
+            "p50_ms": pct_ms(&b.elapsed, 0.50),
+            "p95_ms": pct_ms(&b.elapsed, 0.95),
+            "first_p50_ms": pct_ms(&b.first, 0.50),
+        })
+    };
+
+    let edges = [0.5_f64, 1.0, 2.0, 5.0, 10.0, 30.0, 60.0];
+    let labels = ["≤0.5s", "0.5–1s", "1–2s", "2–5s", "5–10s", "10–30s", "30–60s", ">60s"];
+    let mut hist = vec![0_u64; labels.len()];
+    for v in &total_elapsed {
+        let mut idx = edges.len();
+        for (i, edge) in edges.iter().enumerate() {
+            if *v <= *edge {
+                idx = i;
+                break;
+            }
+        }
+        hist[idx] += 1;
+    }
+    let histogram: Vec<Value> = labels
+        .iter()
+        .enumerate()
+        .map(|(i, label)| json!({"label": label, "count": hist[i]}))
+        .collect();
+
+    let mut models: Vec<Value> = model_rows
+        .into_iter()
+        .map(|(model, (calls, input, output, elapsed))| {
+            let avg = if elapsed.is_empty() {
+                0.0
+            } else {
+                elapsed.iter().sum::<f64>() / elapsed.len() as f64 * 1000.0
+            };
+            json!({
+                "model": model,
+                "calls": calls,
+                "input": input,
+                "output": output,
+                "total": input + output,
+                "avg_ms": (avg * 10.0).round() / 10.0,
+            })
+        })
+        .collect();
+    models.sort_by_key(|r| -r["calls"].as_i64().unwrap_or(0));
+
+    let mut upstreams: Vec<Value> = up_rows
+        .into_iter()
+        .map(|(upstream, (calls, elapsed, first))| {
+            json!({
+                "upstream": upstream,
+                "calls": calls,
+                "ok": calls,
+                "failed": Value::Null,
+                "success_rate": Value::Null,
+                "p50_ms": pct_ms(&elapsed, 0.50),
+                "p95_ms": pct_ms(&elapsed, 0.95),
+                "first_p50_ms": pct_ms(&first, 0.50),
+            })
+        })
+        .collect();
+    upstreams.sort_by_key(|r| -r["calls"].as_i64().unwrap_or(0));
+
+    json!({
+        "ok": true,
+        "scope": "all",
+        "failed_known": false,
+        "generated_at": chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string(),
+        "bucket_seconds": bucket_secs,
+        "buckets": buckets.iter().map(bucket_json).collect::<Vec<_>>(),
+        "histogram": histogram,
+        "models": models,
+        "upstreams": upstreams,
+        "totals": {
+            "calls": totals.calls,
+            "ok": totals.calls,
+            "failed": Value::Null,
+            "success_rate": Value::Null,
+            "input": totals.input,
+            "output": totals.output,
+            "cache_read": totals.cache_read,
+            "cache_write": totals.cache_write,
+            "p50_ms": pct_ms(&total_elapsed, 0.50),
+            "p95_ms": pct_ms(&total_elapsed, 0.95),
+            "first_p50_ms": pct_ms(&total_first, 0.50),
+        },
+        "partial": earliest != f64::MAX && earliest > start + bucket_secs as f64,
+        "earliest": if earliest == f64::MAX { 0.0 } else { earliest },
+        "latest": latest,
+    })
+}
+
+fn series_bucket_label(start: f64, bucket_secs: i64) -> String {
+    let Some(dt) = chrono::DateTime::from_timestamp(start as i64, 0) else {
+        return String::new();
+    };
+    let local = dt.with_timezone(&chrono::Local);
+    if bucket_secs >= 86400 {
+        local.format("%m-%d").to_string()
+    } else {
+        local.format("%H:%M").to_string()
+    }
 }
 
 /// magpie 口径是否有可用的网关实测值（本机没开 Magpie 时为 false，前端据此提示）。

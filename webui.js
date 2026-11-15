@@ -3584,12 +3584,14 @@ if ($("#sideSource")) {
     reqPage = 1; lastSideHash = "";
     await loadJournal();
     renderSide();
+    chartFilterTouched();
   };
 }
 if ($("#sideMetric")) {
   $("#sideMetric").onchange = () => {
     reqPage = 1; lastSideHash = "";
     saveTimingMode($("#sideMetric").value);
+    chartFilterTouched();
   };
 }
 // 按天 / 按月 / 按分组筛选：改动后回到第一页重新从流水取
@@ -3599,6 +3601,7 @@ if ($("#sideDay")) {
     reqPage = 1; lastSideHash = "";
     await loadJournal();
     renderSide();
+    chartFilterTouched();
   };
 }
 if ($("#sideMonth")) {
@@ -3607,6 +3610,7 @@ if ($("#sideMonth")) {
     reqPage = 1; lastSideHash = "";
     await loadJournal();
     renderSide();
+    chartFilterTouched();
   };
 }
 $("#sideFilter").onchange = async () => {
@@ -3616,12 +3620,14 @@ $("#sideFilter").onchange = async () => {
   reqPage = 1; lastSideHash = "";
   await loadJournal();
   renderSide();
+  chartFilterTouched();
 };
 if ($("#sideUpstream")) {
   $("#sideUpstream").onchange = async () => {
     reqPage = 1; lastSideHash = "";
     await loadJournal();
     renderSide();
+    chartFilterTouched();
   };
 }
 $("#sideMode").onchange = () => { lastSideHash = ""; renderSide(); };
@@ -5184,15 +5190,40 @@ function radarChart(host, axes, series) {
 function reqRangeLabel(r) {
   return r === "today" ? "今天 00:00 起" : r === "all" ? "全部（尾部缓存）" : String(r || "");
 }
+// 图表必须和上面的统计卡 / 列表同口径：数据范围（全部 Agent 会话 还是 本机路由流水）、
+// 耗时口径、分组 / 上游 / 模型筛选都跟着走；只按「经过 8010 的请求」画图，
+// 就会比列表少一大截（尤其是没走本机路由的那些 Agent 调用）。
+function reqChartQuery() {
+  const f = curJournalFilter();
+  const scope = ($("#sideSource") && $("#sideSource").value) === "router" ? "router" : "all";
+  const win = ($("#reqChartRange") && $("#reqChartRange").value) || "list";
+  const qs = new URLSearchParams();
+  qs.set("scope", scope);
+  qs.set("metric", timingMode());
+  if (f.group) qs.set("group", f.group);
+  if (f.upstream) qs.set("upstream", f.upstream);
+  if (f.model) qs.set("model", f.model);
+  if (win === "list") {
+    // 跟随列表：列表按天 / 按月就跟着按天 / 按月，都没选就是今天。
+    if (f.day) { qs.set("day", f.day); qs.set("range", "all"); }
+    else if (f.month) { qs.set("month", f.month); qs.set("range", "all"); }
+    else qs.set("range", "today");
+  } else if (win === "today") {
+    qs.set("range", "today");
+  } else if (win === "all" || win === "0") {
+    qs.set("range", "all");
+  } else {
+    qs.set("hours", win);
+  }
+  return qs;
+}
 async function loadReqCharts(force) {
   const host = $("#reqTrendChart");
   if (!host || reqChartBusy) return;
   if (!force && Date.now() - reqChartAt < 20000) return;
   reqChartBusy = true;
   try {
-    const range = $("#reqChartRange") ? $("#reqChartRange").value : "today";
-    const qs = range === "today" ? "range=today" : (range === "all" || range === "0" ? "range=all" : "hours=" + encodeURIComponent(range));
-    const d = await api("/stats/series?" + qs);
+    const d = await api("/stats/series?" + reqChartQuery().toString());
     reqChartAt = Date.now();
     renderReqCharts(d);
   } catch (e) {
@@ -5201,16 +5232,26 @@ async function loadReqCharts(force) {
     reqChartBusy = false;
   }
 }
+// 筛选一动就把 20 秒节流清零，让图表跟着列表马上重算。
+function chartFilterTouched() {
+  reqChartAt = 0;
+  if ($("#reqTrendChart")) loadReqCharts();
+}
 function renderReqCharts(d) {
   const t = d.totals || {};
   let buckets = d.buckets || [];
   const firstIdx = buckets.findIndex(b => (b.calls || 0) > 0);
   if (firstIdx > 2) buckets = buckets.slice(firstIdx - 2);
-  $("#reqChartMeta").textContent = `窗口 ${reqRangeLabel(d.range)} · ${fmtCount(t.calls)} 次调用 · 成功率 ${t.success_rate == null ? "—" : t.success_rate + "%"} · P50 ${chartMs(t.p50_ms)} · 首字 P50 ${chartMs(t.first_p50_ms)}`;
-  lineChart($("#reqTrendChart"), buckets.map(b => b.label), [
-    { name: "调用", values: buckets.map(b => b.calls || 0), color: CHART_COLORS.blue },
-    { name: "失败", values: buckets.map(b => b.failed || 0), color: CHART_COLORS.red },
-  ]);
+  const known = d.failed_known !== false;
+  const scopeLabel = d.scope === "router" ? "本机路由流水" : "全部 Agent 会话";
+  const windowText = d.day ? `${d.day}（当天）`
+    : d.month ? `${d.month}（整月）`
+    : reqRangeLabel(d.range);
+  $("#reqChartMeta").textContent = `${scopeLabel} · 窗口 ${windowText} · ${fmtCount(t.calls)} 次调用 · 成功率 ${t.success_rate == null ? "—（会话记录不含失败）" : t.success_rate + "%"} · P50 ${chartMs(t.p50_ms)} · 首字 P50 ${chartMs(t.first_p50_ms)}`;
+  // Agent 会话记录里没有失败信息，画一条恒为 0 的「失败」线会让人以为一次没失败。
+  const trend = [{ name: "调用", values: buckets.map(b => b.calls || 0), color: CHART_COLORS.blue }];
+  if (known) trend.push({ name: "失败", values: buckets.map(b => b.failed || 0), color: CHART_COLORS.red });
+  lineChart($("#reqTrendChart"), buckets.map(b => b.label), trend);
   histogramChart($("#reqHistChart"), d.histogram || []);
   const models = (d.models || []).slice(0, 8).map(m => ({
     label: m.model,

@@ -9,7 +9,7 @@ use std::sync::Arc;
 use axum::extract::{Query, State};
 use axum::response::{IntoResponse, Response};
 use axum::Json;
-use chrono::Timelike;
+use chrono::{TimeZone, Timelike};
 use serde::Deserialize;
 use serde_json::{json, Value};
 
@@ -24,6 +24,18 @@ pub struct SeriesQuery {
     pub hours: Option<f64>,
     /// 可选：强制分桶秒数
     pub bucket: Option<i64>,
+    /// all = 全部 Agent 会话（默认，与请求记录同口径）；router = 本机路由流水
+    pub scope: Option<String>,
+    /// 耗时口径：newapi / magpie / current
+    pub metric: Option<String>,
+    /// routed / external / all
+    pub route: Option<String>,
+    /// 与请求记录页一致的筛选：日期 / 月份 / 分组 / 上游 / 模型
+    pub day: Option<String>,
+    pub month: Option<String>,
+    pub group: Option<String>,
+    pub upstream: Option<String>,
+    pub model: Option<String>,
 }
 
 #[derive(Deserialize, Default)]
@@ -113,6 +125,23 @@ fn percentile_ms(samples: &[f64], p: f64) -> f64 {
     (v[idx.min(v.len() - 1)] * 1000.0 * 10.0).round() / 10.0
 }
 
+/// 「跟随列表筛选」时窗口是列表选中的某一天 / 某个月：起点要取那一天（那一月）
+/// 的本机 00:00，否则 range=all 会把起点算成 1970，桶宽与 x 轴刻度全乱
+/// （实测：整天的请求全挤进最后一根桶，刻度显示成 1970 年的 08-28）。
+fn local_day_start_ts(day: &str) -> Option<f64> {
+    let d = chrono::NaiveDate::parse_from_str(day.trim(), "%Y-%m-%d").ok()?;
+    let dt = d.and_hms_opt(0, 0, 0)?;
+    let local = chrono::Local.from_local_datetime(&dt).earliest()?;
+    Some(local.timestamp() as f64)
+}
+
+fn local_month_start_ts(month: &str) -> Option<f64> {
+    let d = chrono::NaiveDate::parse_from_str(&format!("{}-01", month.trim()), "%Y-%m-%d").ok()?;
+    let dt = d.and_hms_opt(0, 0, 0)?;
+    let local = chrono::Local.from_local_datetime(&dt).earliest()?;
+    Some(local.timestamp() as f64)
+}
+
 fn auto_bucket(span: f64) -> i64 {
     if span <= 2.0 * 3600.0 {
         300
@@ -168,14 +197,80 @@ pub async fn series(State(state): State<Arc<AppState>>, Query(q): Query<SeriesQu
         }
     };
 
+    let scope = q
+        .scope
+        .as_deref()
+        .map(|s| s.trim().to_ascii_lowercase())
+        .unwrap_or_default();
+    // 默认「全部 Agent 会话」：请求记录页、统计卡和这里必须是同一个口径，
+    // 否则图表会比列表少一大截（只有经过 8010 的请求）。
+    let scope = if scope == "router" { "router" } else { "all" };
+    let f_day = q.day.as_deref().unwrap_or("").trim().to_string();
+    let f_month = q.month.as_deref().unwrap_or("").trim().to_string();
+    let f_group = q.group.as_deref().unwrap_or("").trim().to_string();
+    let f_upstream = q.upstream.as_deref().unwrap_or("").trim().to_string();
+    let f_model = q.model.as_deref().unwrap_or("").trim().to_string();
+    // 列表按天 / 按月筛选时，图表的横轴也要跟着按天 / 按月。
+    let since = if !f_day.is_empty() {
+        local_day_start_ts(&f_day).unwrap_or(since)
+    } else if !f_month.is_empty() {
+        local_month_start_ts(&f_month).unwrap_or(since)
+    } else {
+        since
+    };
     let span = (now_ts - since).max(60.0);
     let bucket_secs = q.bucket.unwrap_or_else(|| auto_bucket(span)).max(60);
-    let cache_key = format!("series|{}|{}|{}", range, q.hours.unwrap_or(0.0), bucket_secs);
+    let cache_key = format!(
+        "series|{scope}|{range}|{}|{bucket_secs}|{}|{}|{}|{}|{}|{}|{}",
+        q.hours.unwrap_or(0.0),
+        q.metric.clone().unwrap_or_default(),
+        q.route.clone().unwrap_or_default(),
+        f_day,
+        f_month,
+        f_group,
+        f_upstream,
+        f_model
+    );
     if let Some(v) = super::collector::get(&cache_key, 8) {
         return Json(v).into_response();
     }
-    // 对齐到桶边界，图表的 x 轴刻度更自然。
-    let start = (since / bucket_secs as f64).floor() * bucket_secs as f64;
+    if scope == "all" {
+        let port = {
+            let p = state.port.load(std::sync::atomic::Ordering::Relaxed);
+            if p == 0 {
+                8010
+            } else {
+                p
+            }
+        };
+        let mut out = super::sessions::session_series(
+            port,
+            (since * 1000.0) as i64,
+            bucket_secs,
+            super::sessions::route_filter(q.route.as_deref()),
+            super::sessions::metric_mode(q.metric.as_deref()),
+            &f_day,
+            &f_month,
+            &f_group,
+            &f_upstream,
+            &f_model,
+        );
+        if let Some(obj) = out.as_object_mut() {
+            obj.insert("range".into(), json!(range_label));
+            obj.insert("since".into(), json!(since));
+            // 图表跟着列表的「某天 / 某月」筛选时，标题要写清楚是哪一天，
+            // 不能笼统地显示「全部历史」。
+            obj.insert("day".into(), json!(f_day));
+            obj.insert("month".into(), json!(f_month));
+        }
+        super::collector::put(cache_key, out.clone());
+        return Json(out).into_response();
+    }
+    // 对齐到桶边界，图表的 x 轴刻度更自然；再按本机时区回正（本机零点对应的
+    // UTC 秒要先把偏移加回去再取整），否则桶宽 >= 1 天时整条轴会偏一个时区。
+    let tz_offset = chrono::Local::now().offset().local_minus_utc() as f64;
+    let start =
+        ((since + tz_offset) / bucket_secs as f64).floor() * bucket_secs as f64 - tz_offset;
     let count = (((now_ts - start) / bucket_secs as f64).ceil() as usize + 1).clamp(1, 240);
 
     let mut buckets: Vec<Bucket> = (0..count)
@@ -195,6 +290,53 @@ pub async fn series(State(state): State<Arc<AppState>>, Query(q): Query<SeriesQu
         let at = e.get("at").and_then(|v| v.as_f64()).unwrap_or(0.0);
         if at <= 0.0 || at < since {
             continue;
+        }
+        if !f_day.is_empty() || !f_month.is_empty() {
+            let d = match chrono::DateTime::from_timestamp(at as i64, 0) {
+                Some(dt) => dt.with_timezone(&chrono::Local).format("%Y-%m-%d").to_string(),
+                None => String::new(),
+            };
+            if !f_day.is_empty() && d != f_day {
+                continue;
+            }
+            if f_day.is_empty() && !f_month.is_empty() && !d.starts_with(&f_month) {
+                continue;
+            }
+        }
+        // 分组看 model 字段；上游/模型还要能命中 trail 里的实际尝试
+        // （重试换过上游的那一轮也该算在换过去的那个上游名下）。
+        if !f_group.is_empty() && e.get("model").and_then(|v| v.as_str()).unwrap_or("") != f_group {
+            continue;
+        }
+        if !f_upstream.is_empty() {
+            let hit = e.get("upstream").and_then(|v| v.as_str()) == Some(f_upstream.as_str())
+                || e
+                    .get("trail")
+                    .and_then(|v| v.as_array())
+                    .map(|a| {
+                        a.iter().any(|s| {
+                            s.get("upstream").and_then(|v| v.as_str()) == Some(f_upstream.as_str())
+                        })
+                    })
+                    .unwrap_or(false);
+            if !hit {
+                continue;
+            }
+        }
+        if !f_model.is_empty() {
+            let hit = e.get("effective_model").and_then(|v| v.as_str()) == Some(f_model.as_str())
+                || e
+                    .get("trail")
+                    .and_then(|v| v.as_array())
+                    .map(|a| {
+                        a.iter().any(|s| {
+                            s.get("model").and_then(|v| v.as_str()) == Some(f_model.as_str())
+                        })
+                    })
+                    .unwrap_or(false);
+            if !hit {
+                continue;
+            }
         }
         earliest = earliest.min(at);
         latest = latest.max(at);
@@ -353,6 +495,8 @@ pub async fn series(State(state): State<Arc<AppState>>, Query(q): Query<SeriesQu
 
     let out = json!({
         "ok": true,
+        "scope": "router",
+        "failed_known": true,
         "generated_at": now.format("%Y-%m-%d %H:%M:%S").to_string(),
         "range": range_label,
         "since": since,
