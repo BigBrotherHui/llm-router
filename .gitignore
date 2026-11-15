@@ -35,3 +35,9 @@ desktop/dist/
 # relay/node_modules
 relay/node_modules/
 relay/client/node_modules/
+
+# debug runtime artifacts: captured wire bodies contain plaintext prompts
+logs/
+tools/debug/_capture_bodies*
+tools/debug/_cap_bodies*
+

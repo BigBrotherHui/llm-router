@@ -1,0 +1,29 @@
+# Overlay for `dsh --profile headless --patch`: route the default model through a
+# local logging proxy that forwards to llm-router, so the exact wire body DSH
+# sends is captured.
+- id: agent-default-model
+  config:
+    provider: probe
+    model: deepseek
+    reasoningEffort: max
+- id: llm-pi-ai
+  config:
+    providers:
+      probe:
+        displayName: Probe
+        apiKeyEnv: LLM_ROUTER_KEY
+        api: openai-completions
+        baseURL: http://127.0.0.1:8321/v1
+        models:
+          - id: deepseek
+            name: deepseek probe
+            contextWindow: 1000000
+            maxTokens: 131072
+            input: [text, image]
+            reasoningEfforts:
+              "off": none
+              low: low
+              medium: medium
+              high: high
+              xhigh: xhigh
+              max: max
