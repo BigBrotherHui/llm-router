@@ -85,9 +85,9 @@
         </select>
         <select id="sideMetric" style="font-size:12px;padding:5px 8px"
               title="首字 / 耗时口径，与设置页联动">
-          <option value="happycoding" selected>口径：happycoding</option>
+          <option value="newapi" selected>口径：New API</option>
           <option value="magpie">口径：Magpie</option>
-          <option value="dsh">口径：DSH 会话</option>
+          <option value="current">口径：当前计时</option>
         </select>
         <span class="hint" id="sideMetricNote" style="font-size:11.5px"></span>
         <select id="sideDay" style="font-size:12px;padding:5px 8px"
@@ -702,16 +702,16 @@
         <h2>首字与耗时口径</h2>
         <div class="hint" style="margin:-6px 0 12px">
           三家面板对「首字」和「总耗时」的掐表位置不一样，同一个请求会得到三个数。这里选一套口径，
-          「请求记录」里的首字、总耗时与 TPS 会按它重算（原始会话记录不动，只换算法）。
-          本机路由流水是转发时实测写入的，健康看板按那份原始数据统计，不参与换算。
+          「请求记录」的首字/总耗时/TPS、「健康看板」的总耗时 P50/P95 与首字 P50、「缓存账本」的总耗时分位数
+          都按它重算（原始会话记录与流水不动，只换算法）。三个页面读同一个开关，所以同一时刻三处数字对得上。
         </div>
         <div class="row" style="gap:10px;align-items:flex-end;flex-wrap:wrap">
           <label class="cap-cell" style="max-width:260px">
             <span class="cap-k">计算口径</span>
             <select id="timingMode" style="font-size:13px">
-              <option value="happycoding">happycoding（New API）· 默认</option>
+              <option value="newapi">New API · 默认</option>
               <option value="magpie">Magpie</option>
-              <option value="dsh">DSH 会话（当前方案）</option>
+              <option value="current">当前计时</option>
             </select>
           </label>
           <span class="hint" id="timingStatus"></span>
@@ -722,31 +722,31 @@
           <thead><tr><th>口径</th><th>首字怎么算</th><th>耗时怎么算</th><th>已知偏差</th></tr></thead>
           <tbody>
             <tr>
-              <td><b>happycoding</b><br><span class="hint">New API</span></td>
-              <td>第一个 SSE <code>data:</code> 帧到达（含 <code>role</code> 空帧 / <code>block-start</code> 这类不带内容的帧），从网关开始处理请求算起</td>
-              <td>网关开始处理 → 响应写回完成，<b>截断到整秒</b>（<code>Unix()</code> 秒差）</td>
-              <td>起点在读完请求体、选完渠道之后，前面的排队与上传不计入，所以数字最小</td>
+              <td><b>New API</b><br><span class="hint">one-api / new-api 系面板</span></td>
+              <td>第一个 SSE <code>data:</code> 帧（含 <code>role</code> / <code>block-start</code> 这类不带内容的帧），从网关读完请求体、选完渠道开始算</td>
+              <td>网关开始处理 → 写回完成，<b>向下取整到整秒</b>（<code>Unix()</code> 秒差）</td>
+              <td>会话记录里没有 New API 的计时，所以用 Magpie 网关的账本反推：<code>首字 = ttft_ms − sent_ms − own_ms</code>，再把总耗时按整秒截断（实测算术误差中位 2&nbsp;ms）；拿不到网关数据的轮次退回 <code>request/header</code>，再没有才用 <code>step/start</code></td>
             </tr>
             <tr>
-              <td><b>magpie</b><br><span class="hint">本地网关 3425</span></td>
+              <td><b>Magpie</b><br><span class="hint">本地网关 3425</span></td>
               <td>上游第一个<b>有内容</b>的字节（跳过空帧），网关从收到请求头开始算，含把请求体传给上游的时间</td>
               <td>首字 + 纯解码段，到最后一个字节，毫秒精度</td>
-              <td>会话记录里没有「网关收包」时刻：按<b>会话 + 输入/输出/缓存读 token</b>去 Magpie 用量日志对账，对上直接取它的 <code>ttft_ms</code> / <code>ms</code>（实测误差 0 ms）；对不上的回退到 DSH <code>request/header</code> 时刻，再没有就退回 step 口径</td>
+              <td>按<b>会话 + 输入/输出/缓存读 token</b>去 Magpie 用量日志对账，对上直接取它的 <code>ttft_ms</code> / <code>ms</code>（实测误差 0 ms）；对不上回退到 <code>request/header</code> 推算，再没有就退回 step 口径</td>
             </tr>
             <tr>
-              <td><b>dsh</b><br><span class="hint">会话记录</span></td>
+              <td><b>当前计时</b><br><span class="hint">本程序原先的算法</span></td>
               <td>第一个流帧到达，从 <code>step/start</code> 算起</td>
               <td><code>step/start</code> → <code>assistant/message</code> 落盘，毫秒精度</td>
-              <td>含 DSH 自己序列化请求体的时间（实测中位 +1.8 秒），所以数字最大</td>
+              <td>含 DSH 自己序列化请求体的时间（实测中位 +1.8 秒），所以数字最大；好处是不依赖任何外部日志，永远有值</td>
             </tr>
           </tbody>
         </table>
         </div>
         <div class="hint" style="margin-top:8px">
           三套口径都从 DSH 会话里的同一批时间戳换算，原始记录不改：
-          happycoding = 首帧 + 整秒截断；magpie = Magpie 网关实测（对不上时用 <code>request/header</code> 时刻推算）；dsh = 首帧 + 到消息落盘。
-          起点都是 <code>step/start</code>；magpie 口径会读 <code>GET /v1/magpie/usage/requests</code>（本机没开 Magpie 时自动回退），
-          请求页右上角会显示「网关实测 N / M 轮」，展开单条请求还能看到这条记录用的是哪套时间。
+          <b>New API</b> = 网关 ttft 减去网关上传与自身开销、总耗时整秒截断；<b>Magpie</b> = 网关实测 ttft/ms（对不上时用 <code>request/header</code> 推算）；<b>当前计时</b> = 首帧 + 到最后一个流帧。
+          第一档与第二档都会读 <code>GET /v1/magpie/usage/requests</code>（本机没开 Magpie 时自动回退），
+          请求页工具栏会显示「网关实测 N / M 轮」，展开单条请求还能看到这条记录用的是哪套时间。
         </div>
       </div>
 

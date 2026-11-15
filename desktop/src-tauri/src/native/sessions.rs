@@ -40,8 +40,24 @@ static LAST_ROUND_CACHE: OnceLock<Mutex<Option<(Instant, Value)>>> = OnceLock::n
 /// 我们的会话记录里没有「网关收包」时刻，只能靠它把 magpie 口径对齐到面板上的数。
 struct MagpieSnap {
     at: Instant,
-    map: HashMap<String, (f64, f64)>,
+    map: HashMap<String, MagpieHit>,
 }
+
+/// 一轮请求在 Magpie 网关侧的实测值（全部毫秒）。
+/// `sent`/`own` 用来把起点从「网关收到请求头」推到「网关读完请求体」，
+/// 也就是 New API 系面板开始计时的那一刻。
+#[derive(Clone, Copy, Default)]
+pub struct MagpieHit {
+    ttft: f64,
+    ms: f64,
+    sent: f64,
+    own: f64,
+    /// 网关收到请求的绝对时刻（epoch ms）。有了它就不必依赖 DSH 的 request/header 事件
+    /// （那条事件只在配置变更时才写，绝大多数轮次没有），New API 口径直接用网关收包时刻当锚点。
+    at_ms: i64,
+}
+/// 快照保鲜时间：与采集器预热节奏（10s）对齐。
+const MAGPIE_TTL_SECS: u64 = 10;
 static MAGPIE_SNAP: OnceLock<Mutex<Option<MagpieSnap>>> = OnceLock::new();
 static MAGPIE_BUSY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
@@ -105,7 +121,7 @@ fn refresh_magpie() {
     if all.is_empty() {
         return;
     }
-    let mut map: HashMap<String, (f64, f64)> = HashMap::new();
+    let mut map: HashMap<String, MagpieHit> = HashMap::new();
     for r in all.iter() {
         let input = r.get("in").and_then(|x| x.as_u64());
         let output = r.get("out").and_then(|x| x.as_u64());
@@ -114,9 +130,21 @@ fn refresh_magpie() {
         let ms = r.get("ms").and_then(|x| x.as_f64());
         if let (Some(i), Some(o), Some(t), Some(m)) = (input, output, ttft, ms) {
             if o > 0 {
-                map.insert(magpie_key(i, o, cache_read), (t, m));
+                let hit = MagpieHit {
+                    ttft: t,
+                    ms: m,
+                    sent: r.get("sent_ms").and_then(|x| x.as_f64()).unwrap_or(0.0),
+                    own: r.get("own_ms").and_then(|x| x.as_f64()).unwrap_or(0.0),
+                    at_ms: r
+                        .get("t")
+                        .and_then(|x| x.as_str())
+                        .and_then(|x| chrono::DateTime::parse_from_rfc3339(x).ok())
+                        .map(|d| d.timestamp_millis())
+                        .unwrap_or(0),
+                };
+                map.insert(magpie_key(i, o, cache_read), hit);
                 if let Some(sid) = r.get("session").and_then(|x| x.as_str()) {
-                    map.insert(format!("{sid}|{}", magpie_key(i, o, cache_read)), (t, m));
+                    map.insert(format!("{sid}|{}", magpie_key(i, o, cache_read)), hit);
                 }
             }
         }
@@ -132,12 +160,12 @@ fn refresh_magpie() {
 }
 
 /// 返回 Magpie 实测值快照；过期就在后台线程刷一次（本机网关没开时返回空表，不报错）。
-pub fn magpie_offsets() -> HashMap<String, (f64, f64)> {
+pub fn magpie_offsets() -> HashMap<String, MagpieHit> {
     let cell = MAGPIE_SNAP.get_or_init(|| Mutex::new(None));
     let stale = {
         match cell.lock() {
             Ok(g) => match g.as_ref() {
-                Some(s) => s.at.elapsed().as_secs() >= 30,
+                Some(s) => s.at.elapsed().as_secs() >= MAGPIE_TTL_SECS,
                 None => true,
             },
             Err(_) => false,
@@ -629,8 +657,8 @@ struct Ctx<'a> {
     since_ms: i64,
     route_filter: u8,
     metric: u8,
-    /// magpie 口径用：网关实测值快照，每次扫描只取一次
-    magpie: HashMap<String, (f64, f64)>,
+    /// magpie / newapi 口径用：网关实测值快照，每次扫描只取一次
+    magpie: HashMap<String, MagpieHit>,
     aggs: &'a mut AggMap,
     sessions: &'a mut SessList,
     records: Option<&'a mut Vec<Value>>,
@@ -645,11 +673,12 @@ pub fn route_filter(v: Option<&str>) -> u8 {
     }
 }
 
-/// 首字 / 耗时口径：0 = happycoding（默认），1 = magpie，2 = dsh（当前方案）
+/// 首字 / 耗时口径：0 = New API（默认），1 = Magpie，2 = 当前计时（DSH step/start）。
+/// 旧值 happycoding / dsh 仍然认，方便已经存在 localStorage 里的选择不失效。
 pub fn metric_mode(v: Option<&str>) -> u8 {
     match v.unwrap_or("").trim().to_ascii_lowercase().as_str() {
-        "magpie" => 1,
-        "dsh" | "step" | "native" | "current" => 2,
+        "magpie" | "mg" => 1,
+        "current" | "now" | "dsh" | "step" | "native" => 2,
         _ => 0,
     }
 }
@@ -668,35 +697,74 @@ impl<'a> Ctx<'a> {
         duration_ms: Option<f64>,
         first_chunk_ms: Option<f64>,
         header_ms: Option<f64>,
+        step_start_ms: Option<i64>,
     ) {
-        // magpie 口径：会话记录里没有「网关收包」时刻，但 Magpie 自己的用量日志有。
-        // 走 Magpie 的请求按 token 指纹（输入 / 输出 / 缓存读）对账，对上就直接用网关实测值。
+        // 会话记录里没有「网关收包」时刻，但 Magpie 自己的用量日志有。
+        // 走 Magpie 的请求按 token 指纹（输入 / 输出 / 缓存读）对账：
+        //   Magpie 口径 → 直接取网关的 ttft_ms / ms
+        //   New API 口径 → 用网关的 sent_ms + own_ms 把起点推到「读完请求体」之后
         let mut duration_ms = duration_ms;
         let mut first_chunk_ms = first_chunk_ms;
         let mut metric_source = "step";
-        if self.metric == 1 && source == "dsh" {
-            if let Some(h) = header_ms {
-                metric_source = "header";
-                if let Some(d) = duration_ms.as_mut() {
-                    *d = (*d - h).max(0.0);
+        let hit = if source == "dsh" && usage[1] > 0 {
+            let key = magpie_key(usage[0], usage[1], usage[2]);
+            self.magpie
+                .get(&format!("{}|{key}", sess.id))
+                .or_else(|| self.magpie.get(&key))
+                .copied()
+        } else {
+            None
+        };
+        match self.metric {
+            1 => {
+                if let Some(h) = header_ms {
+                    metric_source = "header";
+                    if let Some(d) = duration_ms.as_mut() {
+                        *d = (*d - h).max(0.0);
+                    }
+                    if let Some(f) = first_chunk_ms.as_mut() {
+                        *f = (*f - h).max(0.0);
+                    }
                 }
-                if let Some(f) = first_chunk_ms.as_mut() {
-                    *f = (*f - h).max(0.0);
-                }
-            }
-            if usage[1] > 0 {
-                let key = magpie_key(usage[0], usage[1], usage[2]);
-                let hit = self
-                    .magpie
-                    .get(&format!("{}|{key}", sess.id))
-                    .or_else(|| self.magpie.get(&key))
-                    .copied();
-                if let Some((ttft, ms)) = hit {
-                    first_chunk_ms = Some(ttft);
-                    duration_ms = Some(ms);
+                if let Some(g) = hit {
+                    first_chunk_ms = Some(g.ttft);
+                    duration_ms = Some(g.ms);
                     metric_source = "magpie";
                 }
             }
+            0 => {
+                // New API 系（one-api / new-api）的 StartTime 在读完请求体、选完渠道之后才建立，
+                // 所以起点 = DSH 发出请求头（request/header）+ 上传请求体 + 网关自身开销。
+                // 没有 request/header 就只能退回 step/start，数字会偏大，这里如实标成 newapi-step。
+                // 优先级：网关收包时刻（最准，197/197 轮都有）> request/header > step/start。
+                let mut base = 0.0;
+                if let (Some(g), Some(start)) = (hit, step_start_ms) {
+                    if g.at_ms > 0 && g.at_ms >= start {
+                        // 网关收包 → 读完请求体，还要再加上网关自身开销
+                        base = (g.at_ms - start) as f64 + g.sent + g.own;
+                        metric_source = "newapi-gw";
+                    }
+                }
+                if base <= 0.0 {
+                    if let Some(h) = header_ms {
+                        base = h;
+                        metric_source = "newapi-header";
+                    }
+                }
+                if base > 0.0 {
+                    if let Some(f) = first_chunk_ms.as_mut() {
+                        *f = (*f - base).max(0.0);
+                    }
+                    if let Some(d) = duration_ms.as_mut() {
+                        *d = (*d - base).max(0.0);
+                    }
+                }
+                // 面板上的 use_time 是 Unix() 秒差，等价于向下取整到整秒。
+                if let Some(d) = duration_ms.as_mut() {
+                    *d = (*d / 1000.0).floor() * 1000.0;
+                }
+            }
+            _ => {}
         }
         let provider = if provider.trim().is_empty() {
             "(未记录)"
@@ -965,7 +1033,7 @@ pub fn session_cache_ledger(port: u16, since_ms: i64, route: u8, metric: u8) -> 
     {
         let mut ctx = Ctx {
             bases: &bases, port, since_ms, route_filter: route, metric,
-            magpie: if metric == 1 { magpie_offsets() } else { HashMap::new() },
+            magpie: if metric <= 1 { magpie_offsets() } else { HashMap::new() },
             aggs: &mut aggs, sessions: &mut sessions, records: None,
         };
         let mut st = blank_stat("dsh", "DeepSeek Harness");
@@ -1044,7 +1112,7 @@ pub fn session_records(port: u16, since_ms: i64, route: u8, metric: u8, day: &st
     {
         let mut ctx = Ctx {
             bases: &bases, port, since_ms, route_filter: route, metric,
-            magpie: if metric == 1 { magpie_offsets() } else { HashMap::new() },
+            magpie: if metric <= 1 { magpie_offsets() } else { HashMap::new() },
             aggs: &mut aggs, sessions: &mut sessions, records: Some(&mut records),
         };
         let mut st = blank_stat("dsh", "DeepSeek Harness");
@@ -1135,13 +1203,17 @@ pub fn session_records(port: u16, since_ms: i64, route: u8, metric: u8, day: &st
         match r.get("metric_source").and_then(|v| v.as_str()) {
             Some("magpie") => magpie_hits += 1,
             Some("header") => header_hits += 1,
+            // New API 口径：起点由网关的 sent_ms/own_ms 推出来的算「网关对账」，
+            // 只靠 request/header 的算「按请求头推算」。
+            Some("newapi-gw") => magpie_hits += 1,
+            Some("newapi-header") => header_hits += 1,
             _ => {}
         }
     }
     let metric_label = match metric {
         1 => "magpie",
-        2 => "dsh",
-        _ => "happycoding",
+        2 => "current",
+        _ => "newapi",
     };
     let rounds_total = records.len();
     let entries: Vec<Value> = records.into_iter().skip(offset).take(limit).collect();
@@ -1520,9 +1592,10 @@ fn scan_dsh(ctx: &mut Ctx, home: &Path, st: &mut SrcStat) {
                     .min()
             });
             let end_time = stream.and_then(|arr| arr.iter().filter_map(|x| x.get("time").and_then(|t| t.as_i64())).max());
-            // 口径 0 = happycoding（New API）：首字取第一个 SSE 帧，耗时向下取整到整秒
-            // 口径 1 = magpie：首字取第一个有内容的块，耗时到最后一个字节
-            // 口径 2 = dsh（当前）：首字取第一个流帧，耗时到 assistant/message
+            // 三种口径各取所需，这里只给「相对 step/start 的原始毫秒」，扣起点与取整都在 Ctx::round 里做：
+            //   0 = New API      首字取第一个 SSE 帧（含空帧），耗时到最后一个字节
+            //   1 = Magpie       首字取第一个有内容的块，耗时到最后一个字节
+            //   2 = 当前计时     首字取第一个流帧，耗时到 assistant/message 落盘
             let (first_chunk, duration) = match start {
                 Some(start) if at > start => match ctx.metric {
                     1 => (
@@ -1535,7 +1608,10 @@ fn scan_dsh(ctx: &mut Ctx, home: &Path, st: &mut SrcStat) {
                     ),
                     _ => (
                         frame_time.filter(|t| *t >= start).map(|t| (t - start) as f64),
-                        Some((((at - start) as f64) / 1000.0).floor() * 1000.0),
+                        end_time
+                            .filter(|t| *t > start)
+                            .map(|t| (t - start) as f64)
+                            .or_else(|| Some((at - start) as f64)),
                     ),
                 },
                 _ => (None, None),
@@ -1555,7 +1631,7 @@ fn scan_dsh(ctx: &mut Ctx, home: &Path, st: &mut SrcStat) {
                 pick_num(&u, &["cacheWriteTokens", "cache_write"]),
                 pick_num(&u, &["totalTokens", "total"]),
             ];
-            ctx.round("dsh", "DeepSeek Harness", &mut sess, provider, model, at, usage, duration, first_chunk, header_ms);
+            ctx.round("dsh", "DeepSeek Harness", &mut sess, provider, model, at, usage, duration, first_chunk, header_ms, start);
         }
         if read >= FILE_CAP {
             st.truncated = true;
@@ -1658,7 +1734,7 @@ fn scan_claude(ctx: &mut Ctx, home: &Path, st: &mut SrcStat) {
                     .and_then(|x| x.as_str())
                     .filter(|s| !s.is_empty())
                     .unwrap_or("anthropic");
-                ctx.round("claude", "Claude Code", &mut sess, provider, model, at, usage, None, None, None);
+                ctx.round("claude", "Claude Code", &mut sess, provider, model, at, usage, None, None, None, None);
             }
         });
         st.bytes += n;
@@ -1778,7 +1854,7 @@ fn scan_pi(ctx: &mut Ctx, home: &Path, st: &mut SrcStat) {
                 pick_num(&u, &["cacheWrite"]),
                 pick_num(&u, &["totalTokens", "total"]),
             ];
-            ctx.round("pi", "Pi", &mut sess, &provider, model, at, usage, None, None, None);
+            ctx.round("pi", "Pi", &mut sess, &provider, model, at, usage, None, None, None, None);
         });
         st.bytes += n;
         if n >= FILE_CAP {
@@ -1898,7 +1974,7 @@ fn scan_codex(ctx: &mut Ctx, home: &Path, st: &mut SrcStat) {
                     } else {
                         meta_provider.as_str()
                     };
-                    ctx.round("codex", "Codex", &mut sess, provider, &cur_model, at, usage, None, None, None);
+                    ctx.round("codex", "Codex", &mut sess, provider, &cur_model, at, usage, None, None, None, None);
                 }
                 _ => {}
             }

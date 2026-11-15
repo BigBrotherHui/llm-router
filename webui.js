@@ -2536,11 +2536,11 @@ function renderSide() {
     if (!allScope || !mm) {
       metricNote.textContent = "";
       metricNote.title = "";
-    } else if (mm.mode !== "magpie") {
-      metricNote.textContent = mm.mode === "dsh" ? "DSH 会话计时" : "happycoding 口径";
-      metricNote.title = TIMING_TEXT[mm.mode] || "";
+    } else if (mm.mode !== "magpie" && mm.mode !== "newapi") {
+      metricNote.textContent = timingName(mm.mode) + " 口径";
+      metricNote.title = TIMING_TEXT[normalizeTiming(mm.mode)] || "";
     } else if (mm.magpie_available === false) {
-      metricNote.textContent = "Magpie 未在运行，已回退";
+      metricNote.textContent = timingName(mm.mode) + " · Magpie 未运行，已回退";
       metricNote.title = "没读到 Magpie 网关的用量日志，这些轮按 request/header 时刻推算";
     } else {
       const denom = mm.via_magpie != null ? mm.via_magpie : mm.rounds;
@@ -2740,7 +2740,7 @@ function renderSide() {
           <div class="hint" style="line-height:1.8">
             总耗时：<code>${fmtLat(h.elapsed_seconds)}</code>（从收到请求到响应结束，含上游重试与流式输出全过程）<br>
             首字延迟：<code>${h.first_chunk_seconds != null ? fmtLat(h.first_chunk_seconds) : "—"}</code>（首个内容块到达，只有新版本流式流水才有）<br>
-            ${h.metric_source ? `计时来源：<code>${{ magpie: "Magpie 网关用量日志", header: "DSH request/header 时刻", step: "DSH step/start" }[h.metric_source] || esc(h.metric_source)}</code><br>` : ""}
+            ${h.metric_source ? `计时来源：<code>${{ magpie: "Magpie 网关用量日志", header: "DSH request/header 时刻", step: "DSH step/start", "newapi-gw": "New API：请求头 + 网关上传/自身开销", "newapi-header": "New API：仅按 request/header 推算" }[h.metric_source] || esc(h.metric_source)}</code><br>` : ""}
             request/header：<code>${h.request_header_seconds != null ? fmtLat(h.request_header_seconds) : "—"}</code>（DSH 写请求头的时刻，相对 step/start；DSH 只在配置变更时才写这条事件，所以大多数轮没有）<br>
             有效内容块：<code>${h.chunks != null ? fmtCount(h.chunks) : "—"}</code>　·　请求方式：<code>${h.stream ? "流式" : "非流式"}</code><br>
              ${tpsDetail(h)}
@@ -4082,16 +4082,23 @@ let refreshTimer = null;
 let refreshDelay = 5000;
 let refreshing = false;
 
-// 首字 / 耗时口径：happycoding（默认）/ magpie / dsh。
+// 首字 / 耗时口径：newapi（默认，New API）/ magpie / current（当前计时）。
 // 后端按这个参数换算法重算，不改原始时间戳。
 const TIMING_TEXT = {
-  happycoding: "happycoding（New API）：首字=第一个 SSE 帧（含空帧），耗时=开始处理→写回完成并截断到整秒；起点在读完请求体之后，数字最小。",
-  magpie: "Magpie：首字=上游第一个有内容的字节（跳过空帧），耗时=到最后一个字节，毫秒精度；会话记录里没有「网关收包」时刻，所以按会话 + token 指纹去 Magpie 自己的用量日志里对账，对上的直接用它的 ttft_ms / ms，对不上的回退到 DSH request/header 时刻。",
-  dsh: "DSH 会话（当前）：首字=第一个流帧（从 step/start 算起），耗时=step/start→assistant/message 落盘，毫秒精度；含 DSH 序列化时间（实测中位比网关多 1.8 秒）。",
+  newapi: "New API：首字=第一个 SSE 帧（含空帧），起点在网关读完请求体之后；耗时=开始处理→写回完成并向下取整到整秒。会话记录里用 request/header + Magpie 的 sent_ms/own_ms 把起点推到那一刻。",
+  magpie: "Magpie：首字=上游第一个有内容的字节（跳过空帧），网关从收到请求头开始算、含上传请求体时间；耗时=到最后一个字节，毫秒精度。按会话 + token 指纹去 Magpie 用量日志对账，对上的直接用它的 ttft_ms / ms。",
+  current: "当前计时：首字=第一个流帧（从 step/start 算起），耗时=step/start→assistant/message 落盘，毫秒精度。含 DSH 序列化时间（实测中位比网关多 1.8 秒），但永远有值。",
 };
+const TIMING_NAMES = { newapi: "New API", magpie: "Magpie", current: "当前计时" };
+function timingName(v) { return TIMING_NAMES[v] || TIMING_NAMES.newapi; }
+// 兼容旧值：以前存的是 happycoding / dsh
+function normalizeTiming(v) {
+  if (v === "magpie") return "magpie";
+  if (v === "current" || v === "dsh" || v === "step" || v === "native") return "current";
+  return "newapi";
+}
 function timingMode() {
-  const v = localStorage.getItem(TIMING_KEY);
-  return v === "magpie" || v === "dsh" ? v : "happycoding";
+  return normalizeTiming(localStorage.getItem(TIMING_KEY));
 }
 function applyTimingMode() {
   const v = timingMode();
@@ -4105,7 +4112,7 @@ function applyTimingMode() {
   if (st) st.textContent = "";
 }
 async function saveTimingMode(v) {
-  localStorage.setItem(TIMING_KEY, v === "magpie" || v === "dsh" ? v : "happycoding");
+  localStorage.setItem(TIMING_KEY, normalizeTiming(v));
   applyTimingMode();
   const st = $("#timingStatus");
   if (st) st.textContent = "已切换，正在按新口径重新统计…";
@@ -4118,7 +4125,7 @@ async function saveTimingMode(v) {
   if (curTab === "sessions") await loadSessions();
   await refresh();
   if (st) st.textContent = "已按新口径重算";
-  toast("已切换为 " + timingMode() + " 口径", "ok");
+  toast("已切换为 " + timingName(timingMode()) + " 口径", "ok");
 }
 
 function refreshSeconds() {

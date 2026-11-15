@@ -238,31 +238,38 @@ GET /sessions/bases
 
 ## 首字与耗时口径（可切换）
 
-同一轮调用在 happycoding / Magpie / 我们三处面板上的「首字」和「总耗时」必然不同 —— 三家掐表的起点和终点都不一样。
-设置页新增「首字与耗时口径」卡片，可以三选一，默认 **happycoding**；切换后「请求记录」的首字、总耗时与 TPS、
+同一轮调用在 New API（上游面板）/ Magpie / 本机三处看到的「首字」和「总耗时」必然不同 —— 三家掐表的起点和终点都不一样。
+设置页「首字与耗时口径」卡片三选一，默认 **New API**；切换后「请求记录」的首字、总耗时与 TPS、
 「健康看板」的总耗时 P50/P95 与首字 P50、「缓存账本」的总耗时分位数都按新口径重算，原始会话记录与流水不改。
-口径是页面级开关（存 `localStorage['llm-router-timing-metric']`），三个页面读同一个值，所以同一时刻三处数字互相对得上。
+口径是页面级开关（存 `localStorage['llm-router-timing-metric']`，兼容旧值），三个页面读同一个值，所以同一时刻三处数字互相对得上。
 
-| 口径 | 首字 | 总耗时 | 已知偏差 |
-|---|---|---|---|
-| `happycoding`（默认，New API） | 第一个 SSE `data:` 帧（含 `role` 空帧 / `block-start`），网关开始处理请求算起 | 开始处理 → 写回完成，**截断到整秒** | 起点在读完请求体、选完渠道之后，排队与上传不计入，所以数字最小 |
-| `magpie` | 上游第一个**有内容**的字节（跳过空帧），网关收到请求头算起，含上传请求体时间 | 首字 + 纯解码段，到最后一个字节 | 会话记录里没有「网关收包」时刻：先按**会话 + 输入/输出/缓存读 token** 去 Magpie 用量日志对账，对上直接用网关实测 `ttft_ms` / `ms`（实测误差 0 ms）；对不上的回退到 DSH `request/header` 时刻，再没有就用 step 口径 |
-| `dsh` | 第一个流帧，`step/start` 算起 | `step/start` → `assistant/message` 落盘 | 含 DSH 自己序列化请求体的时间（实测中位比网关多约 1.8 秒），数字最大 |
+| 口径 | 起点 | 首字 | 总耗时 | 实测首字中位（今天 210 轮）|
+|---|---|---|---|---|
+| `newapi`（默认，New API）| 网关读完请求体、开始处理 | 第一个 SSE `data:` 帧（含 `role` 空帧）| 到写回完成，**截断到整秒**（`Unix()` 秒差）| **5.110 s** |
+| `magpie` | 网关收到请求头 | 上游第一个**有内容**的字节（跳过空帧）| 到最后一个字节 | **5.918 s** |
+| `current`（当前计时）| DSH `step/start`（请求体还没序列化）| 会话里第一个流帧 | `step/start` → 最后一个流帧 | **7.857 s** |
 
-三套口径都从 DSH 会话里的同一批时间戳换算，差别在「哪一帧算首字」和「算到哪一帧」。
-各面板与我们的起点差异（DSH 本地序列化、happycoding 读完请求体才计时）无法从会话文件还原，
-所以 `magpie` 口径改为**直接和 Magpie 网关对账**：
+三者是层层扣减的关系：`当前计时` 减掉 DSH 序列化 + 上传（中位约 1.8 s）得 `Magpie`，再减掉网关收包前的排队与网关自身开销得 `New API`。
 
-- Magpie 的 `GET /v1/magpie/usage/requests`（`Authorization: Bearer magpie`）记录每轮的
-  `ttft_ms`（网关收到请求头 → 上游第一个有内容的字节）与 `ms`（到最后一个字节）。
-- 后端每 30 秒在后台线程拉一次（最多 500 条），用「会话 id + 输入 / 输出 / 缓存读 token」
-  做指纹，对上的轮直接写网关实测值；本机没开 Magpie 时自动跳过，不影响其它口径。
-- DSH 的 `request/header`（写请求头的时刻，不带 turn/step，按最近一次 `step/start` 归属）
-  也一并落进每条记录：`request_header_seconds`。它是「网关收包」的本地近似，
-  对账失败时用它把 DSH 本地准备时间扣掉。
-- 每条记录带 `metric_source`：`magpie`（网关实测）/ `header`（按 request/header 推算）/
-  `step`（原始 step/start 口径）。请求页右上角显示「网关实测 N / M 轮」，展开单条请求能看到
-  这条记录用的是哪种时间。
+`New API` 口径怎么算出来的 —— 本机拿不到 New API 的计时，只有 Magpie 网关的账本，所以反推：
+
+- `首字 = 网关 ttft_ms − sent_ms − own_ms`；`总耗时 = (网关 ms − sent_ms − own_ms)` 再按 `floor(Unix 秒差)` 截断到整秒。
+- 实测 197 轮与网关字段的算术误差 **中位 2 ms、最大 12 ms**；总耗时因整秒截断比网关值平均少 0.55 s（这正是 New API `use_time` 的行为）。
+
+`Magpie` 口径的取值：
+
+- 先用「会话 id + 输入 / 输出 / 缓存读 token」指纹去 `GET http://127.0.0.1:3425/v1/magpie/usage/requests`
+  （`Authorization: Bearer magpie`）对账，对上直接用网关实测 `ttft_ms` / `ms`（实测误差 0 ms）。
+- 后端 30 秒过期、每页 500 条最多 8 页，在后台线程分页拉取；本机没开 Magpie 时不参与，其它口径不受影响。
+
+`current`（当前计时）口径完全来自会话文件，不需要网关：
+
+- 起点是 DSH 的 `step/start`，含 DSH 自己序列化请求体的时间，所以数字最大。
+- DSH 的 `request/header`（写请求头的时刻，不带 turn/step，按最近一次 `step/start` 归属）也落进每条记录的
+  `request_header_seconds`；但它只在配置变更时才写（全库 61 / 4415 条），所以只作为 `New API` 口径的兜底锚点。
+
+每条记录带 `metric_source`：`newapi-gw`（网关反推）/ `newapi-header`（按 request/header 推算）/ `magpie`（网关实测）/
+`header` / `step`（原始 step/start 口径）。请求页工具栏显示「网关实测 N / M 轮」，展开单条请求能看到这条记录用的是哪种时间。
 
 本机路由流水的时间是转发时实测写入的，不参与换算（它本来就是线上掐表）；但当窗口里既有本机路由又有外部会话时，
 健康看板会优先用本机流水的分位数，本机流水为空的窗口才回填外部会话算出的分位数。
@@ -271,8 +278,9 @@ GET /sessions/bases
 所以「全部 Agent 会话」窗口里健康看板把成功 / 失败 / 成功率显示为 `—` 并注明「外部 Agent 会话记录不含失败信息」，
 不伪造成 100%。上游图表在这种情况下改成按调用量画（标题会写「上游调用量 Top 10（外部会话没有成功率）」）。
 
-接口参数：`GET /sessions/records?metric=happycoding|magpie|dsh`、`GET /sessions/scan?metric=...`；
-返回里带 `metric: {mode, rounds, magpie, header, magpie_available}`，说明这个窗口里多少轮真的取到了网关实测值。
+接口参数：`GET /sessions/records?metric=newapi|magpie|current`（旧值 `happycoding`→`newapi`、`dsh`→`current` 仍兼容）、
+`GET /sessions/scan?metric=...`、`GET /health/upstreams?metric=...`、`GET /stats/cache-ledger?metric=...`；
+返回里带 `metric: {mode, rounds, magpie, header, via_magpie, magpie_available}`，说明这个窗口里多少轮真的取到了网关反推/实测值。
 桌面端与浏览器各自的设置在 localStorage（`llm-router-timing-metric`），请求页工具条上也有同一个下拉可快捷切换。
 
 ## 图表与 MCP 工具排行榜
