@@ -265,6 +265,23 @@ GET /sessions/bases
   取整前的实测值一并显示：`总耗时 2.00 s（实测 2.33 s）`，并加一枚 `首字 > 总耗时` 徽标（悬浮看解释）；
   请求详情里的「耗时」段也会列出实测值。接口字段是 `elapsed_raw_seconds`（未取整的秒）。
 
+### 耗时着色（绿 / 黄 / 红）
+
+请求列表的「首字」「总耗时」和 TPS 徽标都按耗时消耗上色，分档直接沿用 New API 用量日志面板的判定
+（`web/src/features/usage-logs/lib/format.ts`，组件 `timing-metrics-cell.tsx`）：
+
+| 指标 | 绿 | 黄 | 红 |
+| --- | --- | --- | --- |
+| 首字（`getFirstResponseTimeColor`） | < 5 s | 5–10 s | ≥ 10 s |
+| 总耗时（输出 ≥ 100 tok，`getThroughputColor`） | ≥ 30 tok/s | 15–30 tok/s | < 15 tok/s |
+| 总耗时（输出 < 100 tok，`getTimeColor`） | < 10 s | 10–30 s | ≥ 30 s |
+| TPS 徽标（`getThroughputColor`） | ≥ 30 tok/s | 15–30 tok/s | < 15 tok/s |
+
+列表每行左侧还有一根 3px 双色竖条（New API 那个指标条的同款思路）：上段=首字、下段=总耗时，
+不用读数字也能一眼看出这行快不快。鼠标悬浮指标条/数字会显示当前档位和对应阈值。
+Magpie 那边没有公开色阶（只在用量接口里暴露 `speed_min`，默认 100 t/s 才算「快」，以及按模型的
+`tps`/`ttft_ms`），所以这里统一用 New API 的分档，避免两套阈值互相打架。
+
 `Magpie` 口径的取值：
 
 - 先用「会话 id + 时间窗 + 输入 / 输出 / 缓存读 token」两道定位去 `GET http://127.0.0.1:3425/v1/magpie/usage/requests`

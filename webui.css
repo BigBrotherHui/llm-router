@@ -798,3 +798,24 @@
 #timingCard .timing-table td:nth-child(3){width:26%}
 #timingCard .timing-table td:nth-child(4){width:22%;color:#a9bcd4}
 #timingCard .timing-table code{font-size:11.5px;padding:1px 5px;border-radius:5px;background:rgba(120,170,255,.12);color:#bcd8ff}
+
+/* 首字 / 总耗时按「耗时消耗」着色。分档抄 New API 的面板口径：
+   首字 <5s 绿 / <10s 黄 / >=10s 红；总耗时在输出 >=100 token 时按吞吐
+   （>=30 绿 / >=15 黄 / <15 红），否则按绝对秒（<10 绿 / <30 黄 / >=30 红）。
+   色条是 New API 那个双色竖条的轻量版：上段首字、下段总耗时。 */
+.lat-ok{color:var(--ok)}
+.lat-warn{color:var(--warn)}
+.lat-bad{color:var(--bad)}
+.lat-unknown{color:var(--dim)}
+.lat-group{display:inline-flex;align-items:center;gap:6px}
+.lat-bar{display:inline-flex;flex-direction:column;gap:1px;width:3px;height:20px;flex:0 0 3px}
+.lat-bar > i{display:block;flex:1 1 0;border-radius:2px;background:var(--dim);opacity:.35}
+.lat-bar > i.lat-ok{background:var(--ok);opacity:.9}
+.lat-bar > i.lat-warn{background:var(--warn);opacity:.9}
+.lat-bar > i.lat-bad{background:var(--bad);opacity:.9}
+.lat-bar > i.lat-unknown{background:var(--dim);opacity:.35}
+.lat-dot{display:inline-block;width:6px;height:6px;border-radius:50%;margin-right:4px;vertical-align:1px;background:currentColor;opacity:.85}
+.badge.lat-ok{color:var(--ok);border-color:#1d4029}
+.badge.lat-warn{color:var(--warn);border-color:#4a3c14}
+.badge.lat-bad{color:var(--bad);border-color:#4a2020}
+
