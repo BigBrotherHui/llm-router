@@ -11,6 +11,12 @@
 //!     （Bing 抓取 + 网页抽取），并在正文之前下发 server_tool_use /
 //!     web_search_tool_result / web_fetch_tool_result 块；正文里的 [n] 角标会转成
 //!     citations_delta（web_search_result_location），客户端因此能渲染来源卡片与角标。
+//!     搜索类别分四档（对应客户端的 ServerToolKind）：search / deep_search / image_search /
+//!     deep_image_search —— 前两档走 Bing 网页结果，后两档走 Bing 图片结果；deep 档会顺带抓
+//!     前几篇正文再交给模型。
+//!   - 多轮网页上下文：web_fetch_tool_result 带上 signature（本网关为可解密的 base64，
+//!     官方是不透明密文）；客户端只在 signature 非空时才会把该块回传到下一轮，网关再解出
+//!     正文拼回上下文 —— 这就是「读过的网页在下一轮还记得」的机制。
 //!   - 附件：image/document（含 file_id）转 OpenAI 多模态部件或内联文本，PDF 在网关侧抽文本。
 
 use std::collections::HashMap;
@@ -21,6 +27,8 @@ use axum::body::{to_bytes, Body, Bytes};
 use axum::extract::State;
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
+use base64::engine::general_purpose::STANDARD;
+use base64::Engine as _;
 use futures_util::StreamExt;
 use serde_json::{json, Value};
 use uuid::Uuid;
@@ -389,9 +397,75 @@ impl WebContext {
     }
 }
 
-/// 声明了哪些服务端工具：(需要联网搜索, 需要读链接)。
-fn server_tool_intent(req: &Value) -> (bool, bool) {
-    let mut want_search = false;
+/// 联网搜索的类别（与客户端的 ServerToolKind 对齐：search / deep_search /
+/// image_search / deep_image_search）。前两档抓 Bing 网页结果，后两档抓 Bing 图片结果；
+/// deep* 档额外抓取若干篇正文。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SearchKind {
+    Search,
+    Deep,
+    Image,
+    DeepImage,
+}
+
+impl SearchKind {
+    fn kind_str(self) -> &'static str {
+        match self {
+            SearchKind::Search => "search",
+            SearchKind::Deep => "deep_search",
+            SearchKind::Image => "image_search",
+            SearchKind::DeepImage => "deep_image_search",
+        }
+    }
+
+    /// 写给上游模型看的上下文标题。
+    fn label(self) -> &'static str {
+        match self {
+            SearchKind::Search => "联网搜索结果",
+            SearchKind::Deep => "联网深度搜索结果",
+            SearchKind::Image => "图片搜索结果",
+            SearchKind::DeepImage => "深度图片搜索结果",
+        }
+    }
+
+    /// 类别越具体越优先（客户端同时声明多个服务端工具时）。
+    fn rank(self) -> u8 {
+        match self {
+            SearchKind::Search => 0,
+            SearchKind::Deep => 1,
+            SearchKind::Image => 2,
+            SearchKind::DeepImage => 3,
+        }
+    }
+
+    fn is_image(self) -> bool {
+        matches!(self, SearchKind::Image | SearchKind::DeepImage)
+    }
+
+    /// deep* 档要顺带抓正文。
+    fn wants_pages(self) -> bool {
+        matches!(self, SearchKind::Deep | SearchKind::DeepImage)
+    }
+
+    fn from_env(v: &str) -> Option<Self> {
+        match v.trim().to_ascii_lowercase().as_str() {
+            "search" | "web" => Some(SearchKind::Search),
+            "deep" | "deep_search" => Some(SearchKind::Deep),
+            "image" | "image_search" => Some(SearchKind::Image),
+            "deep_image" | "deep_image_search" => Some(SearchKind::DeepImage),
+            _ => None,
+        }
+    }
+}
+
+/// 声明了哪些服务端工具：(搜索类别, 是否需要读链接)。
+///
+/// 客户端（chat-demo / DeepSeek 官方前端）只声明 `deepseek_web_search` 与
+/// `deepseek_read_url`；deep / image 类别靠更具体的工具名（`*_deep_search`、
+/// `*_image_search`）或环境变量 `LLM_ROUTER_WEB_SEARCH_KIND` 强制指定
+/// （后者让没有客户端配合时也能验证这两条分支）。
+fn server_tool_intent(req: &Value) -> (Option<SearchKind>, bool) {
+    let mut search: Option<SearchKind> = None;
     let mut want_read = false;
     if let Some(arr) = req.get("tools").and_then(|v| v.as_array()) {
         for t in arr {
@@ -405,15 +479,41 @@ fn server_tool_intent(req: &Value) -> (bool, bool) {
                 continue;
             }
             let name = t.get("name").and_then(|x| x.as_str()).unwrap_or("");
-            if name == "deepseek_web_search" || name.starts_with("web_search") {
-                want_search = true;
+            let ty = t.get("type").and_then(|x| x.as_str()).unwrap_or("");
+            let tag = format!("{ty} {name}");
+            let hit = if tag.contains("deep_image_search") {
+                Some(SearchKind::DeepImage)
+            } else if tag.contains("image_search") {
+                Some(SearchKind::Image)
+            } else if tag.contains("deep_search") || name == "deepseek_deep_search" {
+                Some(SearchKind::Deep)
+            } else if name == "deepseek_web_search"
+                || name.starts_with("web_search")
+                || ty.starts_with("web_search")
+            {
+                Some(SearchKind::Search)
+            } else {
+                None
+            };
+            if let Some(h) = hit {
+                search = Some(match search {
+                    Some(prev) if prev.rank() >= h.rank() => prev,
+                    _ => h,
+                });
             }
             if name == "deepseek_read_url" || name.starts_with("web_fetch") {
                 want_read = true;
             }
         }
     }
-    (want_search, want_read)
+    if let Ok(v) = std::env::var("LLM_ROUTER_WEB_SEARCH_KIND") {
+        if let Some(forced) = SearchKind::from_env(&v) {
+            if search.is_some() {
+                search = Some(forced);
+            }
+        }
+    }
+    (search, want_read)
 }
 
 /// 最后一轮 user 的纯文本（搜索词与链接识别都基于它）。
@@ -433,10 +533,93 @@ fn last_user_text(req: &Value) -> String {
     String::new()
 }
 
-/// 与官方形状一致的工具调用 id：srvtoolu_{s|rl}_{序号}_{32 位 hex}。
+/// 与官方形状一致的工具调用 id：srvtoolu_{s|ds|rl|is|dis}_{序号}_{32 位 hex}。
 fn server_tool_id(kind: &str) -> String {
-    let tag = if kind == "read_link" { "rl" } else { "s" };
+    let tag = match kind {
+        "read_link" => "rl",
+        "deep_search" => "ds",
+        "image_search" => "is",
+        "deep_image_search" => "dis",
+        _ => "s",
+    };
     format!("srvtoolu_{tag}_1_{}", Uuid::new_v4().simple())
+}
+
+/// 网页签名：官方是不透明密文，本网关用可解密的 base64（客户端只要求「非空即回传」）。
+/// 下一轮客户端把带签名的 web_fetch_tool_result 原样带回来，网关据此把正文拼回上下文。
+const SIGN_PREFIX: &str = "llmrouter:v1:";
+
+fn encode_page_signature(url: &str, body: &str) -> String {
+    let payload = json!({"url": url, "text": body}).to_string();
+    format!("{SIGN_PREFIX}{}", STANDARD.encode(payload.as_bytes()))
+}
+
+fn decode_page_signature(sig: &str) -> Option<(String, String)> {
+    let raw = sig.trim().strip_prefix(SIGN_PREFIX)?;
+    let bytes = STANDARD.decode(raw).ok()?;
+    let v: Value = serde_json::from_slice(&bytes).ok()?;
+    Some((
+        v.get("url")?.as_str()?.to_string(),
+        v.get("text")?.as_str()?.to_string(),
+    ))
+}
+
+/// 历史轮次里已经读过的网页：只有签名（或块内自带的正文）都在时才算数。
+fn restored_pages(req: &Value) -> Vec<(String, String)> {
+    let mut pages: Vec<(String, String)> = Vec::new();
+    let Some(arr) = req.get("messages").and_then(|v| v.as_array()) else {
+        return pages;
+    };
+    for m in arr {
+        for b in content_blocks(m.get("content").unwrap_or(&Value::Null)) {
+            if b.get("type").and_then(|x| x.as_str()) != Some("web_fetch_tool_result") {
+                continue;
+            }
+            let sig = b
+                .get("signature")
+                .and_then(|x| x.as_str())
+                .unwrap_or("")
+                .trim()
+                .to_string();
+            let pair = if !sig.is_empty() {
+                decode_page_signature(&sig)
+            } else {
+                // 没有签名（或不是本网关签的）时，退而求其次：块里若还带着正文就直接用。
+                let c = b.get("content").unwrap_or(&Value::Null);
+                if c.get("type").and_then(|x| x.as_str()) != Some("web_fetch_result") {
+                    None
+                } else {
+                    let url = c.get("url").and_then(|x| x.as_str()).unwrap_or("");
+                    let text = c
+                        .pointer("/content/source/data")
+                        .and_then(|x| x.as_str())
+                        .unwrap_or("");
+                    if url.is_empty() || text.trim().is_empty() {
+                        None
+                    } else {
+                        Some((url.to_string(), text.to_string()))
+                    }
+                }
+            };
+            if let Some((url, text)) = pair {
+                if !url.is_empty() && !text.trim().is_empty() && !pages.iter().any(|(u, _)| *u == url) {
+                    pages.push((url, text));
+                }
+            }
+        }
+    }
+    // 只回填最近 3 篇、总量 4 万字符（历史轮次越多，页面原文越不该无限膨胀上下文）。
+    let mut picked: Vec<(String, String)> = Vec::new();
+    let mut total = 0usize;
+    for (url, text) in pages.iter().rev() {
+        if picked.len() >= 3 || total >= 40_000 {
+            break;
+        }
+        total += text.chars().count();
+        picked.push((url.clone(), text.clone()));
+    }
+    picked.reverse();
+    picked
 }
 
 fn server_tool_use_block(name: &str, kind: &str, input: Value) -> Value {
@@ -450,11 +633,12 @@ fn server_tool_use_block(name: &str, kind: &str, input: Value) -> Value {
     })
 }
 
-fn search_result_block(tool_use_id: &str, content: Value) -> Value {
+/// 搜索结果 -> web_search_result 块的包装（kind 随搜索类别变化）。
+fn search_result_block(tool_use_id: &str, kind: &str, content: Value) -> Value {
     json!({
         "type": "web_search_tool_result",
         "tool_use_id": tool_use_id,
-        "kind": "search",
+        "kind": kind,
         "content": content,
     })
 }
@@ -497,9 +681,13 @@ fn search_query(text: &str) -> String {
         .trim()
         .to_string();
     for p in [
-        "麻烦", "帮我搜一下", "帮我查一下", "帮我搜", "帮我查", "搜索一下", "搜索", "搜一下",
-        "搜一搜", "查一下", "查一查", "查找", "查下", "查询", "找一下", "找找", "看一下",
-        "看看", "告诉我", "请问", "我想知道", "想知道", "了解一下", "了解", "介绍一下",
+        "麻烦", "帮我搜一下", "帮我查一下", "帮我搜", "帮我查", "帮我",
+        // 「深度搜索一下 X」这类动词短语要整段剥掉，否则搜索词里留着动词，Bing 会跑偏
+        "深度搜索一下", "深度搜索", "深入搜索一下", "深入搜索", "仔细搜索一下", "仔细搜索",
+        "详细搜索一下", "详细搜索", "深入了解一下", "深入分析一下", "深入分析",
+        "搜索一下", "搜索", "搜一下", "搜一搜", "查一下", "查一查", "查找", "查下", "查询",
+        "找一下", "找找", "看一下", "看看", "告诉我", "请问", "我想知道", "想知道",
+        "了解一下", "了解", "介绍一下", "讲讲", "说说",
     ] {
         if let Some(rest) = q.strip_prefix(p) {
             q = rest.trim().to_string();
@@ -546,106 +734,182 @@ fn search_query(text: &str) -> String {
     }
 }
 
+/// 图搜的搜索词：在通用清洗之外再去掉「找几张…的图片」这类图搜脚手架
+/// （Bing 图片对「橘猫」与「找几张橘猫的图片」都能出结果，但前者相关性更高）。
+fn image_query(text: &str) -> String {
+    let base = search_query(text);
+    let mut q = base.trim().to_string();
+    for p in ["找几张", "找几幅", "搜几张", "来几张", "给我找", "给我", "几张", "一些", "找", "搜"] {
+        if let Some(rest) = q.strip_prefix(p) {
+            q = rest.trim().to_string();
+        }
+    }
+    for s in ["的图片", "图片", "的照片", "照片", "的图"] {
+        if let Some(rest) = q.strip_suffix(s) {
+            q = rest.trim().to_string();
+        }
+    }
+    if q.chars().count() < 2 {
+        base
+    } else {
+        q
+    }
+}
+
+/// 抓一篇正文并下发 read_link 那一对块（server_tool_use + web_fetch_tool_result）。
+/// 结果块带 signature，客户端下一轮会把它带回，正文因此能在多轮里留存。
+async fn fetch_page_into(
+    state: &AppState,
+    ctx: &mut WebContext,
+    sections: &mut Vec<String>,
+    url: &str,
+) {
+    let use_block = server_tool_use_block(
+        "deepseek_read_url",
+        "read_link",
+        json!({"action": "read_link", "url": url}),
+    );
+    let id = use_block["id"].as_str().unwrap_or("").to_string();
+    ctx.prelude.push(use_block);
+    match search::read_page(&state.client, url).await {
+        Ok((title, body)) => {
+            let signature = encode_page_signature(url, &body);
+            ctx.prelude.push(json!({
+                "type": "web_fetch_tool_result",
+                "tool_use_id": id,
+                "kind": "read_link",
+                "signature": signature,
+                "content": {
+                    "type": "web_fetch_result",
+                    "url": url,
+                    "title": title,
+                    "content": {
+                        "type": "document",
+                        "source": {
+                            "type": "text",
+                            "media_type": "text/plain",
+                            "data": body,
+                        },
+                    },
+                    "published_at": Value::Null,
+                },
+            }));
+            let n = ctx.sources.len() + 1;
+            ctx.sources.push((url.to_string(), title.clone()));
+            sections.push(format!(
+                "【[{n}] 已读取网页 {url}（正文截断至 2 万字符）】\n{body}"
+            ));
+        }
+        Err(e) => {
+            eprintln!("[anthropic] 读取网页失败: {e}");
+            ctx.prelude.push(json!({
+                "type": "web_fetch_tool_result",
+                "tool_use_id": id,
+                "kind": "read_link",
+                "content": {
+                    "type": "web_fetch_tool_result_error",
+                    "error_code": "url_not_accessible",
+                },
+            }));
+            sections.push(format!("【读取网页 {url} 失败：{e}】"));
+        }
+    }
+}
+
 async fn collect_web_context(
     state: &AppState,
     req: &Value,
-    want_search: bool,
+    search_kind: Option<SearchKind>,
     want_read: bool,
 ) -> WebContext {
     let mut ctx = WebContext::default();
     let text = last_user_text(req);
-    if text.trim().is_empty() {
-        return ctx;
-    }
     let mut sections: Vec<String> = Vec::new();
 
-    if want_search {
-        let query = search_query(&text);
-        let use_block = server_tool_use_block(
-            "deepseek_web_search",
-            "search",
-            json!({"action": "search", "query": query, "queries": [query]}),
-        );
-        let id = use_block["id"].as_str().unwrap_or("").to_string();
-        ctx.prelude.push(use_block);
-        match search::web_search(&state.client, &query, 8).await {
-            Ok(hits) if !hits.is_empty() => {
-                let items: Vec<Value> = hits.iter().map(search::hit_to_result).collect();
-                ctx.prelude.push(search_result_block(&id, json!(items)));
-                for h in &hits {
-                    ctx.sources.push((
-                        h.url.clone(),
-                        if h.title.is_empty() {
-                            None
-                        } else {
-                            Some(h.title.clone())
-                        },
+    // 1) 历史轮次里读过的网页（客户端把带 signature 的结果块回传，这里解出正文）
+    for (url, body) in restored_pages(req) {
+        sections.push(format!(
+            "【此前已读取的网页 {url}（由 signature 恢复，正文截断至 2 万字符）】\n{}",
+            search::truncate_chars(&body, 20_000)
+        ));
+    }
+
+    // 2) 本轮声明的服务端工具
+    if let Some(kind) = search_kind {
+        if !text.trim().is_empty() {
+            let query = if kind.is_image() {
+                image_query(&text)
+            } else {
+                search_query(&text)
+            };
+            let use_block = server_tool_use_block(
+                "deepseek_web_search",
+                kind.kind_str(),
+                json!({"action": "search", "query": query, "queries": [query]}),
+            );
+            let id = use_block["id"].as_str().unwrap_or("").to_string();
+            ctx.prelude.push(use_block);
+            let limit = if kind == SearchKind::DeepImage { 12 } else { 8 };
+            let found = if kind.is_image() {
+                search::image_search(&state.client, &query, limit).await
+            } else {
+                search::web_search(&state.client, &query, limit).await
+            };
+            match found {
+                Ok(hits) if !hits.is_empty() => {
+                    let items: Vec<Value> = hits.iter().map(search::hit_to_result).collect();
+                    ctx.prelude
+                        .push(search_result_block(&id, kind.kind_str(), json!(items)));
+                    for h in &hits {
+                        ctx.sources.push((
+                            h.url.clone(),
+                            if h.title.is_empty() {
+                                None
+                            } else {
+                                Some(h.title.clone())
+                            },
+                        ));
+                    }
+                    sections.push(search::render_context_kind(&query, &hits, kind.label()));
+                    // deep* 档：再抓前几篇正文，让模型据正文回答
+                    if kind.wants_pages() {
+                        let take = if kind == SearchKind::DeepImage { 1 } else { 3 };
+                        let urls: Vec<String> = hits
+                            .iter()
+                            .map(|h| h.url.clone())
+                            .filter(|u| u.starts_with("http"))
+                            .take(take)
+                            .collect();
+                        for url in urls {
+                            fetch_page_into(state, &mut ctx, &mut sections, &url).await;
+                        }
+                    }
+                }
+                Ok(_) => {
+                    ctx.prelude
+                        .push(search_result_block(&id, kind.kind_str(), search_error_content()));
+                    sections.push(format!(
+                        "【{}】搜索词「{query}」没有返回结果，请如实说明未检索到。",
+                        kind.label()
                     ));
                 }
-                sections.push(search::render_context(&query, &hits));
-            }
-            Ok(_) => {
-                ctx.prelude.push(search_result_block(&id, search_error_content()));
-                sections.push(format!(
-                    "【联网搜索结果】搜索词「{query}」没有返回结果，请如实说明未检索到。"
-                ));
-            }
-            Err(e) => {
-                eprintln!("[anthropic] 联网搜索失败: {e}");
-                ctx.prelude.push(search_result_block(&id, search_error_content()));
-                sections.push(format!(
-                    "【联网搜索结果】网关联网失败（{e}），请如实说明无法联网核实。"
-                ));
+                Err(e) => {
+                    eprintln!("[anthropic] 联网搜索失败: {e}");
+                    ctx.prelude
+                        .push(search_result_block(&id, kind.kind_str(), search_error_content()));
+                    sections.push(format!(
+                        "【{}】网关联网失败（{e}），请如实说明无法联网核实。",
+                        kind.label()
+                    ));
+                }
             }
         }
     }
 
+    // 3) 用户消息里给了链接且声明了读链接工具
     if want_read {
         if let Some(url) = search::first_url(&text) {
-            let use_block = server_tool_use_block(
-                "deepseek_read_url",
-                "read_link",
-                json!({"action": "read_link", "url": url}),
-            );
-            let id = use_block["id"].as_str().unwrap_or("").to_string();
-            ctx.prelude.push(use_block);
-            match search::read_page(&state.client, &url).await {
-                Ok((title, body)) => {
-                    ctx.prelude.push(json!({
-                        "type": "web_fetch_tool_result",
-                        "tool_use_id": id,
-                        "kind": "read_link",
-                        "content": {
-                            "type": "web_fetch_result",
-                            "url": url,
-                            "title": title,
-                            "content": {
-                                "type": "document",
-                                "source": {
-                                    "type": "text",
-                                    "media_type": "text/plain",
-                                    "data": body,
-                                },
-                            },
-                            "published_at": Value::Null,
-                        },
-                    }));
-                    sections.push(format!("【已读取网页 {url}（正文截断至 2 万字符）】\n{body}"));
-                }
-                Err(e) => {
-                    eprintln!("[anthropic] 读取网页失败: {e}");
-                    ctx.prelude.push(json!({
-                        "type": "web_fetch_tool_result",
-                        "tool_use_id": id,
-                        "kind": "read_link",
-                        "content": {
-                            "type": "web_fetch_tool_result_error",
-                            "error_code": "url_not_accessible",
-                        },
-                    }));
-                    sections.push(format!("【读取网页 {url} 失败：{e}】"));
-                }
-            }
+            fetch_page_into(state, &mut ctx, &mut sections, &url).await;
         }
     }
 
@@ -1609,13 +1873,10 @@ pub async fn messages(
         }
     };
     let files_dir = files::files_dir(&state);
-    // 客户端声明了服务端工具就先在本机执行（搜索 / 读链接），再带着结果去问模型。
-    let (want_search, want_read) = server_tool_intent(&req);
-    let web = if want_search || want_read {
-        collect_web_context(&state, &req, want_search, want_read).await
-    } else {
-        WebContext::default()
-    };
+    // 服务端工具（搜索 / 读链接）由网关先执行；即使用户本轮没开搜索，也要把历史轮次里
+    // 带回 signature 的网页恢复进上下文（否则「刚读过的网页」下一轮就忘了）。
+    let (search_kind, want_read) = server_tool_intent(&req);
+    let web = collect_web_context(&state, &req, search_kind, want_read).await;
     let built = match build_openai_request(&req, Some(files_dir.as_path()), &web) {
         Ok(v) => v,
         Err(e) => return anthropic_error(StatusCode::BAD_REQUEST, &e),
@@ -1700,6 +1961,17 @@ mod tests {
         assert!(q.contains('年'), "有时效诉求应补当天日期: {q}");
     }
 
+    /// 「深度搜索一下 X」这类动词短语要整段剥掉（否则 Bing 会按动词跑偏）。
+    #[test]
+    fn search_query_strips_verb_phrases() {
+        let q = search_query("深度搜索一下 llm-router 是什么项目");
+        assert!(!q.contains("深度搜索"), "{q}");
+        assert!(q.contains("llm-router"), "{q}");
+        let q = search_query("帮我详细搜索一下 大语言模型 路由网关");
+        assert!(!q.contains("详细搜索") && !q.contains("帮我"), "{q}");
+        assert!(q.contains("路由网关"), "{q}");
+    }
+
     #[test]
     fn search_query_keeps_topic() {
         let q = search_query("帮我查一下 Kimi K3.1 Pro 有哪些升级");
@@ -1713,5 +1985,99 @@ mod tests {
         let q = search_query("2026年11月 全球 AI 新闻日报");
         assert!(q.contains("2026年11月"), "{q}");
         assert_eq!(q.matches('年').count(), 1, "不应重复补日期: {q}");
+    }
+
+    /// 图搜搜索词：去掉「找几张…的图片」脚手架，但保底不空。
+    #[test]
+    fn image_query_strips_scaffolding() {
+        assert_eq!(image_query("找几张橘猫的图片"), "橘猫");
+        assert_eq!(image_query("给我找一些 AI 芯片的照片"), "AI 芯片");
+        // 全是脚手架时退回通用清洗结果（不为空）
+        assert!(!image_query("找图片").is_empty());
+        assert_eq!(search_query("橘猫图片"), "橘猫图片");
+    }
+
+    /// 网页签名：编码后可解回原文（多轮网页上下文靠它）。
+    #[test]
+    fn signature_round_trip() {
+        let sig = encode_page_signature("https://example.com/a", "正文内容 123");
+        assert!(sig.starts_with(SIGN_PREFIX), "{sig}");
+        assert_eq!(
+            decode_page_signature(&sig),
+            Some(("https://example.com/a".to_string(), "正文内容 123".to_string()))
+        );
+        // 别人签的（官方密文）解不出来 → 不该误用
+        assert_eq!(decode_page_signature("opaque-official-blob"), None);
+    }
+
+    /// 历史轮次里的 web_fetch_tool_result（chat-demo 回传的形状）应被恢复成正文。
+    #[test]
+    fn restores_pages_from_history() {
+        let sig = encode_page_signature("https://example.com/p1", "第一篇正文");
+        let req = json!({
+            "messages": [
+                {"role": "user", "content": "读一下这个链接"},
+                {"role": "assistant", "content": [
+                    {"type": "server_tool_use", "id": "srvtoolu_rl_1_aa", "name": "deepseek_read_url",
+                     "input": {"action": "read_link", "url": "https://example.com/p1"}, "kind": "read_link"},
+                    {"type": "web_fetch_tool_result", "tool_use_id": "srvtoolu_rl_1_aa", "kind": "read_link",
+                     "signature": sig, "content": {"type": "web_fetch_result", "url": "https://example.com/p1",
+                     "title": "P1", "content": {"type": "document", "source": {"type": "text",
+                     "media_type": "text/plain", "data": "第一篇正文"}}, "published_at": null}}
+                ]},
+                {"role": "user", "content": "它讲了什么？"}
+            ]
+        });
+        let pages = restored_pages(&req);
+        assert_eq!(pages.len(), 1);
+        assert_eq!(pages[0].0, "https://example.com/p1");
+        assert_eq!(pages[0].1, "第一篇正文");
+        // 去重：同一 url 出现多次只保留一份
+        let mut dup = req.clone();
+        if let Some(arr) = dup["messages"].as_array_mut() {
+            arr.push(arr[1].clone());
+        }
+        assert_eq!(restored_pages(&dup).len(), 1);
+        // 没有签名、也没有自带的正文 → 不恢复（官方密文场景）
+        let unsigned = json!({"messages": [{"role": "assistant", "content": [
+            {"type": "web_fetch_tool_result", "tool_use_id": "t", "kind": "read_link", "signature": "blob",
+             "content": {"type": "web_fetch_result", "url": "https://example.com/x", "title": "X",
+             "content": {"type": "document", "source": {"type": "text", "media_type": "text/plain", "data": ""}},
+             "published_at": null}}]}]});
+        assert!(restored_pages(&unsigned).is_empty());
+    }
+
+    /// 服务端工具声明的解析：类别优先级 + 读链接标记。
+    #[test]
+    fn intent_detects_kinds() {
+        let tools = |list: Value| json!({"tools": list});
+        let (kind, read) = server_tool_intent(&tools(json!([
+            {"type": "deepseek_read_url", "name": "deepseek_read_url"},
+            {"type": "deepseek_web_search", "name": "deepseek_web_search"}
+        ])));
+        assert_eq!(kind, Some(SearchKind::Search));
+        assert!(read);
+
+        let (kind, _) = server_tool_intent(&tools(json!([
+            {"type": "deepseek_web_search", "name": "deepseek_web_search"},
+            {"type": "deepseek_image_search", "name": "deepseek_image_search"}
+        ])));
+        assert_eq!(kind, Some(SearchKind::Image));
+
+        let (kind, _) = server_tool_intent(&tools(json!([
+            {"type": "deepseek_deep_search", "name": "deepseek_deep_search"}
+        ])));
+        assert_eq!(kind, Some(SearchKind::Deep));
+
+        // 客户端自定义工具（无 type / type=custom）不算服务端工具
+        let (kind, read) = server_tool_intent(&tools(json!([
+            {"name": "get_weather", "input_schema": {"type": "object"}},
+            {"type": "custom", "name": "deepseek_web_search"}
+        ])));
+        assert_eq!(kind, None);
+        assert!(!read);
+
+        assert_eq!(SearchKind::from_env("deep_image"), Some(SearchKind::DeepImage));
+        assert_eq!(SearchKind::from_env("nope"), None);
     }
 }

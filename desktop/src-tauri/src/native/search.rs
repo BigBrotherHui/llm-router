@@ -4,12 +4,14 @@
 //! 直接被上游 400 拒掉），所以当客户端（DeepSeek 官方前端 / chat-demo）声明
 //! `deepseek_web_search` / `deepseek_read_url` 这类「服务端工具」时，执行方只能是网关这一层。
 //! 网关执行完再产回 Anthropic 的服务端工具块：
-//!   deepseek_web_search -> server_tool_use(kind=search)    + web_search_tool_result
+//!   deepseek_web_search -> server_tool_use(kind=search/deep_search) + web_search_tool_result
+//!   （图搜同一条路，kind=image_search / deep_image_search，结果条目带 image_url）
 //!   deepseek_read_url   -> server_tool_use(kind=read_link) + web_fetch_tool_result
 //!
 //! 搜索后端选 Bing 的 HTML 结果页（本机实测可达：bing.com 200 / 10 条 b_algo；
 //! html.duckduckgo.com、lite.duckduckgo.com 均超时，search.marcia.cc 连接被重置）。
-//! 解析全部手写，不引 regex / scraper —— 与项目其它模块的风格保持一致。
+//! 图搜用 bing.com/images 的 HTML 页（结果在 `<a class="iusc" m="{...}">` 的 m 属性里，
+//! 是 HTML 转义后的 JSON）。解析全部手写，不引 regex / scraper —— 与项目其它模块的风格保持一致。
 
 use serde_json::{json, Value};
 
@@ -18,7 +20,7 @@ const MAX_PAGE_BYTES: usize = 2 * 1024 * 1024;
 const MAX_PAGE_CHARS: usize = 20_000;
 const MAX_SNIPPET: usize = 500;
 
-/// 一条搜索结果。
+/// 一条搜索结果（图搜会额外带上 image_url / icon=缩略图）。
 #[derive(Debug, Clone, Default)]
 pub struct Hit {
     pub title: String,
@@ -26,6 +28,8 @@ pub struct Hit {
     pub snippet: String,
     pub site: Option<String>,
     pub icon: Option<String>,
+    /// 仅图片搜索有值：图片直链。
+    pub image_url: Option<String>,
 }
 
 /// CJK 友好的截断（避免在多字节字符中间切开）。
@@ -309,6 +313,7 @@ fn parse_result(chunk: &str) -> Option<Hit> {
         snippet,
         site,
         icon,
+        image_url: None,
     })
 }
 
@@ -336,6 +341,90 @@ fn parse_bing(html: &str, limit: usize) -> Vec<Hit> {
             }
         }
         pos = end;
+    }
+    hits
+}
+
+/// 从一段「像 JSON 的」字符串里取某个字符串字段：`"key":"value"`。
+///
+/// 图搜结果的 `m="…"` 属性是 HTML 转义过的 JSON（`&quot;` 已由 decode_entities 还原成
+/// `"`），但字段顺序与转义方式在不同页面版本里会变，所以只按「键 → 下一个引号对」取值，
+/// 不引入 JSON 解析（部分页面里的 m 属性并非严格合法 JSON）。
+fn json_field(s: &str, key: &str) -> Option<String> {
+    let needle = format!("\"{key}\":\"");
+    let at = s.find(&needle)? + needle.len();
+    let tail = &s[at..];
+    let end = tail.find('"')?;
+    let v = decode_entities(&tail[..end]);
+    if v.is_empty() {
+        None
+    } else {
+        Some(v)
+    }
+}
+
+/// 解析一个图搜结果块（`<a class="iusc" … m="{…}">`）。
+fn parse_image_result(chunk: &str) -> Option<Hit> {
+    let m_at = chunk.find("m=\"")? + 3;
+    let raw = &chunk[m_at..];
+    let meta = decode_entities(&raw[..raw.find('"')?]);
+    let image_url = json_field(&meta, "murl")?;
+    if !image_url.starts_with("http") {
+        return None;
+    }
+    let url = json_field(&meta, "purl").unwrap_or_default();
+    let title = clean_text(&json_field(&meta, "t").unwrap_or_default());
+    let icon = json_field(&meta, "turl").filter(|s| s.starts_with("http"));
+    let site = if url.is_empty() {
+        None
+    } else {
+        Some(host_of(&url))
+    };
+    Some(Hit {
+        title,
+        url,
+        snippet: String::new(),
+        site,
+        icon,
+        image_url: Some(image_url),
+    })
+}
+
+fn host_of(url: &str) -> String {
+    let after = url.split("//").nth(1).unwrap_or(url);
+    after
+        .split(['/', '?', '#'])
+        .next()
+        .unwrap_or(after)
+        .trim_start_matches("www.")
+        .to_string()
+}
+
+fn parse_bing_images(html: &str, limit: usize) -> Vec<Hit> {
+    let needle = "class=\"iusc\"";
+    let mut hits: Vec<Hit> = Vec::new();
+    let mut pos = 0usize;
+    while hits.len() < limit {
+        let Some(found) = html[pos..].find(needle) else {
+            break;
+        };
+        let cur = pos + found;
+        // 结果块的起点要回到它自己的 `<a `（属性在 class 之前），但下一块的探测必须从
+        // `cur` 之后开始 —— 否则探测到的还是这一块，pos 不前进就成了死循环。
+        let start = html[..cur].rfind("<a ").unwrap_or(cur);
+        let next = html[cur + needle.len()..]
+            .find(needle)
+            .map(|e| cur + needle.len() + e)
+            .unwrap_or(html.len());
+        if next <= cur {
+            break;
+        }
+        if let Some(h) = parse_image_result(&html[start..next]) {
+            if !hits.iter().any(|x| x.image_url == h.image_url) {
+                hits.push(h);
+            }
+        }
+        pos = next;
     }
     hits
 }
@@ -374,6 +463,44 @@ pub async fn web_search(
             return Ok(Vec::new());
         }
         return Err("搜索结果解析为空（可能被反爬拦截）".to_string());
+    }
+    Ok(hits)
+}
+
+/// 图片搜索（Bing 图片结果的 HTML 页）。
+pub async fn image_search(
+    client: &reqwest::Client,
+    query: &str,
+    limit: usize,
+) -> Result<Vec<Hit>, String> {
+    let q = truncate_chars(query.trim(), 300);
+    if q.is_empty() {
+        return Err("搜索关键词为空".to_string());
+    }
+    let url = format!(
+        "https://www.bing.com/images/search?q={}&form=HDRSC2&first=1&setlang=zh-CN&mkt=zh-CN",
+        percent_encode(&q)
+    );
+    let resp = client
+        .get(&url)
+        .header("user-agent", UA)
+        .header("accept", "text/html,application/xhtml+xml")
+        .header("accept-language", "zh-CN,zh;q=0.9,en;q=0.8")
+        .timeout(std::time::Duration::from_secs(15))
+        .send()
+        .await
+        .map_err(|e| format!("图片搜索请求失败: {e}"))?;
+    let status = resp.status();
+    if !status.is_success() {
+        return Err(format!("图片搜索后端返回 HTTP {}", status.as_u16()));
+    }
+    let html = resp.text().await.map_err(|e| format!("读取图片搜索结果失败: {e}"))?;
+    let hits = parse_bing_images(&html, limit);
+    if hits.is_empty() {
+        if html.contains("没有与此相关的结果") || html.len() < 20_000 {
+            return Ok(Vec::new());
+        }
+        return Err("图片搜索结果解析为空（可能被反爬拦截）".to_string());
     }
     Ok(hits)
 }
@@ -444,6 +571,7 @@ pub fn hit_to_result(hit: &Hit) -> Value {
         "type": "web_search_result",
         "title": hit.title,
         "url": hit.url,
+        "image_url": hit.image_url.clone().map(Value::from).unwrap_or(Value::Null),
         "snippet": if hit.snippet.is_empty() { Value::Null } else { json!(hit.snippet) },
         "site_name": hit.site.clone().map(Value::from).unwrap_or(Value::Null),
         "site_icon": hit.icon.clone().map(Value::from).unwrap_or(Value::Null),
@@ -453,9 +581,11 @@ pub fn hit_to_result(hit: &Hit) -> Value {
 }
 
 /// 给上游模型看的搜索结果上下文（编号 1..n，与 citations 的编号对齐）。
-pub fn render_context(query: &str, hits: &[Hit]) -> String {
+///
+/// `label` 用来区分搜索类别（搜索 / 深度搜索 / 图片搜索），只影响写给模型看的标题文案。
+pub fn render_context_kind(query: &str, hits: &[Hit], label: &str) -> String {
     let mut out = String::new();
-    out.push_str("【联网搜索结果（由网关实时抓取，编号即引用编号）】\n");
+    out.push_str(&format!("【{label}（由网关实时抓取，编号即引用编号）】\n"));
     out.push_str(&format!("搜索词：{query}\n"));
     for (i, h) in hits.iter().enumerate() {
         out.push_str(&format!(
@@ -465,12 +595,21 @@ pub fn render_context(query: &str, hits: &[Hit]) -> String {
             h.url,
             truncate_chars(&h.snippet, 300)
         ));
+        if let Some(img) = h.image_url.as_deref() {
+            out.push_str(&format!("图片直链：{img}\n"));
+        }
     }
     out.push_str(
         "引用要求：正文里引用上面某条来源时，紧跟该句末尾写角标 [编号]（可连写 [1][2]），\
 不要写 Markdown 链接，也不要写「来源 1」这类文字说明。回答中至少给出一次这样的角标。\n",
     );
     out
+}
+
+/// 普通搜索的上下文（保持原有调用点不变）。
+#[allow(dead_code)]
+pub fn render_context(query: &str, hits: &[Hit]) -> String {
+    render_context_kind(query, hits, "联网搜索结果")
 }
 
 #[cfg(test)]
@@ -494,5 +633,30 @@ mod tests {
             Some("https://example.com/a?b=1".to_string())
         );
         assert_eq!(super::first_url("没有链接"), None);
+    }
+
+    /// 图搜夹具：`m` 属性是 HTML 转义后的 JSON（不联网）。
+    /// 夹具里放两条结果 —— 单条时「块起点回退」的 bug 不会暴露（会退化成死循环），
+    /// 两条才能验证游标确实在前进。
+    #[test]
+    fn parse_image_fixture() {
+        let html = r#"<div id="mmComponent_images_2" class="dgControl"><ul><li><a class="iusc" style="height:180px" m="{&quot;sid&quot;:&quot;&quot;,&quot;cturl&quot;:&quot;&quot;,&quot;cid&quot;:&quot;1A2B&quot;,&quot;murl&quot;:&quot;https://img.example.com/cat-a.jpg&quot;,&quot;turl&quot;:&quot;https://tse1.mm.bing.net/th?id=OIP.1A&quot;,&quot;md5&quot;:&quot;d41d&quot;,&quot;purl&quot;:&quot;https://www.example.com/posts/1&quot;,&quot;t&quot;:&quot;橘猫 &amp; 沙发&quot;}"><div class="imgpt"><img class="mimg" src="https://tse1.mm.bing.net/th?id=OIP.1A"></div></a></li><li><a class="iusc" style="height:180px" m="{&quot;sid&quot;:&quot;&quot;,&quot;cturl&quot;:&quot;&quot;,&quot;cid&quot;:&quot;3C4D&quot;,&quot;murl&quot;:&quot;https://img.example.com/cat-b.png&quot;,&quot;turl&quot;:&quot;https://tse1.mm.bing.net/th?id=OIP.2B&quot;,&quot;md5&quot;:&quot;d42d&quot;,&quot;purl&quot;:&quot;https://www.example.org/posts/2&quot;,&quot;t&quot;:&quot;第二只橘猫&quot;}"><div class="imgpt"><img class="mimg" src="https://tse1.mm.bing.net/th?id=OIP.2B"></div></a></li></ul></div>"#;
+        let hits = super::parse_bing_images(html, 5);
+        assert_eq!(hits.len(), 2, "两条图搜结果都该解析出来");
+        assert_eq!(
+            hits[0].image_url.as_deref(),
+            Some("https://img.example.com/cat-a.jpg")
+        );
+        assert_eq!(hits[0].url, "https://www.example.com/posts/1");
+        assert_eq!(hits[0].title, "橘猫 & 沙发");
+        assert_eq!(hits[0].site.as_deref(), Some("example.com"));
+        assert_eq!(
+            hits[1].image_url.as_deref(),
+            Some("https://img.example.com/cat-b.png")
+        );
+        assert_eq!(hits[1].title, "第二只橘猫");
+        assert_eq!(hits[1].site.as_deref(), Some("example.org"));
+        // limit 生效
+        assert_eq!(super::parse_bing_images(html, 1).len(), 1);
     }
 }
