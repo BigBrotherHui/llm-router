@@ -190,6 +190,41 @@ pub fn models_url(base: &str) -> String {
     join_url(base, "/models")
 }
 
+/// 上游对输出预算字段（max_completion_tokens / max_tokens / max_output_tokens）的硬上限。
+///
+/// 解析顺序：模型组 JSON 的 `max_output_tokens`（`ModelRoute.extra` 会原样保留这个自定义字段）
+/// → `defaults.max_output_tokens` → None（不干预，保持逐字节透传）。
+pub fn output_token_cap(state: &AppState, requested: &str) -> Option<u64> {
+    let file = state.file.read().unwrap();
+    file.models
+        .get(requested)
+        .and_then(|r| r.extra.get("max_output_tokens"))
+        .or_else(|| file.defaults.get("max_output_tokens"))
+        .and_then(|v| v.as_u64())
+        .filter(|cap| *cap > 0)
+}
+
+/// 把请求体里的输出预算夹到 cap 之内，返回 (字段名, 原值, 新值)。
+///
+/// 客户端（DSH harness + billion-context 的 #3438 output-budget restore）会把
+/// `max_completion_tokens` 抬到模型窗口量级（实测 1018356 = 1049000 − 输入估算），
+/// 远超上游自己的区间上限（ModelScope 的 deepseek 只接受 [1, 393216]），上游于是回
+/// 400 `Range of max_completion_tokens should be [1, 393216]`。这一层是最后一道保证：
+/// 无论客户端发什么，出站值都不会越过上游硬上限。
+pub fn clamp_output_tokens(body: &mut Value, cap: u64) -> Option<(String, u64, u64)> {
+    for field in ["max_completion_tokens", "max_tokens", "max_output_tokens"] {
+        let cur = match body.get(field).and_then(|v| v.as_u64()) {
+            Some(v) => v,
+            None => continue,
+        };
+        if cur > cap {
+            body[field] = json!(cap);
+            return Some((field.to_string(), cur, cap));
+        }
+    }
+    None
+}
+
 pub fn resolve(state: &AppState, requested: &str) -> Vec<(Upstream, String)> {
     let file = state.file.read().unwrap();
     let mut pairs: Vec<(Upstream, String)> = Vec::new();
@@ -343,6 +378,9 @@ pub async fn chat_completions(
     let mut last_status = StatusCode::BAD_GATEWAY;
     let mut last_message = "所有上游都失败了".to_string();
     let started_all = std::time::Instant::now();
+    // 模型组声明的输出上限：客户端可能把 max_completion_tokens 抬到上游窗口量级，
+    // 出站前必须夹回上游真正接受的区间（见 clamp_output_tokens 注释）。
+    let output_cap = output_token_cap(&state, &requested);
 
     // 每次尝试记录进 journal（trail 字段），UI 的尝试链才有完整顺序。
     macro_rules! push_attempt {
@@ -359,6 +397,14 @@ pub async fn chat_completions(
         let url = join_url(&up.base_url, "/chat/completions");
         let mut out = payload.clone();
         out["model"] = json!(real_model);
+        if let Some(cap) = output_cap {
+            if let Some((field, from, to)) = clamp_output_tokens(&mut out, cap) {
+                eprintln!(
+                    "[clamp] {} {} -> {} (模型 {} 声明的输出上限, upstream={})",
+                    field, from, to, requested, up.id
+                );
+            }
+        }
         if stream {
             // 让上游在最后一块回报 usage；否则流式请求永远统计不到 token / 缓存读写。
             if !out.get("stream_options").map(|v| v.is_object()).unwrap_or(false) {
