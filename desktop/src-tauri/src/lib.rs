@@ -330,8 +330,12 @@ pub fn run() {
                         } else {
                             format!("{:.0}ms", p50)
                         };
+                        // 口径写清楚：这里的「今日」是**过 8010 的轮次**（成功率也只有
+                        // 这些轮次有 —— Agent 会话记录不含失败信息）。HUD 里的
+                        //「今日所有请求」是并集（= 过路由 + 未走路由），别让鼠标一悬停
+                        // 又看到一个不同的「今日 N 次」。
                         let text = format!(
-                            "llm-router · 今日 {} 次 · 成功率 {:.1}% · P50 {}",
+                            "llm-router · 今日过路由 {} 次 · 成功率 {:.1}% · P50 {}",
                             calls, rate, p50_text
                         );
                         if let Some(tray) = handle.tray_by_id("main") {

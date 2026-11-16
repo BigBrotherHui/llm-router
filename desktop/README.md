@@ -172,7 +172,7 @@ Agent 卡片会显示「默认模型 magpie/loomy/DeepSeek-V4.1-Flash（没走�
 成功率 / P50 / P95 / 首字 P50 / 缓存读 / 缓存写），用来判断是整条上游都慢、还是只有某一个模型慢。
 时间窗口默认「今天」（按本机时区当天 00:00 起算，不是滚动 24 小时），也可切 1 / 6 / 24 / 72 / 168 小时与「全部」，
 可勾「只看异常」（有失败 / 冷却中 / 已禁用 / 配置已删的孤儿记录）。
-顶部「路由范围」可切「全部请求 / 只过 LLM Router / 只未走 LLM Router」，默认全部：
+顶部「路由范围」可切「全部请求 / 只过 LLM Router / 不过 LLM Router」，默认全部：
 全部与未走模式会把 Agent 会话里的外部上游一并列出（这些行只有会话轮数与缓存量，成功率和延迟显示
 为「—」，因为它们不经过本机路由，没有本机健康样本）；路由模式只统计本机流水。
 「清除熔断」把内存里的连续失败计数与 60 秒冷却清零（阈值 3 次），不改状态文件。
@@ -188,22 +188,39 @@ GET  /health/upstreams?hours=24&limit=4000
 POST /health/upstreams/clear  {"id":"..."} 或 {"all":true}
 ```
 
-## 请求记录（全部 Agent 会话）
+## 请求记录（三个口径：所有请求 / 只过 LLM Router / 不过 LLM Router）
 
-请求记录页顶部「数据口径」默认是 **全部 Agent 会话**：直接读 DSH / Claude Code / Pi / Codex 的会话记录，
-每一条模型调用算一行，分类按 `provider / 模型`（与「会话对账」一致），不再只看经过本机 `8010` 的请求。
-切到「本机路由流水」才回到 `config.history.jsonl` 的客户端请求口径。
+请求记录页顶部「数据口径」三选一，**默认「所有请求」**：
+
+| 口径 | 是什么 | 后端 |
+| --- | --- | --- |
+| **所有请求**（默认）| 绕过本机 `8010` 的 Agent 轮 + 本机 `8010` 的全部流水（两者合成一份逐轮记录，正好等于「会话对账」页的「今日所有请求」）| `/sessions/records?include=router` |
+| 只过 LLM Router | 只看经过本机 `8010` 的请求（带失败、重试、上游尝试）| `/sessions/records?journal_only=1` |
+| 不过 LLM Router | 只看 DSH / Claude Code / Pi / Codex 会话记录里**绕过** `8010` 的轮次 | `/sessions/records?route=external` |
+
+列表、统计卡、三个图表都跟着这个下拉走，而且三个口径都走**同一个接口的同一套逐轮记录
++ 聚合**，所以同一屏里的列表条数、统计卡、图表永远对得上（不再出现「列表 289 条、
+统计卡 286 条」这种落盘流水与滚动聚合之间的差）。
+
+`include=router` 合并时 Agent 侧只取**未走路由**的轮次（`route=external`），否则走了
+`8010` 的那一轮会在流水里再出现一次、被算两遍。
+
+每一条模型调用算一行，分类按 `provider / 模型`（与「会话对账」一致）。
 口径与上游面板对得上：穷举解压 `~/.dsh/sessions/**` 统计 `assistant/message` 与 `/sessions/records` 的 `total`
 逐轮一致（实测 920 = 920，输入/输出/缓存读完全相同），按小时与 Magpie 网关 `calls` 的偏差也在 1% 内
 （差额来自不走 Magpie 的直连轮次与 Magpie 自己的 `retried`/`canceled` 计数方式）。
+
+> 失败数只有「只过 LLM Router」和「所有请求」口径才有（Agent 会话记录只保留成功轮）：
+> 后者的「失败」只统计 `8010` 那部分，纯会话口径显示 `—` 而不是假造 0 失败。
 
 DSH 行会从 `step/start` 到首个 `stream[].time` 计算首字延迟，从 `step/start` 到 `assistant/message` 计算总耗时；
 Claude / Pi / Codex 的会话记录没有首字时间时显示 `—`。表格里的 TPS 仍按「输出 token ÷ (总耗时 − 首字)」计算。
 
 ```
-GET /sessions/records?range=today&limit=100
+GET /sessions/records?range=today&limit=100                      # 所有请求（默认）
+GET /sessions/records?range=today&route=external&limit=100       # 不过 LLM Router
 GET /sessions/records?range=today&group=magpie/workbuddy/deepseek-v4.1-flash&limit=100
-GET /sessions/records?range=today&route=external&day=2026-11-15&limit=100
+GET /stats/series?range=today&scope=all&include=router           # 图表跟列表同口径
 ```
 
 ## 会话对账（找没走本机路由的调用）
@@ -222,16 +239,16 @@ GET /sessions/records?range=today&route=external&day=2026-11-15&limit=100
 baseURL**（`~/.dsh/settings.yaml` 与 profile patch 层、`~/.pi/agent/models.json`、
 `~/.claude/settings.json`、`~/.codex/config.toml`、`opencode.json`、`kimi-code/config.toml`）——
 指向 `127.0.0.1:8010` / 含 `llm-router` 才算走路由。所以别人的网关把 DSH 默认模型改回自己那边之后，
-这一页会立刻显示「未走路由」的调用轮数与 token，并按会话列出外部模型。
+这一页会立刻显示「不过 LLM Router」的调用轮数与 token，并按会话列出外部模型。
 
 大文件只读尾部（默认最后 48MiB / 每个数据源最多 400 个文件），窗口默认「今天」（本机时区当天 00:00 起），
 也可切 24h / 3 天 / 7 天 / 30 天 / 全部；顶部「路由范围」默认「全部请求」，可切「只过 LLM Router /
-只未走 LLM Router」，切换后表格与会话卡会同步过滤。
+不过 LLM Router」，切换后表格与会话卡会同步过滤。
 扫描在打开本页、切换筛选条件或点「重新扫描」时触发；页面可见时跟随「设置 → 界面刷新 →
 会话对账刷新间隔」自动重扫（默认 5 秒，范围 2–600 秒，独立于请求记录的间隔，只在本页可见且没有正在扫描时执行）。
 页面只读，不改任何配置。
 
-页面顶部是总览卡：今日所有请求、其中过 LLM Router（包含关系）、未走路由、输入 / 输出 / 缓存读写和本机流水轮数；下面是路由覆盖比例条、四个数据源的扫描卡片，再往下是 provider / 模型明细表与会话卡片。筛选条支持时间窗口、数据源多选、只看未走路由，以及按 provider / 模型 / 接口地址搜索。
+页面顶部是总览卡：今日所有请求、其中过 LLM Router（包含关系）、不过 LLM Router、输入 / 输出 / 缓存读写和本机流水轮数；下面是路由覆盖比例条、四个数据源的扫描卡片，再往下是 provider / 模型明细表与会话卡片。筛选条支持时间窗口、数据源多选、只看不过 LLM Router，以及按 provider / 模型 / 接口地址搜索。
 
 ```
 GET /sessions/scan?range=today&sources=dsh,claude,pi,codex&limit=200
@@ -306,7 +323,7 @@ Magpie 那边没有公开色阶（只在用量接口里暴露 `speed_min`，默�
 本机路由流水的时间是转发时实测写入的，不参与换算（它本来就是线上掐表）；窗口里既有本机路由又有外部会话时，
 健康看板的「全部请求」会把两边的延迟样本**并进同一个分布**再算 P50 / P95 / 首字 P50（样本量悬殊时结果自然收敛到外部会话），
 所以健康看板总览与缓存账本基本一致 —— 差异只来自那些走了 8010 却不属于任何 Agent 会话的请求（缓存账本只统计 Agent 会话）。
-选「只过 LLM Router」时只用本机流水样本，选「只未走 LLM Router」时只用外部会话样本。
+选「只过 LLM Router」时只用本机流水样本，选「不过 LLM Router」时只用外部会话样本。
 
 外部 Agent 会话（DSH / Claude Code / Pi / Codex 的会话记录）里没有失败信息，只有轮次和 token，
 所以「全部 Agent 会话」窗口里健康看板把成功 / 失败 / 成功率显示为 `—` 并注明「外部 Agent 会话记录不含失败信息」，
@@ -333,7 +350,7 @@ Magpie 那边没有公开色阶（只在用量接口里暴露 `speed_min`，默�
   的耗时占比；没有 trail 的旧记录按「首字等待 / 生成」两段拆分。
 - 直方图复用同一组 SVG 柱子做增量过渡，自动刷新时不再整块重建闪一下；折线图、条形图和雷达图同样复用已有 SVG 节点，只更新路径、几何属性和文字，自动刷新不会重播放入场动画。
 - 会话对账、MCP 工具表格按数据签名复用：数据没变时只更新时间文字，不重写整张表；确有新数据才增删行。
-- **托盘迷你 HUD**：托盘图标悬浮显示今日请求量 / 成功率 / P50；左键打开无边框、
+- **托盘迷你 HUD**：托盘图标悬浮显示**今日过路由**的请求量 / 成功率 / P50（成功率只有过 8010 的轮次才有，Agent 会话记录不含失败信息；HUD 卡片里的「今日所有请求」是并集，两者本来就不是一个数）；左键打开无边框、
   置顶、可拖动的迷你 HUD（今日所有请求 + 其中过 LLM Router 的轮数与占比，另有成功率 / P50 / 首字和缓存指标；下方「最近路由」只显示一条：有请求进行中时显示当前路由，空闲时显示最近一轮对话；标注该轮是否经过 LLM Router（含没走 8010 的调用），多个尝试用 → 串联，3 秒刷新；点击 HUD 以外区域会自动收起），右键菜单也能打开或退出。左上角圆点表示与后端服务的连接状态（绿色已连接，红色读取失败），不代表上游请求成败。
 - 图表全部用内联 SVG 绘制，不引第三方图表库；切页、柱状、折线、雷达、状态灯都有
   轻量 CSS 动画，并遵守系统 `prefers-reduced-motion` 设置。
@@ -366,7 +383,7 @@ Claude/其它 5 分钟）；`session` / `strict` 固定 30 天；`turn` 只在�
 并单独标出其中走本机路由的子集。命中率 = `cache_read ÷ (input + cache_read + cache_write)`、
 节省 token = `cache_read`，同时给出粘性会话数量。
 接口：`GET /stats/cache-ledger?range=today`（或 `hours=24` / `range=all`）。
-顶部「路由范围」默认「全部请求」，可切「只过 LLM Router / 只未走 LLM Router」，接口对应 `route=routed|external`。
+顶部「路由范围」默认「全部请求」，可切「只过 LLM Router / 不过 LLM Router」，接口对应 `route=routed|external`。
 
 > 缓存写说明：Agent 会话记录普遍只记缓存读，不记缓存写——DSH 的 usage 只有 `cacheReadTokens`，
 > Claude 的 `cache_creation_input_tokens`、Pi 的 `cacheWrite`、Codex 的 `cache_write_input_tokens`

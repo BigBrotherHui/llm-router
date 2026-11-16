@@ -50,7 +50,7 @@
       <span>健康看板</span><span class="n" id="tabN-health" title="异常上游数"></span>
     </button>
     <button class="tab" data-tab="sessions" role="tab" aria-selected="false">
-      <span>会话对账</span><span class="n" id="tabN-sessions" title="窗口内没走本机路由的调用轮数"></span>
+      <span>会话对账</span><span class="n" id="tabN-sessions" title="窗口内不过 LLM Router 的调用轮数"></span>
     </button>
     <button class="tab" data-tab="tools" role="tab" aria-selected="false">
       <span>MCP 工具</span><span class="n" id="tabN-tools" title="工具调用次数"></span>
@@ -79,9 +79,10 @@
         <span class="badge" id="sideCount"></span>
         <div class="grow"></div>
         <select id="sideSource" style="font-size:12px;padding:5px 8px"
-              title="数据口径：全部 Agent 会话包含没经过 llm-router 的调用">
-          <option value="all" selected>全部 Agent 会话</option>
-          <option value="router">本机路由流水</option>
+              title="数据口径：所有请求 = 过 LLM Router + 没过 LLM Router（Agent 会话里绕过本机 8010 的调用）">
+          <option value="all" selected>所有请求</option>
+          <option value="router">只过 LLM Router</option>
+          <option value="external">不过 LLM Router</option>
         </select>
         <select id="sideMetric" style="font-size:12px;padding:5px 8px"
               title="首字 / 耗时口径，与设置页联动">
@@ -368,10 +369,10 @@
             <option value="168">最近 7 天</option>
             <option value="0">全部（尾部缓存）</option>
           </select>
-          <select id="healthRoute" style="font-size:12px;padding:5px 8px" title="路由范围：全部 / 只走过本机路由 / 只未走本机路由">
+          <select id="healthRoute" style="font-size:12px;padding:5px 8px" title="路由范围：全部 / 只过 LLM Router / 不过 LLM Router">
             <option value="all" selected>全部请求</option>
             <option value="routed">只过 LLM Router</option>
-            <option value="external">只未走 LLM Router</option>
+            <option value="external">不过 LLM Router</option>
           </select>
           <select id="healthOnlyBad" style="font-size:12px;padding:5px 8px" title="只看有问题的上游">
             <option value="0">全部上游</option>
@@ -447,10 +448,10 @@
           </div>
           <label class="sess-field">
             <span class="sess-field-label">路由范围</span>
-            <select id="sessRoute" class="sess-select" title="全部请求 / 只走过本机路由 / 只未走本机路由">
+            <select id="sessRoute" class="sess-select" title="全部请求 / 只过 LLM Router / 不过 LLM Router">
               <option value="all" selected>全部请求</option>
               <option value="routed">只过 LLM Router</option>
-              <option value="external">只未走 LLM Router</option>
+              <option value="external">不过 LLM Router</option>
             </select>
           </label>
           <label class="sess-field sess-search">
@@ -538,10 +539,10 @@
           <h2 style="margin:0">Prompt Cache 账本 <span class="badge" style="vertical-align:middle">全部 Agent 会话</span></h2>
           <span class="hint" id="cacheMeta"></span>
           <div class="grow"></div>
-          <select id="cacheRoute" class="chart-range" title="路由范围：全部 / 只走过本机路由 / 只未走本机路由">
+          <select id="cacheRoute" class="chart-range" title="路由范围：全部 / 只过 LLM Router / 不过 LLM Router">
             <option value="all" selected>全部请求</option>
             <option value="routed">只过 LLM Router</option>
-            <option value="external">只未走 LLM Router</option>
+            <option value="external">不过 LLM Router</option>
           </select>
           <select id="cacheRange" class="chart-range" title="统计时间窗口">
             <option value="today" selected>今天（当天 00:00 起）</option>

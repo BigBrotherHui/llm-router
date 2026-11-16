@@ -26,6 +26,8 @@ pub struct SeriesQuery {
     pub bucket: Option<i64>,
     /// all = 全部 Agent 会话（默认，与请求记录同口径）；router = 本机路由流水
     pub scope: Option<String>,
+    /// include=router：把 8010 的全部流水并进来 = 请求记录页的「所有请求」口径
+    pub include: Option<String>,
     /// 耗时口径：newapi / magpie / current
     pub metric: Option<String>,
     /// routed / external / all
@@ -221,7 +223,7 @@ pub async fn series(State(state): State<Arc<AppState>>, Query(q): Query<SeriesQu
     let span = (now_ts - since).max(60.0);
     let bucket_secs = q.bucket.unwrap_or_else(|| auto_bucket(span)).max(60);
     let cache_key = format!(
-        "series|{scope}|{range}|{}|{bucket_secs}|{}|{}|{}|{}|{}|{}|{}",
+        "series|{scope}|{range}|{}|{bucket_secs}|{}|{}|{}|{}|{}|{}|{}|{}",
         q.hours.unwrap_or(0.0),
         q.metric.clone().unwrap_or_default(),
         q.route.clone().unwrap_or_default(),
@@ -229,7 +231,8 @@ pub async fn series(State(state): State<Arc<AppState>>, Query(q): Query<SeriesQu
         f_month,
         f_group,
         f_upstream,
-        f_model
+        f_model,
+        super::sessions::wants_journal(q.include.as_deref())
     );
     if let Some(v) = super::collector::get(&cache_key, 8) {
         return Json(v).into_response();
@@ -243,17 +246,27 @@ pub async fn series(State(state): State<Arc<AppState>>, Query(q): Query<SeriesQu
                 p
             }
         };
+        // include=router：跟列表的「所有请求」口径一致（并上 8010 的全部流水）。
+        // 这时 Agent 侧只能取**未走路由**的轮次，否则过了 8010 的那一轮会被算两次。
+        let include_router = super::sessions::wants_journal(q.include.as_deref());
+        let route = if include_router {
+            2
+        } else {
+            super::sessions::route_filter(q.route.as_deref())
+        };
         let mut out = super::sessions::session_series(
+            &state,
             port,
             (since * 1000.0) as i64,
             bucket_secs,
-            super::sessions::route_filter(q.route.as_deref()),
+            route,
             super::sessions::metric_mode(q.metric.as_deref()),
             &f_day,
             &f_month,
             &f_group,
             &f_upstream,
             &f_model,
+            include_router,
         );
         if let Some(obj) = out.as_object_mut() {
             obj.insert("range".into(), json!(range_label));

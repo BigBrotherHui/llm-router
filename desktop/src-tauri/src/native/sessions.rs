@@ -282,6 +282,20 @@ pub struct ScanQuery {
     pub offset: Option<usize>,
     /// 首字 / 耗时口径：happycoding（默认）/ magpie / dsh
     pub metric: Option<String>,
+    /// `include=router`：把本机 8010 的全部流水也并进这份逐轮记录 =
+    /// 请求记录页的「所有请求」口径（没过 8010 的 Agent 轮 + 8010 流水）。
+    pub include: Option<String>,
+    /// `journal_only=1`：只要本机 8010 流水，不扫 Agent 会话 =「只过 LLM Router」。
+    /// 走这条路统计卡和列表是同一份逐轮记录聚合出来的，不会再和滚动聚合差几条。
+    pub journal_only: Option<String>,
+}
+
+/// include=router（或 journal / llmrouter / 1 / true）= 「所有请求」口径。
+pub fn wants_journal(v: Option<&str>) -> bool {
+    matches!(
+        v.unwrap_or("").trim().to_ascii_lowercase().as_str(),
+        "router" | "journal" | "llmrouter" | "1" | "true" | "yes"
+    )
 }
 
 /// HUD 用的“今日全部流量”快照：包含所有 Agent 会话，不只是经过 llm-router 的部分。
@@ -1236,15 +1250,59 @@ fn scan_records(
     (records, days, months)
 }
 
-pub fn session_records(port: u16, since_ms: i64, route: u8, metric: u8, day: &str, month: &str, group: &str, upstream: &str, model: &str, limit: usize, offset: usize) -> Value {
-    let (records, days, months) = scan_records(port, since_ms, route, metric, day, month, group, upstream, model);
+pub fn session_records(
+    state: &AppState,
+    port: u16,
+    since_ms: i64,
+    route: u8,
+    metric: u8,
+    day: &str,
+    month: &str,
+    group: &str,
+    upstream: &str,
+    model: &str,
+    limit: usize,
+    offset: usize,
+    include_router: bool,
+    journal_only: bool,
+) -> Value {
+    let (mut records, mut days, mut months) = if journal_only {
+        (Vec::new(), Vec::new(), Vec::new())
+    } else {
+        scan_records(port, since_ms, route, metric, day, month, group, upstream, model)
+    };
+    if include_router || journal_only {
+        // 并上 8010 的全部流水（两边同形，后面统一聚合）。
+        // 「所有请求」口径下 route 必须是 2（只取未走路由的 Agent 轮），
+        // 否则走了路由的那一轮会在流水里再出现一次、被算两遍。
+        let (jr, jdays, jmonths) = journal_as_records(state, since_ms, day, month, group, upstream, model);
+        records.extend(jr);
+        records.sort_by(|a, b| {
+            b["at"].as_f64().unwrap_or(0.0)
+                .partial_cmp(&a["at"].as_f64().unwrap_or(0.0))
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+        days.extend(jdays);
+        days.sort();
+        days.dedup();
+        months.extend(jmonths);
+        months.sort();
+        months.dedup();
+    }
     let total = records.len();
-    let mut calls = 0u64; let mut input = 0u64; let mut output = 0u64;
+    let mut calls = 0u64; let mut ok_n = 0u64; let mut failed_n = 0u64; let mut attempts_n = 0u64;
+    let mut input = 0u64; let mut output = 0u64;
     let mut cache_read = 0u64; let mut cache_write = 0u64;
-    let mut groups: HashMap<String, (u64, u64, u64, u64, u64, String)> = HashMap::new();
-    let mut ups: HashMap<String, (u64, String)> = HashMap::new();
+    // (calls, ok, failed, input, output, cache_read, cache_write, provider)
+    let mut groups: HashMap<String, (u64, u64, u64, u64, u64, u64, u64, String)> = HashMap::new();
+    // (calls, ok, failed, provider)
+    let mut ups: HashMap<String, (u64, u64, u64, String)> = HashMap::new();
     for r in &records {
         calls += 1;
+        // 会话记录只保留成功轮，所以那边一律算成功；8010 流水那边有真实的成败。
+        let ok = r["ok"].as_bool().unwrap_or(true);
+        if ok { ok_n += 1 } else { failed_n += 1 }
+        attempts_n += r["attempts"].as_u64().unwrap_or(1).max(1);
         let u = &r["usage"];
         input += u["input"].as_u64().unwrap_or(0);
         output += u["output"].as_u64().unwrap_or(0);
@@ -1253,27 +1311,31 @@ pub fn session_records(port: u16, since_ms: i64, route: u8, metric: u8, day: &st
         let provider = r["upstream"].as_str().unwrap_or("");
         let model = r["model"].as_str().unwrap_or("");
         let gkey = format!("{provider}/{model}");
-        let e = groups.entry(gkey.clone()).or_insert((0, 0, 0, 0, 0, String::new()));
+        let e = groups.entry(gkey.clone()).or_insert((0, 0, 0, 0, 0, 0, 0, String::new()));
         e.0 += 1;
-        e.1 += u["input"].as_u64().unwrap_or(0);
-        e.2 += u["output"].as_u64().unwrap_or(0);
-        e.3 += u["cache_read"].as_u64().unwrap_or(0);
-        e.4 += u["cache_write"].as_u64().unwrap_or(0);
-        e.5 = provider.to_string();
-        ups.entry(format!("{provider}\u{1}{model}")).or_insert((0, provider.to_string()));
-        if let Some(x) = ups.get_mut(&format!("{provider}\u{1}{model}")) { x.0 += 1; }
+        if ok { e.1 += 1 } else { e.2 += 1 }
+        e.3 += u["input"].as_u64().unwrap_or(0);
+        e.4 += u["output"].as_u64().unwrap_or(0);
+        e.5 += u["cache_read"].as_u64().unwrap_or(0);
+        e.6 += u["cache_write"].as_u64().unwrap_or(0);
+        e.7 = provider.to_string();
+        let up = ups
+            .entry(format!("{provider}\u{1}{model}"))
+            .or_insert((0, 0, 0, provider.to_string()));
+        up.0 += 1;
+        if ok { up.1 += 1 } else { up.2 += 1 }
     }
-    let mut group_rows: Vec<Value> = groups.into_iter().map(|(k, (c, i, o, cr, cw, p))| json!({
-        "group": k, "calls": c, "ok": c, "failed": 0, "attempts": c,
+    let mut group_rows: Vec<Value> = groups.into_iter().map(|(k, (c, o, f, i, ou, cr, cw, p))| json!({
+        "group": k, "calls": c, "ok": o, "failed": f, "attempts": c,
         "avg_elapsed": 0.0, "upstream_count": 1,
-        "usage": {"input": i, "output": o, "cache_read": cr, "cache_write": cw},
-        "upstreams": [{"upstream": p, "calls": c, "ok": c, "failed": 0,
-                       "models": [{"model": k.splitn(2, '/').nth(1).unwrap_or(""), "calls": c, "ok": c, "failed": 0}]}]
+        "usage": {"input": i, "output": ou, "cache_read": cr, "cache_write": cw},
+        "upstreams": [{"upstream": p, "calls": c, "ok": o, "failed": f,
+                       "models": [{"model": k.splitn(2, '/').nth(1).unwrap_or(""), "calls": c, "ok": o, "failed": f}]}]
     })).collect();
     group_rows.sort_by_key(|v| std::cmp::Reverse(v["calls"].as_u64().unwrap_or(0)));
-    let upstream_rows: Vec<Value> = ups.into_iter().map(|(k, (c, p))| {
+    let upstream_rows: Vec<Value> = ups.into_iter().map(|(k, (c, o, f, p))| {
         let model = k.splitn(2, '\u{1}').nth(1).unwrap_or("");
-        json!({"upstream": p, "model": model, "key": format!("{p} · {model}"), "failed": 0, "calls": c})
+        json!({"upstream": p, "model": model, "key": format!("{p} · {model}"), "failed": f, "ok": o, "calls": c})
     }).collect();
     // 口径覆盖：magpie 口径下有多少轮真的取到了网关实测值，多少轮回退到 request/header。
     let mut magpie_hits = 0usize;
@@ -1304,12 +1366,21 @@ pub fn session_records(port: u16, since_ms: i64, route: u8, metric: u8, day: &st
     let rounds_total = records.len();
     let entries: Vec<Value> = records.into_iter().skip(offset).take(limit).collect();
     json!({
-        "scope": "all", "total": total, "offset": offset, "limit": limit,
+        // scope：all = 所有请求（并了 8010 流水），router = 只有 8010 流水，
+        // agent = 只有 Agent 会话记录
+        "scope": if journal_only { "router" } else if include_router { "all" } else { "agent" },
+        "total": total, "offset": offset, "limit": limit,
         "entries": entries,
-        "metric": {"mode": metric_label, "rounds": rounds_total,
-                   "magpie": magpie_hits, "header": header_hits, "via_magpie": via_magpie,
-                   "magpie_available": !self_magpie_empty(metric)},
-        "totals": {"calls": calls, "ok": calls, "failed": Value::Null, "attempts": calls,
+        // 「只过 LLM Router」的那份流水是本机自己掐的表，没有第一/三方口径封面可言，
+        // 给个 null 让前端别显示「网关实测 0 / N 轮」。
+        "metric": if journal_only { Value::Null } else { json!({
+            "mode": metric_label, "rounds": rounds_total,
+            "magpie": magpie_hits, "header": header_hits, "via_magpie": via_magpie,
+            "magpie_available": !self_magpie_empty(metric)}) },
+        "totals": {"calls": calls, "ok": ok_n, "attempts": attempts_n,
+                   // Agent 会话记录不含失败轮，只有并进了 8010 流水才敢报失败数；
+                   // 纯会话口径继续显示「—」，不伪造成 0 失败。
+                   "failed": if include_router { json!(failed_n) } else { Value::Null },
                    "input": input, "output": output, "cache_read": cache_read, "cache_write": cache_write},
         "groups": group_rows, "upstreams": upstream_rows,
         "days": days.iter().map(|d| json!({"key": d})).collect::<Vec<_>>(),
@@ -1322,6 +1393,7 @@ pub fn session_records(port: u16, since_ms: i64, route: u8, metric: u8, day: &st
 /// Agent 会话记录里没有失败信息，所以 failed / success_rate 一律为 null，
 /// 并用 failed_known=false 让前端去掉「失败」那条线，而不是画一条假的 0 线。
 pub fn session_series(
+    state: &AppState,
     port: u16,
     since_ms: i64,
     bucket_secs: i64,
@@ -1332,8 +1404,14 @@ pub fn session_series(
     group: &str,
     upstream: &str,
     model: &str,
+    include_router: bool,
 ) -> Value {
-    let (records, _days, _months) = scan_records(port, since_ms, route, metric, day, month, group, upstream, model);
+    let (mut records, _days, _months) = scan_records(port, since_ms, route, metric, day, month, group, upstream, model);
+    if include_router {
+        // 图表也按「所有请求」口径：并上 8010 的全部流水，否则折线会比列表矮一截。
+        let (jr, _jd, _jm) = journal_as_records(state, since_ms, day, month, group, upstream, model);
+        records.extend(jr);
+    }
     let now_ts = now_ms() as f64 / 1000.0;
     let bucket_secs = bucket_secs.max(60);
     let since = (since_ms as f64 / 1000.0).max(0.0).min(now_ts);
@@ -2385,8 +2463,107 @@ fn journal_window(state: &AppState, since_ms: i64, route: u8) -> Value {
     })
 }
 
-// ───────────────────────── handler ─────────────────────────
+/// 把本机 8010 流水（SQLite 索引）转成与会话记录**同形**的逐轮记录。
+///
+/// 「所有请求」口径 = 没过 8010 的 Agent 轮 + 8010 的全部流水，两边同形之后，
+/// 列表渲染、分组聚合、图表分桶都能直接复用同一套代码（会话对账页的
+/// 「今日所有请求」就是这个集合）。
+///
+/// 返回 (逐轮记录, 有数据的日期, 有数据的月份)；日期 / 月份取自**过滤前**的全部行，
+/// 用来填筛选下拉框 —— 只经过 8010 的那些天在 Agent 会话记录里是不存在的。
+fn journal_as_records(
+    state: &AppState,
+    since_ms: i64,
+    day: &str,
+    month: &str,
+    group: &str,
+    upstream: &str,
+    model: &str,
+) -> (Vec<Value>, Vec<String>, Vec<String>) {
+    let since = if since_ms > 0 { since_ms as f64 / 1000.0 } else { 0.0 };
+    let mut out: Vec<Value> = Vec::new();
+    let mut days: Vec<String> = Vec::new();
+    let mut months: Vec<String> = Vec::new();
+    for e in super::journal_index::entries(state, 0.0, None) {
+        let at = e.get("at").and_then(|v| v.as_f64()).unwrap_or(0.0);
+        // 流水里的 `time` 只有时分秒（"15:07:09"），日期必须从 at 按本机时区算 ——
+        // 直接拿 time 当前缀筛日期会一条都筛不出来（历史 bug 就是这么踩的）。
+        // 顺带补成完整时间戳，列表里才和 Agent 会话那半边（"2026-11-16 15:07:09"）对得齐。
+        let time = chrono::DateTime::from_timestamp(at as i64, 0)
+            .map(|d| d.with_timezone(&chrono::Local).format("%Y-%m-%d %H:%M:%S").to_string())
+            .unwrap_or_default();
+        let d: String = time.chars().take(10).collect();
+        let mo: String = time.chars().take(7).collect();
+        if d.len() == 10 && !days.contains(&d) {
+            days.push(d.clone());
+        }
+        if mo.len() == 7 && !months.contains(&mo) {
+            months.push(mo);
+        }
+        if at <= 0.0 || (since > 0.0 && at < since) {
+            continue;
+        }
+        if !day.is_empty() && d != day {
+            continue;
+        }
+        if !month.is_empty() && !d.starts_with(month) {
+            continue;
+        }
+        let m = e.get("model").and_then(|v| v.as_str()).unwrap_or("");
+        let up = e.get("upstream").and_then(|v| v.as_str()).unwrap_or("");
+        let eff = e
+            .get("effective_model")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty())
+            .unwrap_or(m);
+        // 分组键与 session_records 的聚合一致：上游(provider) / 模型（用 model，不是
+        // effective_model —— 下拉里的分组名就是按 model 拼的，用错字段会筛出空列表）
+        if !group.is_empty() && format!("{up}/{m}") != group {
+            continue;
+        }
+        if !upstream.is_empty() && up != upstream {
+            continue;
+        }
+        if !model.is_empty() && m != model {
+            continue;
+        }
+        out.push(json!({
+            // 与会话记录同名的字段：列表按它区分来源、展开正文时按 at + upstream 取
+            "source": "router",
+            "agent": "LLM Router",
+            "project": "(本机 8010 流水)",
+            "routed": true,
+            "at": at,
+            "time": time,
+            "model": m,
+            "effective_model": eff,
+            "upstream": up,
+            "upstream_id": e.get("upstream_id").cloned().unwrap_or(Value::Null),
+            "status": e.get("status").cloned().unwrap_or(json!(0)),
+            "ok": e.get("ok").and_then(|v| v.as_bool()).unwrap_or(false),
+            "stream": e.get("stream").and_then(|v| v.as_bool()).unwrap_or(false),
+            "elapsed_seconds": e.get("elapsed_seconds").cloned().unwrap_or(json!(0.0)),
+            "elapsed_raw_seconds": e.get("elapsed_seconds").cloned().unwrap_or(json!(0.0)),
+            "first_chunk_seconds": e.get("first_chunk_seconds").cloned().unwrap_or(Value::Null),
+            "request_header_seconds": Value::Null,
+            "attempts": e.get("attempts").cloned().unwrap_or(json!(1)),
+            "chunks": e.get("chunks").cloned().unwrap_or(Value::Null),
+            "key": e.get("key").cloned().unwrap_or(Value::Null),
+            "route_source": e.get("route_source").cloned().unwrap_or(Value::Null),
+            "error": e.get("error").cloned().unwrap_or(Value::Null),
+            "session_id": e.get("session_id").cloned().unwrap_or(Value::Null),
+            "usage": e.get("usage").cloned().unwrap_or(json!({})),
+            "trail": e.get("trail").cloned().unwrap_or(json!([])),
+        }));
+    }
+    days.sort();
+    days.dedup();
+    months.sort();
+    months.dedup();
+    (out, days, months)
+}
 
+// ───────────────────────── handler ─────────────────────────
 pub async fn scan(State(state): State<Arc<AppState>>, Query(q): Query<ScanQuery>) -> Response {
     let port = {
         let p = state.port.load(std::sync::atomic::Ordering::Relaxed);
@@ -2950,7 +3127,13 @@ pub async fn records(State(state): State<Arc<AppState>>, Query(q): Query<ScanQue
     let metric = metric_mode(q.metric.as_deref());
     let limit = q.limit.unwrap_or(50).clamp(5, 200);
     let offset = q.offset.unwrap_or(0);
-    let value = session_records(port, since_ms, route, metric, &day, &month, &group, &upstream, &model, limit, offset);
+    // include=router：「所有请求」= 没过 8010 的 Agent 轮 + 8010 的全部流水。
+    // journal_only=1：「只过 LLM Router」= 只要 8010 流水（不扫 Agent 会话）。
+    // 两种情况下 route 都只能是「只未走路由」，否则过了 8010 的 Agent 轮会被算两次。
+    let journal_only = wants_journal(q.journal_only.as_deref());
+    let include_router = wants_journal(q.include.as_deref()) || journal_only;
+    let route = if include_router { 2 } else { route };
+    let value = session_records(&state, port, since_ms, route, metric, &day, &month, &group, &upstream, &model, limit, offset, include_router, journal_only);
     Json(value).into_response()
 }
 

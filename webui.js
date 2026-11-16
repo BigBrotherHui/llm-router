@@ -2327,6 +2327,7 @@ function curJournalFilter() {
 
 async function loadJournal() {
   const f = curJournalFilter();
+  // 三个口径：所有请求（默认，过 + 不过 LLM Router）/ 只过 LLM Router / 不过 LLM Router
   const source = ($("#sideSource") && $("#sideSource").value) || "all";
   const qs = new URLSearchParams({
     limit: String(REQ_PAGE),
@@ -2340,19 +2341,20 @@ async function loadJournal() {
   // 口径/筛选切得快时会有多个请求在途，先到的旧响应不能覆盖后发的新结果。
   const seq = ++journalSeq;
   try {
-    let got;
-    if (source === "router") {
-      got = await api("/admin/journal?" + qs.toString(), undefined, "GET");
-    } else {
-      if (!f.day && !f.month) qs.set("range", "all");
-      qs.set("metric", timingMode());
-      got = await api("/sessions/records?" + qs.toString(), undefined, "GET");
-    }
+    // 三个口径现在都走同一个接口、同一套逐轮记录 + 聚合（统计卡的数字和列表
+    // 必然一致）：所有请求 = 并上 8010 流水，只过 LLM Router = 只要 8010 流水，
+    // 不过 LLM Router = 只要绕过 8010 的 Agent 轮。
+    if (!f.day && !f.month) qs.set("range", "all");
+    qs.set("metric", timingMode());
+    if (source === "router") qs.set("journal_only", "1");
+    else if (source === "external") qs.set("route", "external");
+    else qs.set("include", "router");
+    const got = await api("/sessions/records?" + qs.toString(), undefined, "GET");
     if (seq !== journalSeq) return journalPage;
     journalPage = got;
   } catch (e) {
     if (seq !== journalSeq) return journalPage;
-    journalPage = { entries: [], total: 0, error: e.message, scope: source === "router" ? "router" : "all" };
+    journalPage = { entries: [], total: 0, error: e.message, scope: source };
   }
   // 上游下拉跟着当前分组走：只有选过分组才列上游，避免全量时列一长串。
   fillUpstreamOptions();
@@ -2360,6 +2362,21 @@ async function loadJournal() {
   renderTabNums();
   return journalPage;
 }
+
+// 请求记录页的「数据口径」：all = 所有请求（过 + 不过 LLM Router），
+// router = 只过 LLM Router（本机 8010 流水），external = 不过 LLM Router
+// （Agent 会话里绕过本机 8010 的那些轮）。
+function reqScope() {
+  return ($("#sideSource") && $("#sideSource").value) || "all";
+}
+function reqScopeLabel(s) {
+  return s === "router"
+    ? "只过 LLM Router（8010 流水）"
+    : s === "external"
+      ? "不过 LLM Router（Agent 会话绕过 8010）"
+      : "所有请求（过 + 不过 LLM Router）";
+}
+// 三个口径都拿列表自己那份逐轮记录聚合（后端同一套），统计卡直接用它。
 
 // 按当前分组列上游（带失败数）。数据来自 query_journal 的 upstreams 字段，
 // 它在「天/月/分组」筛选之后统计，所以这里天然只有该分组用过的上游。
@@ -2414,7 +2431,7 @@ function fillFilterOptions() {
   };
   const today = dayKeyOf();
   const idx = journalIndex || {};
-  const allScope = journalPage && journalPage.scope === "all";
+  const allScope = !!journalPage;
   const groupItems = allScope
     ? (journalPage.groups || []).map(g => ({ key: g.group }))
     : (idx.groups || []);
@@ -2606,10 +2623,12 @@ function renderSide() {
   // 老的实现里列表读的是内存里那 500 条 history，所以白天/昨天的记录翻不到，
   // 而汇总数字来自另一个口径 —— 两边永远对不上。现在统一成一个来源。
   const sr = state.stats_range || {};
-  const allScope = journalPage && journalPage.scope === "all";
-  const stats = allScope
+  // 三个口径都是拿列表自己的逐轮记录聚合出来的（后端同一套聚合），所以统计卡
+  // 直接用 journalPage.totals / groups —— 列表和统计卡永远同一个数。
+  const allScope = !!journalPage;
+  const stats = journalPage
     ? { totals: journalPage.totals || {}, groups: journalPage.groups || [] }
-    : (sr.groups ? sr : (state.call_stats || {}));
+    : { totals: sr.totals || {}, groups: sr.groups || [] };
   const totals = stats.totals || {};
 
   const filter = $("#sideFilter").value;
@@ -2641,19 +2660,25 @@ function renderSide() {
     } else {
       const denom = mm.via_magpie != null ? mm.via_magpie : mm.rounds;
       const rest = denom - mm.magpie;
-      metricNote.textContent = `网关实测 ${fmtCount(mm.magpie)} / ${fmtCount(denom)} 轮`;
+      // 「所有请求」里还有 8010 那一半（本机自己掐表，没有网关数字），别让
+      // 「网关实测 X / Y 轮」看起来像覆盖了整张列表。
+      const agentOnly = reqScope() === "all";
+      metricNote.textContent = `网关实测 ${fmtCount(mm.magpie)} / ${fmtCount(denom)} 轮${agentOnly ? "（Agent 会话部分）" : ""}`;
       metricNote.title = "按「会话 + 输入/输出/缓存读 token」和 Magpie 自己的用量日志对账，"
         + "对上的直接用网关实测 ttft_ms / ms（实测 0 ms 误差）。"
         + (rest > 0
           ? `还有 ${fmtCount(rest)} 轮没对上：${fmtCount(mm.header)} 轮按 DSH request/header 时刻推算，其余用 step 口径。`
-          : "这个窗口里的每一轮都取到了网关实测值。")
-        + (mm.rounds - denom > 0 ? `另有 ${fmtCount(mm.rounds - denom)} 轮没经过 Magpie 网关，用 step 口径。` : "");
+          : "这个窗口里 Agent 会话的每一轮都取到了网关实测值。")
+        + (mm.rounds - denom > 0 ? `另有 ${fmtCount(mm.rounds - denom)} 轮没经过 Magpie 网关，用 step 口径。` : "")
+        + (agentOnly ? "本机 8010 流水是本机自己测的时间，不走这套对账。" : "");
     }
   }
   $("#sideCount").title = fullCalls != null
-    ? (allScope
-      ? `当前筛选下共 ${fullCalls} 条 Agent 会话记录（DSH / Claude / Pi / Codex）；切到「本机路由流水」只看经过 8010 的请求`
-      : `当前筛选下共 ${fullCalls} 条调用记录（本机路由落盘流水，可一直往下翻）`)
+    ? (reqScope() === "router"
+      ? `只看经过本机 8010 的 ${fullCalls} 条调用记录（带失败、重试与上游尝试）`
+      : reqScope() === "external"
+        ? `只看绕过本机 8010 的 ${fullCalls} 条 Agent 轮（DSH / Claude / Pi / Codex 的会话记录；不含失败信息）`
+        : `所有请求共 ${fullCalls} 条 = 绕过本机 8010 的 Agent 轮 + 8010 的全部流水`)
     : "调用记录";
 
   // ---- 统计区 ----
@@ -2698,9 +2723,11 @@ function renderSide() {
     <div class="ovc"><b style="color:var(--warn)">${fmtNum(totals.cache_write)}</b><span>缓存写</span></div>
   </div>
   <div class="hint" style="padding:2px 2px 8px">
-    ${allScope
-      ? "全部 Agent 会话来自 DSH / Claude / Pi / Codex 的会话记录；会话记录只包含成功轮，失败数不单独提供；首字来自流式首个内容块。切到「本机路由流水」可查看 8010 的失败、重试与上游尝试。"
-      : "「总请求」按客户端请求算（失败会换下一个，还算一次）；「上游尝试」按实际发给上游算——换过一次就会多一两次。和右上角每个上游卡片里的「请求/成功/失败」是同一口径。每个上游条上的「N 败」是该上游自己失败的次数（换家过程中失败的也算），所以各条相加会大于客户端「失败」——想看某个上游的真实情况，就在上面的下拉里选它。"}
+    ${reqScope() === "router"
+      ? "「只过 LLM Router」= 本机 8010 的落盘流水。「总请求」按客户端请求算（失败会换下一个，还算一次）；「上游尝试」按实际发给上游算——换过一次就会多一两次。和右上角每个上游卡片里的「请求/成功/失败」是同一口径。每个上游条上的「N 败」是该上游自己失败的次数（换家过程中失败的也算），所以各条相加会大于客户端「失败」——想看某个上游的真实情况，就在上面的下拉里选它。"
+      : reqScope() === "external"
+        ? "「不过 LLM Router」只列<b>绕过本机 8010</b> 的 Agent 轮（DSH / Claude / Pi / Codex 的会话记录）。会话记录只保留成功轮，失败数不单独提供。想看 8010 那边的失败、重试与上游尝试，切到「只过 LLM Router」。"
+        : "「所有请求」= 绕过本机 8010 的 Agent 轮 + 8010 的全部流水（两边的逐轮记录在这里合成一份，与会话对账页的「今日所有请求」同一个集合）。会话记录不含失败轮，所以「失败」只统计 8010 那部分；切到「只过 LLM Router」可以只看本机流水。"}
   </div>`;
 
   const glist = filter
@@ -3024,23 +3051,16 @@ function renderTabNums() {
     uCount.textContent = upsAll.length
       ? `${upsAll.length} 个上游，其中 ${nOn} 个已启用` : "";
   }
-  // 角标 = 落盘流水里的总条数（跨重启累计，和列表同一个来源）。
-  // 优先用流水索引的 total；索引还没读到就退回聚合统计。
-  const journalTotal = journalIndex && journalIndex.total != null
-    ? journalIndex.total : null;
-  const liveAll = journalPage && journalPage.scope === "all" ? journalPage.total : null;
-  const allTotals = (state.stats || {}).totals || {};
-  const fallback = (state.stats_range || {}).totals || (state.call_stats || {}).totals || {};
-  const totals = allTotals.calls != null ? allTotals : fallback;
-  const nCalls = liveAll != null ? liveAll
-                                  : (journalTotal != null ? journalTotal
-                                  : (totals.calls != null ? totals.calls : 0));
-  // tab 上的数字是「累计请求数」，不是错误数：失败多少条在 tooltip 里说，
-  // 别把整个数字染红，否则 410 会被误读成 410 个错误
-  setTabNum("req", nCalls, false,
-            `调用记录共 ${nCalls} 条（全部 Agent 会话；可切到本机路由流水）；` +
-            `按天 / 按月 / 按分组筛选，` +
-            `${totals.failed ? `其中 ${totals.failed} 次失败` : "没有失败"}`);
+  // 角标 = 当前筛选（口径 + 天 / 月 / 分组）下的条数，和列表里的 total 同一个数。
+  // 这里不能用「跨重启累计」的 journalIndex.total：切到「只过 LLM Router」时
+  // 那个数是全部落盘，而列表是今天那一段 —— 同一屏两个口径，看上去就是
+  // 「请求记录」自己在打架。
+  const nCalls = journalPage && journalPage.total != null
+    ? journalPage.total
+    : (journalIndex && journalIndex.total != null ? journalIndex.total : 0);
+  // tab 上的数字是请求条数，不是错误数：别把整个数字染红，
+  // 否则 410 会被误读成 410 个错误。失败数在面板里，按当前筛选算。
+  setTabNum("req", nCalls, false, `${reqScopeLabel(reqScope())} · 当前筛选 ${nCalls} 条`);
   const ups = state.upstreams || [];
   setTabNum("up", ups.length, false, `${ups.length} 个上游`);
   const nModels = Object.keys(state.models || {}).length;
@@ -3518,17 +3538,29 @@ async function refresh() {
     const firstLoad = !state;
     if (firstLoad && curTab === "req") {
       // 首屏一次拿齐统计 + 流水索引 + 第一页，省掉 3 个串行 RTT。
+      // /bootstrap 里的流水切片走 journal::query，它只认 day / month / 分组这些参数，
+      // **不认 range**：之前首屏只传了 range，切片就成「全部日期」，
+      // 于是列表顶着「共 1,045 条」而面板统计和日期下拉都是今天。
       const bq = new URLSearchParams({
         full: "0",
         range: statsRangeKey(),
         limit: String(REQ_PAGE),
         offset: "0",
       });
+      const bf = curJournalFilter();
+      if (bf.day) bq.set("day", bf.day);
+      if (bf.month) bq.set("month", bf.month);
+      if (bf.group) bq.set("group", bf.group);
+      if (bf.upstream) bq.set("upstream", bf.upstream);
+      if (bf.model) bq.set("model", bf.model);
       const boot = await api("/bootstrap?" + bq.toString());
       state = boot.stats || {};
       journalIndex = boot.journal_index || null;
-      journalPage = boot.journal || null;
-      journalHydrated = true;
+      // /bootstrap 里的流水切片走 /admin/journal（8MB 尾部、没有分组聚合），而三个
+      // 口径现在统一走 /sessions/records 的同一套逐轮记录 + 聚合 —— 拿它当首屏列表
+      // 就会出现「列表一份账、统计卡另一份账」。所以首屏不用它，紧接着自己取一次。
+      journalPage = null;
+      journalHydrated = false;
     } else {
       const wantFull = curTab === "up" || curTab === "model";
       let statsUrl = "/stats?full=" + (wantFull ? "1" : "0");
@@ -4425,14 +4457,6 @@ function handleSocket(m) {
   }
 }
 
-function dayKeyOfTs(at) {
-  const n = Number(at || 0);
-  if (!n) return "";
-  const d = new Date(n * 1000);
-  const p = (x) => String(x).padStart(2, "0");
-  return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())}`;
-}
-
 // 实时增量插入后要重取一次列表：见 applyJournalDelta 里的说明。
 let liveReloadTimer = null;
 function scheduleLiveReload() {
@@ -4449,27 +4473,10 @@ function scheduleLiveReload() {
 
 function applyJournalDelta(entry) {
   if (!journalPage || curTab !== "req") return;
-  // 「全部 Agent 会话」的第一行是服务端按当前口径换算过的（首字/耗时会被换成
-  // New API / Magpie 的算法）；这条增量是原始流水，直接插进去会和其余行不是一个口径，
-  // 所以这里不插，改为稍后整页重取。
-  if (journalPage.scope === "all") { scheduleLiveReload(); return; }
-  const f = curJournalFilter();
-  const day = dayKeyOfTs(entry.at);
-  if (f.day && day && day !== f.day) return;
-  if (f.month && !day.startsWith(f.month)) return;
-  if (f.group && (entry.model || "") !== f.group) return;
-  if (f.upstream && (entry.upstream || "") !== f.upstream) {
-    const inTrail = (entry.trail || []).some((s) => s.upstream === f.upstream);
-    if (!inTrail) return;
-  }
-  const key = String(entry.at);
-  const list = journalPage.entries || [];
-  if (list.some((x) => String(x.at) === key)) return;
-  journalPage.entries = [entry, ...list].slice(0, 200);
-  journalPage.total = (journalPage.total || 0) + 1;
-  lastSideHash = "";
-  renderSide();
-  renderTabNums();
+  // 三个口径都是服务端按当前口径聚合好的整份结果（首字/耗时会被换成 New API /
+  // Magpie 的算法，统计卡也来自同一份逐轮记录）；把这条原始流水直接插进列表，
+  // 会让这一行和其余行不是一个口径、统计卡也不会跟着涨，所以统一改为稍后整页重取。
+  scheduleLiveReload();
 }
 
 /* ================= 本机 Agent 接入 ================= */
@@ -5215,11 +5222,15 @@ function reqRangeLabel(r) {
 // 就会比列表少一大截（尤其是没走本机路由的那些 Agent 调用）。
 function reqChartQuery() {
   const f = curJournalFilter();
-  const scope = ($("#sideSource") && $("#sideSource").value) === "router" ? "router" : "all";
+  const src = reqScope();
+  const scope = src === "router" ? "router" : "all";
   const win = ($("#reqChartRange") && $("#reqChartRange").value) || "list";
   const qs = new URLSearchParams();
   qs.set("scope", scope);
   qs.set("metric", timingMode());
+  // 图表也跟着三个口径走：所有请求 = Agent 轮 + 8010 流水，不过 LLM Router = 只 Agent 轮
+  if (src === "external") qs.set("route", "external");
+  else if (src === "all") qs.set("include", "router");
   if (f.group) qs.set("group", f.group);
   if (f.upstream) qs.set("upstream", f.upstream);
   if (f.model) qs.set("model", f.model);
@@ -5642,8 +5653,8 @@ function sessSources() {
 function sessRow(r) {
   const meta = sessSourceMeta(r.source);
   const routed = r.routed
-    ? `<span class="sess-route ok"><i></i>走路由</span>`
-    : `<span class="sess-route bad"><i></i>未走路由</span>`;
+    ? `<span class="sess-route ok"><i></i>过 LLM Router</span>`
+    : `<span class="sess-route bad"><i></i>不过 LLM Router</span>`;
   return `<tr>
     <td><span class="sess-src"><span class="sess-src-dot" style="--h:${meta.hue}">${meta.letter}</span><b title="${esc(r.agent || meta.label)}">${esc(r.agent || meta.label)}</b></span></td>
     <td><code class="sess-code provider" title="${esc(r.provider || "-")}">${esc(r.provider || "-")}</code></td>
@@ -5676,13 +5687,13 @@ function sessItem(s) {
       <span class="sess-src-dot" style="--h:${meta.hue}">${meta.letter}</span>
       <b>${esc(s.agent || meta.label)}</b>
       <span class="badge blue">${esc(s.project || "(未知项目)")}</span>
-      ${ext ? `<span class="sess-route bad"><i></i>未走路由 ${fmtCount(ext)} 轮</span>` : `<span class="sess-route ok"><i></i>全部走路由</span>`}
+      ${ext ? `<span class="sess-route bad"><i></i>不过 LLM Router ${fmtCount(ext)} 轮</span>` : `<span class="sess-route ok"><i></i>全部过 LLM Router</span>`}
       <span class="sess-item-time">最近 ${sessAt(s.ended_ms)}</span>
     </div>
     <div class="sess-item-stats">
       <div class="sess-item-stat"><b>${fmtCount(total)}</b><span>总轮数</span></div>
       <div class="sess-item-stat ok"><b>${pct.toFixed(1)}%</b><span>路由覆盖</span></div>
-      <div class="sess-item-stat ${ext ? "bad" : ""}"><b>${fmtCount(ext)}</b><span>未走路由</span></div>
+      <div class="sess-item-stat ${ext ? "bad" : ""}"><b>${fmtCount(ext)}</b><span>不过 LLM Router</span></div>
       <div class="sess-item-stat"><b>${dur}</b><span>会话时长</span></div>
     </div>
     ${models ? `<div class="sess-item-models"><span class="hint" style="font-size:9.5px">外部模型</span>${models}</div>` : ""}
@@ -5728,9 +5739,9 @@ function renderSessions() {
   }
 
   $("#sessTotals").innerHTML = [
-    sessStat("今日所有请求", fmtCount(all), "过路由 + 未走路由", "accent", "◷"),
+    sessStat("今日所有请求", fmtCount(all), "过 + 不过 LLM Router", "accent", "◷"),
     sessStat("过 LLM Router", fmtCount(routed), all ? `包含在 ${fmtCount(all)} 轮中 · ${coverage.toFixed(1)}%` : "—", "ok", "✓"),
-    sessStat("未走路由", fmtCount(ext), all ? `占 ${extPct.toFixed(1)}%` : "—", ext ? "bad" : "ok", "⇄"),
+    sessStat("不过 LLM Router", fmtCount(ext), all ? `占 ${extPct.toFixed(1)}%` : "—", ext ? "bad" : "ok", "⇄"),
     sessStat("输入 tokens", fmtNum(t.input), "会话记录累计", "", "↓"),
     sessStat("输出 tokens", fmtNum(t.output), "会话记录累计", "", "↑"),
     sessStat("缓存读", fmtNum(t.cache_read), "prompt cache hit", "", "◈"),
@@ -5744,13 +5755,17 @@ function renderSessions() {
   const byModel = (j.by_model || []).slice(0, 5).map(m =>
     `<code>${esc(m.model)} · ${fmtCount(m.rounds)} 轮</code>`
   ).join("");
+  // 把两种口径的对应关系写出来：这一页的「今日所有请求」= 不过 LLM Router 的 Agent 轮
+  // + 8010 的全部流水（并集），也就是「请求记录」页默认口径「所有请求」；
+  // 想看单个口径就在那一页的「数据口径」下拉里切。
   $("#sessCompare").innerHTML = `
     <div class="sess-compare-top">
       <b>今日请求构成</b>
-      <span class="hint">全部 ${fmtCount(all)} 轮 = 过 LLM Router ${fmtCount(routed)} 轮 + 未走路由 ${fmtCount(ext)} 轮 · ${jLine}</span>
+      <span class="hint">全部 ${fmtCount(all)} 轮 = 过 LLM Router ${fmtCount(routed)} 轮 + 不过 LLM Router ${fmtCount(ext)} 轮 · ${jLine}
+        · 「请求记录」页默认的「所有请求」= 同一个并集 ${fmtCount(all)} 轮；只想看本机 8010 流水就切「只过 LLM Router」（${fmtCount(routed)} 轮），只想看绕过本机的 Agent 轮就切「不过 LLM Router」（${fmtCount(ext)} 轮）</span>
       <div class="sess-compare-legend">
-        <span><i class="ok"></i>走路由 ${fmtCount(routed)} 轮</span>
-        <span><i class="bad"></i>未走路由 ${fmtCount(ext)} 轮</span>
+        <span><i class="ok"></i>过 LLM Router ${fmtCount(routed)} 轮</span>
+        <span><i class="bad"></i>不过 LLM Router ${fmtCount(ext)} 轮</span>
       </div>
     </div>
     <div class="sess-ratio">
@@ -5774,7 +5789,7 @@ function renderSessions() {
       }).join("")
     : `<div class="sess-empty">没有启用的数据源。</div>`;
 
-  setTabNum("sessions", ext, ext > 0, "窗口内没走本机路由的调用轮数");
+  setTabNum("sessions", ext, ext > 0, "窗口内不过 LLM Router 的调用轮数");
 
   let rows = (d.rows || []).slice();
   if (routeMode === "external") rows = rows.filter(r => !r.routed);

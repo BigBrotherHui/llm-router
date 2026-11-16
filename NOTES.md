@@ -1,5 +1,40 @@
 # NOTES
 
+## 2026-11-16 v2.10.0：请求记录拆成三口径，并修掉「今日请求数」和流水对不上的四处
+
+起因：用户报「会话对账里的今日请求次数和请求记录没对上」，随后明确要的口径是
+**所有请求 / 只过 LLM Router / 不过 LLM Router，默认所有请求**。实测下来「对不上」
+不是一个 bug，是四个独立原因叠在一起：
+
+1. **首屏切片不认 `range`**：`/bootstrap` 里的流水切片走 `journal::query`，它只认
+   `day`/`month`/分组，前端却只传了 `range` —— 于是列表顶着「共 1,045 条（全部日期）」，
+   旁边统计卡和日期下拉都是今天（117）。
+2. **tab 角标用了累计数**：`renderTabNums` 在 router 口径下回退到 `journalIndex.total`
+   （跨重启的落盘总数，1075），而列表是当天 149 条。
+3. **日界是 UTC**：`journal.rs` 的 `date_of` 用 `DateTime::from_timestamp`（UTC）取日期，
+   而前端默认日、会话对账窗口、`stats.rs`/`insights.rs` 的日桶都是本机时区 ——
+   本机 00:00–08:00 的请求会掉进前一个 UTC 日，「请求记录 → 今天」凭空少一截。
+4. **托盘 tooltip**「今日 N 次」只算了过路由的，和 HUD 的「今日所有请求」不是一个数。
+
+**踩到的坑：流水里的 `time` 只有时分秒**（`"15:07:09"`）。第一版拿它当前缀筛日期，
+`starts_with("2026-11-16")` 一条都不命中，`include=router` 直接少掉 8010 那半边
+（表现为「所有请求 = 不过 LLM Router」）。日期必须从 `at` 按本机时区算。
+
+**结构上的决定**：新增 `journal_as_records()`，把 SQLite 索引里的 8010 流水转成与会话
+记录**同形**的逐轮记录，于是三档口径共用同一套扫描 / 聚合 / 分桶代码：
+
+- 所有请求 = `include=router`（Agent 侧强制 `route=external`，否则过了 8010 的那一轮会被算两遍）
+- 只过 LLM Router = `journal_only=1`（不扫 Agent 会话）
+- 不过 LLM Router = `route=external`
+
+这样列表、角标、统计卡、分组、图表都是同一份逐轮记录算出来的，不会再出现旧实现里
+「列表 289 / 统计卡 286」那种落盘流水与 `config.stats.json` 滚动聚合之间的差。
+`/admin/journal` 保留给单条正文（`/journal/entry`）和旧链接，不再当列表用。
+
+验证：`tools/debug/_dbg_three_scopes.py` 断言「所有 = 只过 + 不过 = 会话对账同一并集」
+（实测 609 = 325 + 284，图表同为 609，按分组筛 100 条）；`_dbg_day_boundary.py` 起一个
+临时实例塞「本机今天凌晨 03:00」的流水，断言它落在**本机日**而不是 UTC 日。
+
 ## 2026-11-01 v2.9.1：把「直连」的谎话堵住（TUN + fake-ip 实测）
 
 用户追问：「在 llm-router 里配好了还要粘到 Clash？不能配了就生效吗？」

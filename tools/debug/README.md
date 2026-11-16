@@ -41,6 +41,11 @@ DSH harness ──(pi-ai adapter)──> billion-context 插件 ──> llm-rout
 | `_bak_probe.mjs` | 在 `cordis.patch.yml` 的历史备份里找某模型卡片（追溯配置漂移） | `node tools/debug/_bak_probe.mjs deepseek` |
 | `_settings_probe.mjs` | 打印 `~/.dsh/settings.yaml` / profile 的 provider 段 | `node tools/debug/_settings_probe.mjs` |
 | `_headless_overlay.yml` | `dsh --profile headless --patch` 用的 overlay 样例：把 provider 指向抓包代理 | `dsh --profile headless --patch tools/debug/_headless_overlay.yml "reply ok"` |
+| `_dbg_reconcile.py` | **口径对账**（找「请求记录 / 会话对账 对不上」先跑这个）：一次取齐「今日」的全部请求数 —— 会话对账三项、请求记录两个口径、tab 角标来源、`/stats` 当天聚合、SQLite 索引、JSONL 行数，并列打印 | `python tools/debug/_dbg_reconcile.py` |
+| `_dbg_journal_diff.py` | JSONL 全量 vs 8MB 尾部的行数、逐日「本地日 / UTC 日」桶、去重与索引总行数（判断少算是截断还是日界） | `python tools/debug/_dbg_journal_diff.py` |
+| `_dbg_stats_gap.py` | 盯一会儿「面板统计 calls vs 列表 total」的差值：恒定 = 上次硬杀进程丢掉的滚动聚合；持续变大 = 真口径差 | `python tools/debug/_dbg_stats_gap.py` |
+| `_dbg_day_boundary.py` | **回归用例**：临时实例（`LLM_ROUTER_PORT=18011` + 独立状态文件，不动 8010）里塞一条「本机今天凌晨 03:00」的流水，断言它落在本机日而不是 UTC 日 | `python tools/debug/_dbg_day_boundary.py` |
+| `_dbg_three_scopes.py` | **请求记录三口径对账**：所有请求 / 只过 LLM Router / 不过 LLM Router 三个数必须满足「所有 = 只过 + 不过」，且与会话对账的「今日所有请求」一致；顺带验图表口径与「按分组筛」 | `python tools/debug/_dbg_three_scopes.py` |
 
 ## 取证素材位置（排障先看这里）
 
@@ -60,4 +65,7 @@ DSH harness ──(pi-ai adapter)──> billion-context 插件 ──> llm-rout
 - **zstd**：DSH 会话文件是**多帧**拼接，必须逐帧找 magic `28 B5 2F FD` 分别解压再拼。
 - **cargo 不在 PATH**：实际在 `C:\Users\<user>\.cargo\bin\cargo.exe`。
 - **重编译前先停进程**：否则链接阶段报 `error: failed to remove file ...llm-router-desktop.exe  Caused by: 拒绝访问 (os error 5)`。
+- **重启 App 必须带 `LLM_ROUTER_STATE`**：直接用 `D:\llm-router-target\release\llm-router-desktop.exe` 起进程时，它会沿 exe 目录向上找 `.llmrouter`，找不到就落到 `%APPDATA%\com.llmrouter.desktop\.llmrouter` —— 那里是另一份**空状态**，8010 上会冒出一个只有示例上游的实例（面板全是 0，看着像数据丢了）。正确姿势：
+  `$env:LLM_ROUTER_STATE='<repo>\.llmrouter\config.state.json'; Start-Process <exe路径>`（history / stats / sqlite 都按这个文件所在目录推导）。
+- **硬杀进程会丢滚动聚合**：`config.stats.json`（面板「总请求」的来源）写盘有节流，`Stop-Process -Force` 丢掉最后一段 → 之后列表比面板恒定多那几条（不扩散）。要数字干净就少硬杀，或容忍这个常量差。
 - **bili 配置优先级**：known output ceiling 的解析顺序是「客户端上报 `x-bili-plugin-max-output` > launcher 通道 > bili 配置声明 > models.dev 注册表」—— 光改 bili 配置压不住客户端上报值。

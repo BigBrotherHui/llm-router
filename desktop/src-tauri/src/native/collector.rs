@@ -130,6 +130,8 @@ pub fn start(state: Arc<AppState>) {
                 upstream: None,
                 model: None,
                 offset: None,
+                include: None,
+                journal_only: None,
             };
             invalidate(&scan_key(&scan_q));
             let _ = sessions::scan(State(state.clone()), Query(scan_q)).await;

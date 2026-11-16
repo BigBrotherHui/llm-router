@@ -68,7 +68,11 @@ pub fn strip_heavy(mut entry: Value) -> Value {
 fn date_of(entry: &Value) -> String {
     let at = entry.get("at").and_then(|v| v.as_f64()).unwrap_or(0.0);
     if let Some(dt) = chrono::DateTime::from_timestamp(at as i64, 0) {
-        dt.format("%Y-%m-%d").to_string()
+        // 按**本机时区**取日期：from_timestamp 拿到的是 UTC，直接 format 出来的
+        // 是 UTC 日。会话对账那边的「今天」是本机当天 00:00 起（README 的约定），
+        // 于是本机 00:00–08:00 的请求在这边会掉进前一个 UTC 日，
+        //「请求记录 → 今天」比会话对账少一截。
+        dt.with_timezone(&chrono::Local).format("%Y-%m-%d").to_string()
     } else {
         String::new()
     }
