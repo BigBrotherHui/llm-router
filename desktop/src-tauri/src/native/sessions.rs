@@ -560,9 +560,16 @@ fn add_json_bases(text: &str, map: &mut HashMap<String, String>) {
     for holder in ["providers", "provider"] {
         if let Some(obj) = v.get(holder).and_then(|x| x.as_object()) {
             for (name, pv) in obj {
+                let label = pv
+                    .get("name")
+                    .and_then(|x| x.as_str())
+                    .map(|s| s.trim())
+                    .filter(|s| !s.is_empty())
+                    .unwrap_or("");
+                let mut urls: Vec<&str> = Vec::new();
                 for key in ["baseUrl", "baseURL", "base_url", "url"] {
                     if let Some(u) = pv.get(key).and_then(|x| x.as_str()) {
-                        insert_base(map, name, u);
+                        urls.push(u);
                     }
                 }
                 if let Some(u) = pv
@@ -570,7 +577,15 @@ fn add_json_bases(text: &str, map: &mut HashMap<String, String>) {
                     .and_then(|o| o.get("baseURL").or_else(|| o.get("baseUrl")))
                     .and_then(|x| x.as_str())
                 {
+                    urls.push(u);
+                }
+                for u in urls {
                     insert_base(map, name, u);
+                    // 配置里的显示名（如 localrouter → llm-router）也要能查到地址，
+                    // 否则按 name 传进来的 provider 会被误判成没走路由。
+                    if !label.is_empty() {
+                        insert_base(map, label, u);
+                    }
                 }
             }
         }
@@ -622,11 +637,13 @@ fn collect_bases(home: &Path) -> HashMap<String, String> {
     add_json_bases(&read(&home.join(".pi").join("agent").join("models.json")), &mut map);
     // Claude Code
     add_json_bases(&read(&home.join(".claude").join("settings.json")), &mut map);
-    // opencode
-    add_json_bases(
-        &read(&home.join(".config").join("opencode").join("opencode.json")),
-        &mut map,
-    );
+    // opencode：json / jsonc 两套都读（dli_ds 这类 provider 只在 jsonc 里）
+    for name in ["opencode.json", "opencode.jsonc"] {
+        add_json_bases(
+            &read(&home.join(".config").join("opencode").join(name)),
+            &mut map,
+        );
+    }
     // Codex
     add_toml_bases(&read(&home.join(".codex").join("config.toml")), &mut map);
     // Kimi Code
@@ -976,6 +993,7 @@ pub fn today_totals(port: u16) -> TodayTotals {
         scan_codex(&mut ctx, &home, &mut st);
         let mut st = blank_stat("orca", "Orca");
         scan_orca(&mut ctx, &home, &mut st);
+        scan_opencode(&mut ctx, &home, &mut st);
     }
     let mut t = TodayTotals::default();
     for a in aggs.values() {
@@ -1126,6 +1144,7 @@ pub fn session_cache_ledger(
         scan_codex(&mut ctx, &home, &mut st);
         let mut st = blank_stat("orca", "Orca");
         scan_orca(&mut ctx, &home, &mut st);
+        scan_opencode(&mut ctx, &home, &mut st);
     }
 
     let mut totals = LedgerAgg::default();
@@ -1224,6 +1243,7 @@ fn scan_records(
         scan_codex(&mut ctx, &home, &mut st);
         let mut st = blank_stat("orca", "Orca");
         scan_orca(&mut ctx, &home, &mut st);
+        scan_opencode(&mut ctx, &home, &mut st);
     }
     let mut days: Vec<String> = records.iter().filter_map(|r| r["time"].as_str().map(|s| s.chars().take(10).collect())).collect();
     days.sort(); days.dedup();
@@ -2680,6 +2700,17 @@ fn scan_orca(ctx: &mut Ctx, home: &Path, st: &mut SrcStat) {
         }
     }
 
+    // opencode 的会话由 scan_opencode 用 opencode.db 的逐轮用量覆盖：
+    // Orca 账本只记「一轮 prompt」且没有 provider/token，dli 这类直连上游完全解析不出来。
+    let opencode_covered: HashSet<String> = {
+        let roots = orca_workspaces(home);
+        opencode_sessions(home)
+            .into_iter()
+            .filter(|(id, _, dir)| !id.is_empty() && is_orca_workspace(dir, &roots))
+            .map(|(id, _, _)| id)
+            .collect()
+    };
+
     // 2) 轮次。同一轮会被反复重写（revision），rowid 倒序先看到的是最新版本，按 itemId 去重；
     //    倒序 + limit 同时把「全部时间」压在最近一段，避免 90 万行的索引整份扫一遍。
     const ORCA_ROW_LIMIT: usize = 20_000;
@@ -2732,6 +2763,10 @@ fn scan_orca(ctx: &mut Ctx, home: &Path, st: &mut SrcStat) {
         let meta = owner.get(&ses).and_then(|g| metas.get(g));
         if let Some(meta) = meta {
             if matches!(meta.agent.as_str(), "claude" | "pi" | "codex") {
+                skipped += turns.len() as u64;
+                continue;
+            }
+            if meta.agent == "opencode" && opencode_covered.contains(&ses) {
                 skipped += turns.len() as u64;
                 continue;
             }
@@ -2812,7 +2847,7 @@ fn scan_orca(ctx: &mut Ctx, home: &Path, st: &mut SrcStat) {
     }
     st.ms += started.elapsed().as_millis() as u64;
     st.note = if skipped > 0 {
-        format!("跳过 {skipped} 轮 claude/pi/codex（各自 jsonl 已覆盖）")
+        format!("跳过 {skipped} 轮 claude/pi/codex/opencode（各自账本已覆盖）")
     } else {
         "opencode 这类 ACP Agent 只有这里有账本".to_string()
     };
@@ -2957,14 +2992,14 @@ fn path_leaf(p: &str) -> String {
         .to_string()
 }
 
-/// ses_* → agent/project。两层来源：
-/// 1. Orca 的 ACP 账本（有会话名和工作区，最准）；
-/// 2. opencode 自己的会话库（补上没进 Orca 账本的：Orca 终端里直接跑的 opencode）。
 fn looks_like_path(s: &str) -> bool {
     let s = s.trim();
     s.contains("::") || s.contains('/') || s.contains('\\')
 }
 
+/// ses_* → agent/project。两层来源：
+/// 1. Orca 的 ACP 账本（有会话名和工作区，最准）；
+/// 2. opencode 自己的会话库（补上没进 Orca 账本的：Orca 终端里直接跑的 opencode）。
 fn build_session_labels() -> HashMap<String, SessionLabel> {
     let home = home();
     let mut out: HashMap<String, SessionLabel> = HashMap::new();
@@ -3010,6 +3045,241 @@ fn build_session_labels() -> HashMap<String, SessionLabel> {
         }
     }
     out
+}
+
+/// opencode 的配置文件：json / jsonc 都读，显示名和 baseURL 都在这里。
+fn opencode_config_paths(home: &Path) -> Vec<PathBuf> {
+    [
+        home.join(".config").join("opencode").join("opencode.json"),
+        home.join(".config").join("opencode").join("opencode.jsonc"),
+        home.join("AppData").join("Roaming").join("opencode").join("opencode.json"),
+        home.join("AppData").join("Roaming").join("opencode").join("opencode.jsonc"),
+        home.join("Library").join("Application Support").join("opencode").join("opencode.json"),
+        home.join("Library").join("Application Support").join("opencode").join("opencode.jsonc"),
+    ]
+    .into_iter()
+    .filter(|p| p.is_file())
+    .collect()
+}
+
+fn provider_labels_from_text(text: &str) -> HashMap<String, String> {
+    let mut out = HashMap::new();
+    let Ok(v) = serde_json::from_str::<Value>(&super::agents::strip_jsonc(
+        text.trim_start_matches('\u{feff}'),
+    )) else {
+        return out;
+    };
+    let Some(providers) = v
+        .get("provider")
+        .or_else(|| v.get("providers"))
+        .and_then(|x| x.as_object())
+    else {
+        return out;
+    };
+    for (key, pv) in providers {
+        let label = pv
+            .get("name")
+            .and_then(|x| x.as_str())
+            .map(|s| s.trim())
+            .filter(|s| !s.is_empty())
+            .unwrap_or(key.as_str());
+        out.entry(key.clone()).or_insert_with(|| label.to_string());
+    }
+    out
+}
+
+/// providerID → 显示名（localrouter → llm-router、dli_ds → dli_ds）。
+/// 先读 opencode.json 再读 jsonc：两边都有 localrouter 时保持原来「llm-router」的口径。
+fn opencode_provider_labels(home: &Path) -> HashMap<String, String> {
+    let mut out = HashMap::new();
+    for p in opencode_config_paths(home) {
+        let Ok(text) = std::fs::read_to_string(&p) else {
+            continue;
+        };
+        for (k, v) in provider_labels_from_text(&text) {
+            out.entry(k).or_insert(v);
+        }
+    }
+    out
+}
+
+struct OpencodeRound {
+    ses: String,
+    provider: String,
+    model: String,
+    at: i64,
+    duration_ms: Option<f64>,
+    usage: [u64; 5],
+}
+
+/// 读 opencode 的逐轮用量（一条 assistant message = 一次上游调用）。
+/// 只按给定的会话用 (session_id, time_created) 索引逐条查：
+/// 整库按时间扫会读 10 GB 的 message.data，实测要 1.4–6 秒，这里只要几十毫秒。
+fn opencode_rounds(home: &Path, since_ms: i64, session_ids: &[String]) -> Vec<OpencodeRound> {
+    let mut out = Vec::new();
+    let Some(db) = opencode_db(home) else {
+        return out;
+    };
+    let Some(conn) = orca_open(&db) else {
+        return out;
+    };
+    let Ok(mut stmt) = conn.prepare(
+        "select json_extract(data,'$.providerID'), json_extract(data,'$.modelID'), \
+         time_created, json_extract(data,'$.time.completed'), \
+         json_extract(data,'$.tokens.input'), json_extract(data,'$.tokens.output'), \
+         json_extract(data,'$.tokens.cache.read'), json_extract(data,'$.tokens.cache.write') \
+         from message \
+         where session_id=?1 and time_created>=?2 and json_extract(data,'$.role')='assistant' \
+         order by time_created asc",
+    ) else {
+        return out;
+    };
+    let since = since_ms.max(0);
+    for sid in session_ids {
+        let Ok(rows) = stmt.query_map(rusqlite::params![sid, since], |r| {
+            Ok((
+                r.get::<_, Option<String>>(0)?,
+                r.get::<_, Option<String>>(1)?,
+                r.get::<_, i64>(2)?,
+                r.get::<_, Option<i64>>(3)?,
+                r.get::<_, Option<i64>>(4)?,
+                r.get::<_, Option<i64>>(5)?,
+                r.get::<_, Option<i64>>(6)?,
+                r.get::<_, Option<i64>>(7)?,
+            ))
+        }) else {
+            continue;
+        };
+        for row in rows.flatten() {
+            let (provider, model, created, completed, input, output, cache_read, cache_write) = row;
+            let provider = provider.unwrap_or_default().trim().to_string();
+            let model = model.unwrap_or_default().trim().to_string();
+            if provider.is_empty() && model.is_empty() {
+                continue;
+            }
+            let input = input.unwrap_or(0).max(0) as u64;
+            let output = output.unwrap_or(0).max(0) as u64;
+            let cache_read = cache_read.unwrap_or(0).max(0) as u64;
+            let cache_write = cache_write.unwrap_or(0).max(0) as u64;
+            let done = completed.unwrap_or(0);
+            // 进行中的半条（刚建好、还没有 usage）先不记，避免列表里多出 0 token 的幽灵行。
+            if done <= 0 && input == 0 && output == 0 {
+                continue;
+            }
+            let duration_ms = if done > created && created > 0 {
+                Some((done - created) as f64)
+            } else {
+                None
+            };
+            out.push(OpencodeRound {
+                ses: sid.clone(),
+                provider,
+                model,
+                at: created,
+                duration_ms,
+                usage: [input, output, cache_read, cache_write, input + output],
+            });
+        }
+    }
+    out
+}
+
+/// Orca 里跑的 opencode（ACP 托管 + 终端直跑）：
+/// 用 opencode.db 的 assistant message 当「一轮」，provider / model / token 都按真实值。
+/// 上游是 dli_ds 这种直连 provider 的轮次以前完全解析不出来（Orca 账本没有 provider），
+/// 现在会按 dli_ds / deepseek-v4.1-flash 落进「不过 LLM Router」。
+fn scan_opencode(ctx: &mut Ctx, home: &Path, st: &mut SrcStat) {
+    let Some(db) = opencode_db(home) else {
+        st.note = "没有找到 opencode.db".into();
+        return;
+    };
+    st.root = db.to_string_lossy().to_string();
+    st.files = 1;
+    st.bytes = std::fs::metadata(&db).map(|m| m.len()).unwrap_or(0);
+    let started = Instant::now();
+    let roots = orca_workspaces(home);
+    let labels = opencode_provider_labels(home);
+    let mut sessions: Vec<(String, String, String)> = opencode_sessions(home)
+        .into_iter()
+        .filter(|(id, _, dir)| !id.is_empty() && is_orca_workspace(dir, &roots))
+        .collect();
+    if sessions.is_empty() {
+        st.note = "Orca 工作区里没有 opencode 会话".into();
+        return;
+    }
+    sessions.sort_by(|a, b| a.0.cmp(&b.0));
+    let ids: Vec<String> = sessions.iter().map(|(id, _, _)| id.clone()).collect();
+    let mut by_ses: HashMap<String, Vec<OpencodeRound>> = HashMap::new();
+    for r in opencode_rounds(home, ctx.since_ms, &ids) {
+        by_ses.entry(r.ses.clone()).or_default().push(r);
+    }
+    let meta: HashMap<String, (String, String)> = sessions
+        .into_iter()
+        .map(|(id, title, dir)| (id, (title, dir)))
+        .collect();
+    let mut ids: Vec<String> = by_ses.keys().cloned().collect();
+    ids.sort();
+    for id in ids {
+        let mut rounds = by_ses.remove(&id).unwrap_or_default();
+        if rounds.is_empty() {
+            continue;
+        }
+        rounds.sort_by_key(|r| r.at);
+        let (title, dir) = meta.get(&id).cloned().unwrap_or_default();
+        let title = title.trim().to_string();
+        let project = if title.is_empty() { path_leaf(&dir) } else { title };
+        let mut sess = Sess {
+            source: "orca".into(),
+            agent: "Orca · opencode".into(),
+            id: id.clone(),
+            project,
+            cwd: dir.clone(),
+            path: db.to_string_lossy().to_string(),
+            started_ms: 0,
+            ended_ms: 0,
+            rounds: 0,
+            routed_rounds: 0,
+            input: 0,
+            output: 0,
+            cache_read: 0,
+            cache_write: 0,
+            models: HashMap::new(),
+            all_models: HashMap::new(),
+            providers: HashSet::new(),
+            external_top: String::new(),
+        };
+        for r in rounds {
+            let provider = labels
+                .get(&r.provider)
+                .cloned()
+                .unwrap_or_else(|| r.provider.clone());
+            let provider = if provider.is_empty() {
+                "(未记录)".to_string()
+            } else {
+                provider
+            };
+            ctx.round(
+                "orca",
+                "Orca · opencode",
+                &mut sess,
+                &provider,
+                &r.model,
+                r.at,
+                r.usage,
+                r.duration_ms,
+                None,
+                None,
+                None,
+            );
+        }
+        if sess.rounds > 0 {
+            st.rounds += sess.rounds;
+            st.sessions += 1;
+            ctx.sessions.push(sess);
+        }
+    }
+    st.ms += started.elapsed().as_millis() as u64;
+    st.note = "opencode 逐轮用量（含 dli_ds 等直连 provider）".to_string();
 }
 
 /// ses_* → (agent, project)：把 Orca 的会话名挂到本机流水那几行上，
@@ -3375,6 +3645,7 @@ pub async fn scan(State(state): State<Arc<AppState>>, Query(q): Query<ScanQuery>
                 records: None,
             };
             scan_orca(&mut ctx, &home, &mut st);
+            scan_opencode(&mut ctx, &home, &mut st);
         }
         stats.push(st);
     }
@@ -3966,5 +4237,25 @@ mod tests {
         assert!(!is_orca_workspace("D:/Project/Dental", &roots));
         assert!(!is_orca_workspace("", &roots));
         assert_eq!(path_leaf("C:/Users/me/orca/workspaces/llm-router/kokanee"), "kokanee");
+    }
+
+    /// opencode 的 provider 显示名来自 json/jsonc：localrouter → llm-router，
+    /// dli_ds 这类直连 provider 必须保留自己的名字，才能按 dli 汇总。
+    #[test]
+    fn provider_labels_parse_jsonc() {
+        let text = r#"
+        {
+          // opencode 配置允许注释
+          "provider": {
+            "localrouter": { "name": "llm-router" },
+            "dli_ds": { "name": "dli_ds" },
+            "plain": { "options": { "baseURL": "http://127.0.0.1:8010/v1" } }
+          }
+        }
+        "#;
+        let m = provider_labels_from_text(text);
+        assert_eq!(m.get("localrouter").map(String::as_str), Some("llm-router"));
+        assert_eq!(m.get("dli_ds").map(String::as_str), Some("dli_ds"));
+        assert_eq!(m.get("plain").map(String::as_str), Some("plain"));
     }
 }

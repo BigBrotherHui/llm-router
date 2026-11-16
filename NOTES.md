@@ -1691,8 +1691,44 @@ Orca 的账本在 `%APPDATA%\Orca\agent-session-journal.db`（SQLite 915 MB / 54
     `Orca · opencode` 徽标；展开详情显示「会话来源」。
 - 未动 3670051 的三口径去重（仍是 route=2 的 Agent 轮 + 8010 全部流水），统计数不变。
 
-**已知限制**：只补了「经过 8010 的请求」的归属。完全绕过路由的 opencode 会话目前仍进不了
-「会话对账 / 不过 LLM Router」（没有 opencode 会话扫描源）；opencode.db 只用来反查归属。
-另：`refresh_magpie()` 冷启动在 async 上下文里同步建 `reqwest::blocking::Client` 会 panic
-（`Cannot drop a runtime in a context where blocking is not allowed`，debug 版实测每 10 秒刷屏）；
-release 靠托盘线程先热身躲过，属于独立问题，本次未修。
+**补充（同日）：dli 这类直连 provider 的轮次没解析**
+
+用户反馈：Orca 里调 dli 不止 4 次，但请求记录里看不到。实测确认不是「少记」而是「解析错」：
+
+- opencode 的 provider `dli_ds`（`https://us-v1.dli.li/v1`）是**直连**，不经过 8010，
+  所以 8010 流水里一条都没有（当天 journal：magpie 987 / apikey 7 / crab-ai 4 / superqiyu 2，无 dli）。
+- 只有 opencode 自己的 `message` 表记得每一次调用：今天 1912 条 assistant message 里
+  382 条是 dli_ds / deepseek-v4.1-flash；而 `scan_orca()` 只读 Orca 的 turn 项，
+  provider 只能退回 opencode.json 顶层默认值（localrouter/deepseek），整批被算成
+  「llm-router / deepseek」——所以看不到 dli。
+
+**改动**
+
+- 新增 `scan_opencode()`：把 opencode 的 assistant message 当一轮（`providerID / modelID /
+  time.created-completed / tokens.input-output-cache.read-cache.write`），按会话用
+  `(session_id, time_created)` 索引逐条查（整库按时间扫要读 10.6 GB 的 message.data，
+  实测 1.4–6 秒；逐会话只要 0.03 秒/天、0.58 秒/全部）。只收 Orca 工作区里的会话。
+- `opencode_provider_labels()` / `collect_bases()`：json + jsonc 都读
+  （dli_ds 这类 provider 只在 `opencode.jsonc` 里），provider 的显示名（localrouter →
+  llm-router）也进 baseURL 映射，路由判定不再依赖名字猜。
+- `scan_orca()`：provider=opencode 且 opencode.db 有账本的会话跳过 turn 项
+  （否则 prompt 轮和 API 轮会一起算，数字翻倍）；claude/pi/codex 仍按各自 jsonl。
+- 接入 4 处扫描（today_totals / 缓存账本 / 请求记录 / 会话对账）；会话对账页说明补上
+  `opencode.db` 与 dli。
+- `webui.html` 的 Orca 源说明同步。
+
+**验证（真跑，8011 隔离实例）**
+
+- `cargo test --lib` 18/18（新增 `provider_labels_parse_jsonc`）。
+- `/sessions/scan?sources=orca&range=today&metric=current` →
+  `orca 1954 轮 / 11 会话`，provider 行：
+  `dli_ds/deepseek-v4.1-flash 382（不过路由）`、`magpie/... 100（直连）`、
+  `dshapi 2`、`primerelay 2`、`llm-router/deepseek 1466（过路由）`、`llm-router/gpt-6.1-sol 2`。
+- `/sessions/records?range=today&include=router` → 列表里出现 `source=orca upstream=dli_ds`
+  的行（agent 仍是 `Orca · opencode`，routed=false）；按分组
+  `dli_ds/deepseek-v4.1-flash` 筛 → total=382；走路由的 opencode 轮仍只由 8010 流水提供，
+  没有重复计入。
+
+**仍存在的限制**：`refresh_magpie()` 冷启动在 async 上下文里同步建 `reqwest::blocking::Client`
+会 panic（`Cannot drop a runtime in a context where blocking is not allowed`，debug 实测每 10 秒刷屏）；
+release 靠托盘线程先热身躲过，属于独立问题，未修。

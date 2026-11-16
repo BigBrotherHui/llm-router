@@ -416,7 +416,8 @@
               直接读各家 Agent 自己的会话记录：DSH <code>~/.dsh/sessions/*/*/session.v4.jsonl.zstd</code>、
               Claude Code <code>~/.claude/projects/*/*.jsonl</code>、Pi <code>~/.pi/agent/sessions/*/*.jsonl</code>、
               Codex <code>~/.codex/sessions/*/*/*/rollout-*.jsonl</code>、Orca
-              <code>agent-session-journal.db</code>（opencode 走 ACP，磁盘上只有这一个账本）。按 <b>provider / 模型</b> 汇总后，
+              <code>agent-session-journal.db</code> + opencode <code>opencode.db</code>
+              （逐轮用量；dli_ds 这类直连 provider 也按真实上游解析）。按 <b>provider / 模型</b> 汇总后，
               与本机 <code>8010</code> 落盘流水对照：标「未走路由」的就是绕过 llm-router 直连别处的调用。
             </div>
             <div class="sess-hero-note">
