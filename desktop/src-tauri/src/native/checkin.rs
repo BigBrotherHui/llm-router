@@ -17,6 +17,10 @@ const CHECKIN_PATHS: [&str; 3] = [
 
 const CHROME_UA: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/138.0.0.0 Safari/537.36";
 
+/// 登录页上优先匹配 Linux.do 的 OAuth 入口；可用 checkin.oauth_hint 覆盖
+/// （值按正则片段处理，比如 "github|oauth"）。
+const OAUTH_HINT: &str = r"linux[\s._-]*do|connect\.linux\.do|/api/oauth/linux";
+
 /// 浏览器签到窗口要一个个来：多个 WebView2 同时登录同一站点容易互相抢 cookie，
 /// 也会把内存顶上去。token 模式仍然走原来的 6 并发。
 static BROWSER_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
@@ -294,6 +298,7 @@ pub fn rows(state: &AppState) -> Vec<Value> {
                 "auth": auth,
                 "provider": prov.name,
                 "site_root_custom": cfg_str(&cfg, "site_root"),
+                "oauth_hint": cfg_str(&cfg, "oauth_hint"),
                 "email": cfg_str(&cfg, "email"),
                 "has_password": !cfg_raw(&cfg, "password").is_empty(),
                 "checkin_enabled": enabled,
@@ -748,7 +753,7 @@ async fn run_browser(state: &AppState, up: &Upstream, press: bool) -> Value {
     // 不强制依赖 cookie 名叫 session：先拿用户信息验证会话。失败且站点有响应时，
     // 再用邮箱密码自动登录一次（凭证没配就是 Ok(false)，直接跳过）。
     if !info.ok && info.status != 0 && !info.blocked {
-        match try_browser_login(&win, &root, &prov, &cfg).await {
+        match try_browser_login(state, &win, &root, &prov, &cfg).await {
             Ok(true) => {
                 login_at = chrono::Utc::now().timestamp();
                 cookies = cookies_now(&win, &root).await;
@@ -1061,12 +1066,6 @@ fn read_cookies(win: &WebviewWindow, root: &str) -> Result<Vec<(String, String)>
         .collect())
 }
 
-fn has_session(cookies: &[(String, String)]) -> bool {
-    cookies
-        .iter()
-        .any(|(k, v)| k == "session" && !v.is_empty())
-}
-
 fn cookie_header(cookies: &[(String, String)]) -> String {
     cookies
         .iter()
@@ -1076,6 +1075,7 @@ fn cookie_header(cookies: &[(String, String)]) -> String {
 }
 
 async fn try_browser_login(
+    state: &AppState,
     win: &WebviewWindow,
     root: &str,
     prov: &Provider,
@@ -1083,31 +1083,184 @@ async fn try_browser_login(
 ) -> Result<bool, String> {
     let email = cfg_str(cfg, "email");
     let password = cfg_raw(cfg, "password");
-    if email.is_empty() || password.is_empty() {
-        return Ok(false);
-    }
+    let has_password = !email.is_empty() && !password.is_empty();
+
     let login_url = format!("{root}{}", prov.login_path);
     let parsed = tauri::Url::parse(&login_url).map_err(|e| e.to_string())?;
     win.navigate(parsed).map_err(|e| e.to_string())?;
     let _ = wait_page_ready(win, 40).await;
     tokio::time::sleep(Duration::from_millis(1200)).await;
-    let js = login_script(&email, &password);
-    let outcome = eval_json(win, &js).await.unwrap_or(Value::Null);
-    if outcome.get("ok").and_then(|v| v.as_bool()) != Some(true) {
-        let reason = outcome
-            .get("reason")
-            .and_then(|v| v.as_str())
-            .unwrap_or("登录表单没有提交成功");
-        return Err(reason.to_string());
-    }
-    for _ in 0..60 {
-        tokio::time::sleep(Duration::from_secs(1)).await;
-        let cookies = cookies_now(win, root).await;
-        if has_session(&cookies) {
-            return Ok(true);
+
+    let api_user = cfg_str(cfg, "user_id");
+    let mut last_error = String::new();
+
+    if has_password {
+        let mut outcome = Value::Null;
+        for attempt in 0..5 {
+            outcome = eval_json(win, &login_script(&email, &password))
+                .await
+                .unwrap_or(Value::Null);
+            if outcome.get("ok").and_then(|v| v.as_bool()) == Some(true) {
+                break;
+            }
+            if attempt < 4 {
+                tokio::time::sleep(Duration::from_secs(1)).await;
+            }
+        }
+        if outcome.get("ok").and_then(|v| v.as_bool()) == Some(true) {
+            match wait_logged_in(state, win, root, prov, &api_user, 35, false).await {
+                Ok(true) => return Ok(true),
+                Ok(false) => last_error = "邮箱登录后没有拿到有效会话".to_string(),
+                Err(e) => last_error = e,
+            }
+            // 密码登录失败后回登录页，给 OAuth 一次机会。
+            if let Ok(url) = tauri::Url::parse(&login_url) {
+                let _ = win.navigate(url);
+                let _ = wait_page_ready(win, 20).await;
+                tokio::time::sleep(Duration::from_millis(800)).await;
+            }
+        } else {
+            last_error = outcome
+                .get("reason")
+                .and_then(|v| v.as_str())
+                .unwrap_or("登录表单没有提交成功")
+                .to_string();
         }
     }
-    Err("登录后 60 秒内没有拿到 session cookie".to_string())
+
+    // 没邮箱密码也走这里：Linux.do 等 OAuth 站点只要浏览器 profile 里还有
+    // 平台登录态，点一下 OAuth 入口就能自动回到站点并刷新会话。
+    let hint = cfg_str(cfg, "oauth_hint");
+    let pattern = if hint.is_empty() {
+        OAUTH_HINT.to_string()
+    } else {
+        hint
+    };
+    let mut outcome = Value::Null;
+    for attempt in 0..8 {
+        outcome = eval_json(win, &oauth_login_script(&pattern))
+            .await
+            .unwrap_or(Value::Null);
+        if outcome.get("ok").and_then(|v| v.as_bool()) == Some(true) {
+            break;
+        }
+        if attempt < 7 {
+            tokio::time::sleep(Duration::from_secs(1)).await;
+        }
+    }
+    if outcome.get("ok").and_then(|v| v.as_bool()) == Some(true) {
+        return wait_logged_in(state, win, root, prov, &api_user, 30, true).await;
+    }
+    let reason = outcome
+        .get("reason")
+        .and_then(|v| v.as_str())
+        .unwrap_or("没有找到 Linux.do / OAuth 登录入口");
+    if last_error.is_empty() {
+        Err(reason.to_string())
+    } else {
+        Err(format!("{last_error}；OAuth：{reason}"))
+    }
+}
+
+async fn wait_logged_in(
+    state: &AppState,
+    win: &WebviewWindow,
+    root: &str,
+    prov: &Provider,
+    api_user: &str,
+    timeout_secs: u64,
+    oauth: bool,
+) -> Result<bool, String> {
+    let site_host = tauri::Url::parse(root)
+        .ok()
+        .and_then(|u| u.host_str().map(|s| s.to_ascii_lowercase()))
+        .unwrap_or_default();
+    let started = std::time::Instant::now();
+    let mut tick = 0u32;
+    loop {
+        // 每 2 秒问一次站点「我是谁」，比死盯 cookie 名（session/其它）可靠。
+        if tick % 2 == 0 {
+            let cookies = cookies_now(win, root).await;
+            let info = http_user_info(state, root, prov, &cookie_header(&cookies), api_user).await;
+            if info.ok {
+                return Ok(true);
+            }
+        }
+        let elapsed = started.elapsed().as_secs();
+        if oauth && elapsed >= 12 {
+            let url = current_url(win).await;
+            let host = tauri::Url::parse(&url)
+                .ok()
+                .and_then(|u| u.host_str().map(|s| s.to_ascii_lowercase()))
+                .unwrap_or_default();
+            if !host.is_empty()
+                && !site_host.is_empty()
+                && host != site_host
+                && !host.ends_with(&format!(".{site_host}"))
+            {
+                return Err(format!(
+                    "已跳转到 {host}，需要先在登录窗口完成该平台（如 Linux.do）的登录"
+                ));
+            }
+        }
+        if elapsed >= timeout_secs {
+            return Ok(false);
+        }
+        tick += 1;
+        tokio::time::sleep(Duration::from_secs(1)).await;
+    }
+}
+
+async fn current_url(win: &WebviewWindow) -> String {
+    eval_json(win, "location.href")
+        .await
+        .and_then(|v| v.as_str().map(|s| s.to_string()))
+        .unwrap_or_default()
+}
+
+fn oauth_login_script(pattern: &str) -> String {
+    let pattern = serde_json::to_string(pattern).unwrap_or_else(|_| "\"linux\"".to_string());
+    format!(
+        r#"(() => {{
+  const re = (() => {{ try {{ return new RegExp({pattern}, 'i'); }} catch (e) {{ return /linux/i; }} }})();
+  // OAuth 按钮有的用 window.open 开弹窗；塞回本窗口，才能把 session 写进同一个 cookie 罐。
+  try {{ window.open = (u) => {{ if (u) location.href = u; return null; }}; }} catch (e) {{}}
+  const vis = (el) => {{
+    if (!el || !el.isConnected) return false;
+    const st = window.getComputedStyle(el);
+    if (st.display === 'none' || st.visibility === 'hidden' || parseFloat(st.opacity) === 0) return false;
+    const r = el.getBoundingClientRect();
+    return r.width > 0 && r.height > 0;
+  }};
+  const nodes = Array.from(document.querySelectorAll('a[href], button, [role="button"], [role="link"], [onclick]'));
+  const desc = (el) => {{
+    const img = el.querySelector('img');
+    return [
+      el.innerText || '',
+      el.getAttribute('aria-label') || '',
+      el.getAttribute('title') || '',
+      el.getAttribute('href') || '',
+      typeof el.className === 'string' ? el.className : '',
+      img ? (img.getAttribute('alt') || '') : ''
+    ].join(' ').replace(/\s+/g, ' ').trim();
+  }};
+  const match = nodes.find(el => vis(el) && re.test(desc(el)));
+  if (!match) return {{ok: false, reason: '没有找到 Linux.do / OAuth 登录入口'}};
+  const href = match.getAttribute('href') || '';
+  try {{
+    if (match.tagName === 'A' && href && href !== '#' && !/^javascript:/i.test(href)) {{
+      match.target = '_self';
+      location.href = match.href;
+    }} else {{
+      match.click();
+    }}
+  }} catch (e) {{
+    return {{ok: false, reason: '点击 OAuth 入口失败：' + String(e).slice(0, 80)}};
+  }}
+  return {{ok: true, hit: desc(match).slice(0, 100)}};
+}})()"#,
+        pattern = pattern
+    )
 }
 
 async fn wait_page_ready(win: &WebviewWindow, timeout_secs: u64) -> Value {
@@ -1606,8 +1759,6 @@ mod tests {
             ]),
             "acw_tc=1; session=abc"
         );
-        assert!(has_session(&[("session".to_string(), "x".to_string())]));
-        assert!(!has_session(&[("session".to_string(), String::new())]));
         assert_eq!(safe_label("a/b:c d"), "a-b-c-d");
         assert_eq!(safe_label(""), "up");
     }

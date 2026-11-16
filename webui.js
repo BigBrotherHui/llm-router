@@ -4024,10 +4024,10 @@ function renderCheckin() {
                    value="${esc(r.user_id || "")}" style="width:100%;margin-top:6px">
           </div>
           <div class="ck-browser-fields" style="${brShow}">
-            <input class="mono" data-ck="email" placeholder="登录邮箱（推荐，会话过期时自动重登）"
+            <input class="mono" data-ck="email" placeholder="登录邮箱（可选；Linux.do 登录可留空）"
                    value="${esc(r.email || "")}" style="width:100%">
             <input class="mono" data-ck="password" type="password" autocomplete="new-password"
-                   placeholder="${r.has_password ? "密码已保存，留空保持不变" : "站点密码（可空，留空则只复用会话）"}"
+                   placeholder="${r.has_password ? "密码已保存，留空保持不变" : "站点密码（可选；Linux.do / OAuth 可留空）"}"
                    value="" style="width:100%;margin-top:6px">
             <label class="hint" style="display:flex;align-items:center;gap:6px;margin-top:4px">
               <input type="checkbox" data-ck="pwd_clear"> 清除已保存密码
@@ -4036,9 +4036,12 @@ function renderCheckin() {
                    value="${esc(r.user_id || "")}" style="width:100%;margin-top:6px">
             <input class="mono" data-ck="site" placeholder="站点根地址（可空，默认 ${esc(r.site_root)}）"
                    value="${esc(r.site_root_custom || "")}" style="width:100%;margin-top:6px">
+            <input class="mono" data-ck="oauth_hint" placeholder="OAuth 入口关键字（可空，默认 Linux.do）"
+                   value="${esc(r.oauth_hint || "")}" style="width:100%;margin-top:6px">
             <div class="hint" style="margin-top:6px">
-              保存后点行内「登录」，在弹出的窗口里登录一次；以后每天自动复用该窗口的会话，
-              填了邮箱密码则过期后自动重登。密码以明文保存在本机状态文件里。
+              保存后点行内「登录」，在弹出的窗口里登录一次（用 Linux.do 也行）；以后每天自动复用
+              该窗口的会话。没有邮箱密码也能自动重登：会话过期后会尝试点 Linux.do 登录入口，
+              前提是登录窗口里的 Linux.do 本身还处于登录状态。密码以明文保存在本机状态文件里。
             </div>
           </div>
         </div>
@@ -4057,7 +4060,7 @@ function renderCheckin() {
       ? `<span class="badge bad" title="这里要填站点的访问令牌，不是 sk- 开头的推理 Key">填成了 sk-</span>`
       : "";
     const hintBadge = isBrowser
-      ? `<span class="badge mono" title="浏览器自动登录${r.provider ? "（" + esc(r.provider) + "）" : ""}">浏览器</span>`
+      ? `<span class="badge mono" title="浏览器自动登录，支持 Linux.do / OAuth${r.provider ? "（" + esc(r.provider) + "）" : ""}">浏览器</span>`
         + (r.email ? `<span class="hint mono">${esc(r.email)}</span>` : "")
         + (r.has_password
           ? `<span class="badge" title="会话过期时会用邮箱密码自动重登">可重登</span>` : "")
@@ -4325,6 +4328,7 @@ $("#ckRows").addEventListener("click", e => {
       email: auth === "browser" ? val("email").trim() : "",
       password: password,
       site_root: auth === "browser" ? val("site").trim() : "",
+      oauth_hint: auth === "browser" ? val("oauth_hint").trim() : "",
     });
   }
 });

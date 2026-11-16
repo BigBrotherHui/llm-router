@@ -50,9 +50,9 @@
   `api_user_key` 覆盖，`site_root` 用来处理「上游填的是 api.xxx 子域」的情况。
 - browser 模式流程：为每个上游建独立 WebView2 profile（`<state目录>/checkin-profiles/ck-<id>`）
   → 隐藏窗口打开站点刷新 WAF cookie → 先用 cookie 走 HTTP 拉用户信息验证会话
-  → 失败则用邮箱密码在页面内自动填表登录（Semi Design 选择器移植自上游）
+  → 失败则先试邮箱密码表单（配了才试），再自动点 Linux.do / OAuth 登录入口
   → 拿到 cookie 后用 reqwest 发签到请求（Chrome UA/Referer/Origin）。
-  不依赖 cookie 名叫 `session`，避免非 NewAPI 站点误判。
+  会话是否有效以 `/api/user/self` 为准，不依赖 cookie 名叫 `session`。
 - 浏览器任务用全局异步锁串行（WebView2 同时开多个容易抢 cookie / 吃内存）；
   token 模式仍保持 6 并发。
 - 新增 `POST /admin/checkin/browser/open`：打开/复用可见登录窗口，登录一次即可，
@@ -65,13 +65,19 @@
 密码（可空）、User id、站点根地址；行内多一个「登录」按钮。密码明文存本机状态文件，
 UI 已提示。
 
+**Linux.do / OAuth**：浏览器模式不要求邮箱密码。会话失效时先试邮箱密码（配了才试），
+再在登录页自动找 Linux.do 入口并点击；如果 12 秒后仍停在 linux.do 域，直接返回
+「需要先登录该平台」，避免每个上游空等 60 秒。登录窗口里用 Linux.do 授权一次后，
+站点会话和 Linux.do 会话都存在该上游专属 profile 里，之后可全自动重登。入口关键字
+可用 `checkin.oauth_hint` 覆盖（默认匹配 linux do / linux.do / linux-do / `/api/oauth/linux`）。
+
 **签到页成员制**：只有 `extra.checkin` 存在时才显示该上游；新增
 `POST /admin/checkin/add`（加空配置）和 `POST /admin/checkin/remove`
 （删 `checkin` + `checkin_state`，不动上游本身），GET `/admin/checkin` 额外返回
 `available` 供下拉框选择。不支持签到的上游从此不占签到页，误加可移除。
 
 **验证**：`cargo test --lib` 19 项全过（新增 7 项覆盖 provider 检测、预设/覆盖、
-browser 配置判定、签到路径候选、cookie/标签工具）；`node --check webui.js` 通过。
+browser 配置判定、签到路径候选、cookie/标签工具、成员制）；`node --check webui.js` 通过。
 **未做的验证**：还没有用真实 AnyRouter 账号跑过端到端；Turnstile 若弹交互，
 自动登录会失败并提示手动点「登录」。
 
