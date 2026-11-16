@@ -578,7 +578,8 @@
           ②「浏览器自动登录」——用应用内 WebView2 打开站点登录，能过 Cloudflare/WAF
           （适合 AnyRouter / AgentRouter），首次点行内「登录」登录一次，之后每天自动复用会话；
           没有邮箱密码也行，Linux.do 等 OAuth 站点会尝试自动点登录入口重登；
-          ③「Chrome 登录」——用专用 Chrome 打开站点，你登录后应用自动抓 Cookie，
+          ③「Chrome 登录」——用专用 Chrome 打开站点，首次从你日常 Chrome 复制登录态
+          （需要先完全退出 Chrome 一次），之后不用重新登录，应用自动抓 Cookie；
           适合 Linux.do 登录、或内置窗口打不开的站点。
         </div>
 

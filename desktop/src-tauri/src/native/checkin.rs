@@ -1197,6 +1197,7 @@ pub fn prepare_chrome_login(state: &AppState, up: &Upstream) -> Result<ChromeLog
     let prov = provider_of(up, &cfg);
     let login_url = format!("{root}{}", prov.login_path);
     let profile = chrome_profile_dir(state);
+    seed_chrome_profile(state)?;
     let (port, ws_path) = ensure_chrome(&profile, &login_url)?;
     Ok(ChromeLogin {
         up: up.clone(),
@@ -1451,6 +1452,127 @@ fn chrome_profile_dir(state: &AppState) -> PathBuf {
         .parent()
         .unwrap_or_else(|| Path::new("."))
         .join("checkin-chrome-profile")
+}
+
+fn chrome_user_data_dir() -> Option<PathBuf> {
+    if let Ok(p) = std::env::var("CHROME_USER_DATA_DIR") {
+        let p = PathBuf::from(p);
+        if p.exists() {
+            return Some(p);
+        }
+    }
+    #[cfg(windows)]
+    {
+        let local = std::env::var("LOCALAPPDATA").ok()?;
+        let p = PathBuf::from(local).join(r"Google\Chrome\User Data");
+        if p.exists() {
+            return Some(p);
+        }
+    }
+    None
+}
+
+fn read_active_profile(local_state: &Path) -> Option<String> {
+    let text = std::fs::read_to_string(local_state).ok()?;
+    let v: Value = serde_json::from_str(&text).ok()?;
+    v.get("profile")?
+        .get("last_used")?
+        .as_str()
+        .map(|s| s.to_string())
+}
+
+fn copy_if_exists(src: &Path, dst: &Path) {
+    if src.exists() {
+        let _ = std::fs::copy(src, dst);
+    }
+}
+
+/// 首次 Chrome 登录：把日常 Chrome 的 cookie 复制到专用 profile，免去重新登录。
+/// Chrome 运行时会独占 cookie DB，此时返回可操作的错误，让用户先退出一次。
+fn seed_chrome_profile(state: &AppState) -> Result<(), String> {
+    let dest = chrome_profile_dir(state);
+    if dest.join(".seeded").exists() {
+        return Ok(());
+    }
+    if let Some((port, _)) = read_devtools_port(&dest.join("DevToolsActivePort")) {
+        if port_open(port) {
+            return Err("请先关闭专用 Chrome 窗口，再点一次「Chrome 登录」".to_string());
+        }
+    }
+    let Some(user_data) = chrome_user_data_dir() else {
+        return Ok(());
+    };
+    seed_from_user_data(&user_data, &dest)?;
+    Ok(())
+}
+
+fn seed_from_user_data(user_data: &Path, dest: &Path) -> Result<bool, String> {
+    let local_state = user_data.join("Local State");
+    if !local_state.exists() {
+        return Ok(false);
+    }
+    let active = read_active_profile(&local_state).unwrap_or_else(|| "Default".to_string());
+    let src_profile = user_data.join(&active);
+    let src_cookies = if src_profile.join("Network").join("Cookies").exists() {
+        src_profile.join("Network").join("Cookies")
+    } else {
+        src_profile.join("Cookies")
+    };
+    if !src_cookies.exists() {
+        return Ok(false);
+    }
+    if std::fs::File::open(&src_cookies).is_err() {
+        return Err("要复用日常 Chrome 的登录态，请先完全退出 Chrome（一次），再点「Chrome 登录」。复制完成后以后不用再退出。".to_string());
+    }
+    if dest.exists() {
+        let _ = std::fs::remove_dir_all(dest);
+    }
+    let profile_dst = dest.join("Default");
+    std::fs::create_dir_all(profile_dst.join("Network"))
+        .map_err(|e| format!("创建 Chrome 配置目录失败：{e}"))?;
+
+    // Local State 只保留 Default，避免 Chrome 启动时弹 profile 选择。
+    let text = std::fs::read_to_string(&local_state).map_err(|e| e.to_string())?;
+    let mut ls: Value = serde_json::from_str(&text).map_err(|e| e.to_string())?;
+    let entry = ls
+        .get("profile")
+        .and_then(|p| p.get("info_cache"))
+        .and_then(|c| c.get(&active))
+        .cloned();
+    if let Some(profile) = ls.get_mut("profile").and_then(|p| p.as_object_mut()) {
+        profile.insert("last_used".to_string(), json!("Default"));
+        let mut cache = Map::new();
+        if let Some(entry) = entry {
+            cache.insert("Default".to_string(), entry);
+        }
+        profile.insert("info_cache".to_string(), Value::Object(cache));
+    }
+    std::fs::write(
+        dest.join("Local State"),
+        serde_json::to_vec(&ls).map_err(|e| e.to_string())?,
+    )
+    .map_err(|e| e.to_string())?;
+
+    for name in ["Cookies", "Cookies-journal", "Cookies-wal", "Cookies-shm"] {
+        copy_if_exists(
+            &src_profile.join("Network").join(name),
+            &profile_dst.join("Network").join(name),
+        );
+    }
+    for name in ["Cookies", "Cookies-journal", "Cookies-wal", "Cookies-shm"] {
+        copy_if_exists(&src_profile.join(name), &profile_dst.join(name));
+    }
+    for name in ["Preferences", "Secure Preferences"] {
+        copy_if_exists(&src_profile.join(name), &profile_dst.join(name));
+    }
+
+    let copied = profile_dst.join("Network").join("Cookies");
+    if !copied.exists() || std::fs::metadata(&copied).map(|m| m.len()).unwrap_or(0) == 0 {
+        return Ok(false);
+    }
+    let marker = format!("seeded from {} / {}\n", user_data.display(), active);
+    let _ = std::fs::write(dest.join(".seeded"), marker);
+    Ok(true)
 }
 
 fn chrome_exe() -> Result<PathBuf, String> {
@@ -2357,5 +2479,46 @@ mod tests {
         assert_eq!(host_of("not a url"), "");
         let c = cfg(json!({"cookies":{"session":"s","acw_tc":"a"}}));
         assert_eq!(stored_cookies(&c).len(), 2);
+    }
+
+    #[test]
+    fn seed_copies_active_chrome_profile_into_default() {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let root = std::env::temp_dir().join(format!(
+            "llm-router-seed-test-{}-{}",
+            std::process::id(),
+            nanos
+        ));
+        let user_data = root.join("User Data");
+        let src = user_data.join("Profile 1");
+        std::fs::create_dir_all(src.join("Network")).unwrap();
+        std::fs::write(
+            user_data.join("Local State"),
+            serde_json::to_vec(&json!({
+                "profile": {
+                    "last_used": "Profile 1",
+                    "info_cache": {
+                        "Default": {},
+                        "Profile 1": {"name": "Me"}
+                    }
+                }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        std::fs::write(src.join("Network").join("Cookies"), b"cookie-db").unwrap();
+        std::fs::write(src.join("Preferences"), b"{}").unwrap();
+        let dest = root.join("dest");
+        assert!(seed_from_user_data(&user_data, &dest).unwrap());
+        assert!(dest.join("Default").join("Network").join("Cookies").exists());
+        assert!(dest.join(".seeded").exists());
+        let ls: Value =
+            serde_json::from_slice(&std::fs::read(dest.join("Local State")).unwrap()).unwrap();
+        assert_eq!(ls["profile"]["last_used"], "Default");
+        assert!(ls["profile"]["info_cache"].get("Profile 1").is_none());
+        let _ = std::fs::remove_dir_all(&root);
     }
 }
