@@ -877,6 +877,21 @@ pub async fn checkin_config(
                 up.extra.remove("checkin_state");
             }
         }
+        if let Some(hint) = p.get("oauth_hint").and_then(|v| v.as_str()) {
+            let hint = hint.trim();
+            let old_hint = cfg
+                .get("oauth_hint")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            if hint != old_hint {
+                up.extra.remove("checkin_state");
+            }
+            if hint.is_empty() {
+                cfg.remove("oauth_hint");
+            } else {
+                cfg.insert("oauth_hint".to_string(), json!(hint));
+            }
+        }
         let has_token = cfg
             .get("token")
             .and_then(|v| v.as_str())
