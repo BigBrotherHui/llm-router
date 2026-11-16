@@ -974,6 +974,8 @@ pub fn today_totals(port: u16) -> TodayTotals {
         scan_pi(&mut ctx, &home, &mut st);
         let mut st = blank_stat("codex", "Codex");
         scan_codex(&mut ctx, &home, &mut st);
+        let mut st = blank_stat("orca", "Orca");
+        scan_orca(&mut ctx, &home, &mut st);
     }
     let mut t = TodayTotals::default();
     for a in aggs.values() {
@@ -1122,6 +1124,8 @@ pub fn session_cache_ledger(
         scan_pi(&mut ctx, &home, &mut st);
         let mut st = blank_stat("codex", "Codex");
         scan_codex(&mut ctx, &home, &mut st);
+        let mut st = blank_stat("orca", "Orca");
+        scan_orca(&mut ctx, &home, &mut st);
     }
 
     let mut totals = LedgerAgg::default();
@@ -1218,6 +1222,8 @@ fn scan_records(
         scan_pi(&mut ctx, &home, &mut st);
         let mut st = blank_stat("codex", "Codex");
         scan_codex(&mut ctx, &home, &mut st);
+        let mut st = blank_stat("orca", "Orca");
+        scan_orca(&mut ctx, &home, &mut st);
     }
     let mut days: Vec<String> = records.iter().filter_map(|r| r["time"].as_str().map(|s| s.chars().take(10).collect())).collect();
     days.sort(); days.dedup();
@@ -2414,6 +2420,432 @@ fn scan_codex(ctx: &mut Ctx, home: &Path, st: &mut SrcStat) {
     }
 }
 
+// ─────────────────── Orca（Electron 的 agent-session-journal.db）───────────────────
+//
+// Orca 托管 Agent 时把每一轮都写进一个 SQLite（`%APPDATA%\Orca\agent-session-journal.db`，
+// `journal_outcomes` 是「字段 → JSON 值」的物化索引）。opencode 走 ACP 传输，磁盘上
+// 没有任何 jsonl 账本 —— 这个库是它唯一的账本，所以只能从这儿读。
+//
+// claude / pi / codex 在 Orca 里也是同一个库记的，但它们各自另有 jsonl 账本，
+// 已经由 scan_claude / scan_pi / scan_codex 覆盖；这里跳过，免得同一轮被算两遍。
+
+/// Orca 的 userData 目录（Electron 三个平台的默认位置）。
+fn orca_db(home: &Path) -> Option<PathBuf> {
+    [
+        home.join("AppData").join("Roaming").join("Orca"),
+        home.join("Library").join("Application Support").join("Orca"),
+        home.join(".config").join("Orca"),
+    ]
+    .into_iter()
+    .map(|d| d.join("agent-session-journal.db"))
+    .find(|p| p.is_file())
+}
+
+/// 只读打开：Orca 正在写 WAL，读侧不能加写锁，失败就静默降级（账本被占用不算错误）。
+fn orca_open(path: &Path) -> Option<rusqlite::Connection> {
+    use rusqlite::OpenFlags;
+    let conn = rusqlite::Connection::open_with_flags(
+        path,
+        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )
+    .ok()?;
+    let _ = conn.busy_timeout(Duration::from_millis(800));
+    Some(conn)
+}
+
+/// `location.workspaceId` 形如 `<uuid>::C:/path/to/checkout`，取后半段当 cwd。
+fn workspace_path(raw: &str) -> String {
+    raw.split_once("::")
+        .map(|(_, p)| p)
+        .unwrap_or(raw)
+        .replace('\\', "/")
+}
+
+/// `providerHandleChain` 里出现过的每个 ses_*（resume 会换新的，旧的也要登记）。
+fn collect_ses_ids(v: &Value, out: &mut Vec<String>) {
+    match v {
+        Value::String(s) => {
+            if s.starts_with("ses_") && !out.iter().any(|x| x == s) {
+                out.push(s.clone());
+            }
+        }
+        Value::Array(a) => a.iter().for_each(|x| collect_ses_ids(x, out)),
+        Value::Object(o) => o.values().for_each(|x| collect_ses_ids(x, out)),
+        _ => {}
+    }
+}
+
+/// turnId 形如 `p:ses_xxx:prompt%3A<ts>-<uuid>`，第一段 ses_* 就是路由流水里的同一个 id。
+fn turn_session_id(turn_id: &str) -> String {
+    turn_id
+        .split(':')
+        .find(|p| p.starts_with("ses_"))
+        .unwrap_or("")
+        .to_string()
+}
+
+/// 一个 Orca 会话的元信息（`agent_session_records.record_json`）。
+struct OrcaMeta {
+    agent: String,
+    name: String,
+    workspace: String,
+    ses_ids: Vec<String>,
+}
+
+impl OrcaMeta {
+    fn from_record(v: &Value) -> Self {
+        let mut ses_ids = Vec::new();
+        collect_ses_ids(v, &mut ses_ids);
+        OrcaMeta {
+            agent: v
+                .get("provider")
+                .and_then(|x| x.as_str())
+                .unwrap_or("")
+                .to_string(),
+            name: v
+                .get("conversationName")
+                .and_then(|x| x.as_str())
+                .unwrap_or("")
+                .to_string(),
+            workspace: v
+                .get("location")
+                .and_then(|l| l.get("workspaceId"))
+                .and_then(|x| x.as_str())
+                .map(workspace_path)
+                .unwrap_or_default(),
+            ses_ids,
+        }
+    }
+
+    fn label(&self) -> String {
+        if self.agent.is_empty() {
+            "Orca".to_string()
+        } else {
+            format!("Orca · {}", self.agent)
+        }
+    }
+}
+
+/// opencode.json 的 provider 表 → (模型名 → provider 标签, 默认标签)。
+/// 标签优先取 provider 的 `name`（这台机器上写的是 llm-router），`is_router_name` 认它。
+fn opencode_labels(home: &Path) -> (HashMap<String, String>, String) {
+    let text = [
+        home.join(".config").join("opencode").join("opencode.json"),
+        home.join("AppData")
+            .join("Roaming")
+            .join("opencode")
+            .join("opencode.json"),
+    ]
+    .into_iter()
+    .filter_map(|p| std::fs::read_to_string(p).ok())
+    .find(|t| !t.trim().is_empty())
+    .unwrap_or_default();
+    let mut by_model: HashMap<String, String> = HashMap::new();
+    let Ok(v) = serde_json::from_str::<Value>(&super::agents::strip_jsonc(
+        text.trim_start_matches('\u{feff}'),
+    )) else {
+        return (by_model, String::new());
+    };
+    let Some(providers) = v
+        .get("provider")
+        .or_else(|| v.get("providers"))
+        .and_then(|p| p.as_object())
+    else {
+        return (by_model, String::new());
+    };
+    let label = |key: &str, pv: &Value| -> String {
+        pv.get("name")
+            .and_then(|x| x.as_str())
+            .map(|s| s.trim())
+            .filter(|s| !s.is_empty())
+            .unwrap_or(key)
+            .to_string()
+    };
+    for (key, pv) in providers {
+        let l = label(key, pv);
+        if let Some(models) = pv.get("models").and_then(|m| m.as_object()) {
+            for model in models.keys() {
+                by_model.entry(model.clone()).or_insert_with(|| l.clone());
+            }
+        }
+    }
+    // 默认标签：opencode.json 顶层 `model` 写成 "provider/model"，取它那个 provider
+    let default = v
+        .get("model")
+        .and_then(|x| x.as_str())
+        .and_then(|m| m.split_once('/'))
+        .and_then(|(key, _)| providers.get(key).map(|pv| label(key, pv)))
+        .or_else(|| providers.keys().next().map(|k| label(k, &providers[k])))
+        .unwrap_or_default();
+    (by_model, default)
+}
+
+struct OrcaTurn {
+    at: i64,
+    ses: String,
+    model: String,
+    duration_ms: Option<f64>,
+}
+
+/// `journal_outcomes.value_json` 里的一条 turn 项 → (去重键, 轮次)。
+fn orca_turn_from_row(v: &Value) -> Option<(String, OrcaTurn)> {
+    let body = v.get("body")?;
+    if body.get("kind").and_then(|x| x.as_str()) != Some("turn") {
+        return None;
+    }
+    let at = body
+        .get("startedAt")
+        .and_then(|x| x.as_i64())
+        .or_else(|| body.get("requestedAt").and_then(|x| x.as_i64()))
+        .unwrap_or(0);
+    if at <= 0 {
+        return None;
+    }
+    let duration_ms = body
+        .get("durationMs")
+        .and_then(|x| x.as_f64())
+        .or_else(|| {
+            let done = body.get("completedAt").and_then(|x| x.as_i64())?;
+            Some((done - at).max(0) as f64)
+        });
+    let model = body
+        .get("contextUsage")
+        .and_then(|c| c.get("used"))
+        .and_then(|u| u.get("model"))
+        .and_then(|x| x.as_str())
+        .unwrap_or("")
+        .to_string();
+    let ses = turn_session_id(body.get("turnId").and_then(|x| x.as_str()).unwrap_or(""));
+    if ses.is_empty() {
+        return None;
+    }
+    let key = v
+        .get("itemId")
+        .and_then(|x| x.as_str())
+        .unwrap_or("")
+        .to_string();
+    Some((
+        key,
+        OrcaTurn {
+            at,
+            ses,
+            model,
+            duration_ms,
+        },
+    ))
+}
+
+fn scan_orca(ctx: &mut Ctx, home: &Path, st: &mut SrcStat) {
+    let Some(db) = orca_db(home) else {
+        st.note = "没有找到 Orca 的 agent-session-journal.db".into();
+        return;
+    };
+    st.root = db.to_string_lossy().to_string();
+    st.files = 1;
+    st.bytes = std::fs::metadata(&db).map(|m| m.len()).unwrap_or(0);
+    let started = std::time::Instant::now();
+    let Some(conn) = orca_open(&db) else {
+        st.note = "Orca 账本打不开（被占用或没有权限）".into();
+        return;
+    };
+
+    // 1) 会话元信息：provider / 会话名 / workspace，以及 providerHandleChain 里所有 ses_*。
+    let mut metas: HashMap<i64, OrcaMeta> = HashMap::new();
+    let mut owner: HashMap<String, i64> = HashMap::new();
+    if let Ok(mut stmt) = conn.prepare(
+        "select g.generation, r.record_json from journal_outcome_generations g \
+         left join agent_session_records r on r.session_id = g.session_id",
+    ) {
+        if let Ok(rows) = stmt.query_map([], |r| {
+            Ok((r.get::<_, i64>(0)?, r.get::<_, Option<String>>(1)?))
+        }) {
+            for (gen, rj) in rows.flatten() {
+                let meta = rj
+                    .as_deref()
+                    .and_then(|s| serde_json::from_str::<Value>(s).ok())
+                    .map(|v| OrcaMeta::from_record(&v))
+                    .unwrap_or(OrcaMeta {
+                        agent: String::new(),
+                        name: String::new(),
+                        workspace: String::new(),
+                        ses_ids: Vec::new(),
+                    });
+                for ses in &meta.ses_ids {
+                    owner.insert(ses.clone(), gen);
+                }
+                metas.insert(gen, meta);
+            }
+        }
+    }
+
+    // 2) 轮次。同一轮会被反复重写（revision），rowid 倒序先看到的是最新版本，按 itemId 去重；
+    //    倒序 + limit 同时把「全部时间」压在最近一段，避免 90 万行的索引整份扫一遍。
+    const ORCA_ROW_LIMIT: usize = 20_000;
+    let (model_labels, default_label) = opencode_labels(home);
+    let router_provider = ctx
+        .bases
+        .iter()
+        .find(|(_, url)| is_router_url(url, ctx.port))
+        .map(|(k, _)| k.clone())
+        .unwrap_or_default();
+    let mut seen: HashSet<String> = HashSet::new();
+    let mut by_ses: HashMap<String, Vec<OrcaTurn>> = HashMap::new();
+    let mut rows_read = 0usize;
+    if let Ok(mut stmt) = conn.prepare(
+        "select value_json from journal_outcomes \
+         where field='items' and deleted=0 and entry_key like '%turn%' \
+         order by rowid desc limit ?1",
+    ) {
+        if let Ok(rows) = stmt.query_map([ORCA_ROW_LIMIT as i64], |r| r.get::<_, String>(0)) {
+            for raw in rows.flatten() {
+                rows_read += 1;
+                let Ok(v) = serde_json::from_str::<Value>(&raw) else {
+                    continue;
+                };
+                let Some((key, turn)) = orca_turn_from_row(&v) else {
+                    continue;
+                };
+                if !seen.insert(key) {
+                    continue;
+                }
+                if ctx.since_ms > 0 && turn.at < ctx.since_ms {
+                    st.skipped_old += 1;
+                    continue;
+                }
+                by_ses.entry(turn.ses.clone()).or_default().push(turn);
+            }
+        }
+    }
+    if rows_read >= ORCA_ROW_LIMIT {
+        st.truncated = true;
+    }
+
+    // 3) 逐会话记轮。跳开 claude / pi / codex：它们各自的 jsonl 账本才是权威来源。
+    let mut skipped = 0u64;
+    let mut ses_ids: Vec<String> = by_ses.keys().cloned().collect();
+    ses_ids.sort();
+    for ses in ses_ids {
+        let mut turns = by_ses.remove(&ses).unwrap_or_default();
+        turns.sort_by_key(|t| t.at);
+        let meta = owner.get(&ses).and_then(|g| metas.get(g));
+        if let Some(meta) = meta {
+            if matches!(meta.agent.as_str(), "claude" | "pi" | "codex") {
+                skipped += turns.len() as u64;
+                continue;
+            }
+        }
+        let agent = meta.map(|m| m.label()).unwrap_or_else(|| "Orca".to_string());
+        let mut sess = Sess {
+            source: "orca".into(),
+            agent: agent.clone(),
+            id: ses.clone(),
+            project: meta
+                .map(|m| {
+                    if m.name.is_empty() {
+                        m.workspace
+                            .rsplit('/')
+                            .next()
+                            .unwrap_or("")
+                            .to_string()
+                    } else {
+                        m.name.clone()
+                    }
+                })
+                .unwrap_or_default(),
+            cwd: meta.map(|m| m.workspace.clone()).unwrap_or_default(),
+            path: db.to_string_lossy().to_string(),
+            started_ms: 0,
+            ended_ms: 0,
+            rounds: 0,
+            routed_rounds: 0,
+            input: 0,
+            output: 0,
+            cache_read: 0,
+            cache_write: 0,
+            models: HashMap::new(),
+            all_models: HashMap::new(),
+            providers: HashSet::new(),
+            external_top: String::new(),
+        };
+        for t in turns {
+            let provider = if t.model.is_empty() {
+                default_label.clone()
+            } else {
+                model_labels
+                    .get(&t.model)
+                    .cloned()
+                    .unwrap_or_else(|| default_label.clone())
+            };
+            let provider = if provider.is_empty() {
+                router_provider.clone()
+            } else {
+                provider
+            };
+            // Orca 只记得「上下文占用」（estimate/report），不是上游计费口径，
+            // token 一律留 0：走了路由的那几轮由 8010 流水提供真实用量。
+            ctx.round(
+                "orca",
+                &agent,
+                &mut sess,
+                &provider,
+                &t.model,
+                t.at,
+                [0; 5],
+                t.duration_ms,
+                None,
+                None,
+                None,
+            );
+        }
+        if sess.rounds > 0 {
+            st.rounds += sess.rounds;
+            st.sessions += 1;
+            ctx.sessions.push(sess);
+        }
+    }
+    st.ms += started.elapsed().as_millis() as u64;
+    st.note = if skipped > 0 {
+        format!("跳过 {skipped} 轮 claude/pi/codex（各自 jsonl 已覆盖）")
+    } else {
+        "opencode 这类 ACP Agent 只有这里有账本".to_string()
+    };
+}
+
+/// ses_* → (agent, project)：把 Orca 的会话名挂到本机流水那几行上，
+/// 否则流水里全是「(本机 8010 流水)」，看不出某条请求是谁问的。
+fn orca_session_labels() -> HashMap<String, (String, String)> {
+    let mut out: HashMap<String, (String, String)> = HashMap::new();
+    let home = home();
+    let Some(db) = orca_db(&home) else {
+        return out;
+    };
+    let Some(conn) = orca_open(&db) else {
+        return out;
+    };
+    let Ok(mut stmt) = conn.prepare("select record_json from agent_session_records") else {
+        return out;
+    };
+    let Ok(rows) = stmt.query_map([], |r| r.get::<_, String>(0)) else {
+        return out;
+    };
+    for rj in rows.flatten() {
+        let Ok(v) = serde_json::from_str::<Value>(&rj) else {
+            continue;
+        };
+        let meta = OrcaMeta::from_record(&v);
+        let project = if meta.name.is_empty() {
+            meta.workspace.clone()
+        } else {
+            meta.name.clone()
+        };
+        let label = meta.label();
+        for ses in &meta.ses_ids {
+            out.insert(ses.clone(), (label.clone(), project.clone()));
+        }
+    }
+    out
+}
+
 // ───────────────────────── 路由流水对照 ─────────────────────────
 
 fn journal_window(state: &AppState, since_ms: i64, route: u8) -> Value {
@@ -2481,6 +2913,7 @@ fn journal_as_records(
     model: &str,
 ) -> (Vec<Value>, Vec<String>, Vec<String>) {
     let since = if since_ms > 0 { since_ms as f64 / 1000.0 } else { 0.0 };
+    let labels = orca_session_labels();
     let mut out: Vec<Value> = Vec::new();
     let mut days: Vec<String> = Vec::new();
     let mut months: Vec<String> = Vec::new();
@@ -2527,11 +2960,18 @@ fn journal_as_records(
         if !model.is_empty() && m != model {
             continue;
         }
+        // 流水里的 ses_* 能对上 Orca 的会话，就报出是谁问的；对不上才是「本机流水」。
+        let (agent, project) = e
+            .get("session_id")
+            .and_then(|v| v.as_str())
+            .and_then(|sid| labels.get(sid))
+            .map(|(a, p)| (a.as_str(), p.as_str()))
+            .unwrap_or(("LLM Router", "(本机 8010 流水)"));
         out.push(json!({
             // 与会话记录同名的字段：列表按它区分来源、展开正文时按 at + upstream 取
             "source": "router",
-            "agent": "LLM Router",
-            "project": "(本机 8010 流水)",
+            "agent": agent,
+            "project": project,
             "routed": true,
             "at": at,
             "time": time,
@@ -2612,13 +3052,14 @@ pub async fn scan(State(state): State<Arc<AppState>>, Query(q): Query<ScanQuery>
             "claude".to_string(),
             "pi".to_string(),
             "codex".to_string(),
+            "orca".to_string(),
         ],
     };
     let row_limit = q.limit.unwrap_or(ROW_LIMIT).clamp(10, 500);
     let route_filter = route_filter(q.route.as_deref());
     let metric = metric_mode(q.metric.as_deref());
     if wanted.is_empty() {
-        return bad("sources 参数为空，请至少选一个数据源（dsh,claude,pi,codex）");
+        return bad("sources 参数为空，请至少选一个数据源（dsh,claude,pi,codex,orca）");
     }
     let cache_key = super::collector::scan_key(&q);
     if let Some(v) = super::collector::get(&cache_key, 15) {
@@ -2715,6 +3156,24 @@ pub async fn scan(State(state): State<Arc<AppState>>, Query(q): Query<ScanQuery>
                 records: None,
             };
             scan_codex(&mut ctx, &home, &mut st);
+        }
+        stats.push(st);
+    }
+    if wanted.iter().any(|s| s == "orca") {
+        let mut st = add_stat("orca", "Orca");
+        {
+            let mut ctx = Ctx {
+                bases: &bases,
+                port,
+                since_ms,
+                route_filter,
+                metric,
+                magpie: MagpieView::default(),
+                aggs: &mut aggs,
+                sessions: &mut sessions,
+                records: None,
+            };
+            scan_orca(&mut ctx, &home, &mut st);
         }
         stats.push(st);
     }
@@ -3248,5 +3707,45 @@ pub async fn tools(State(_state): State<Arc<AppState>>, Query(q): Query<ToolQuer
 /// provider → baseURL 的映射快照（调试 / 排查用）。
 pub async fn bases(State(_state): State<Arc<AppState>>) -> Response {
     let map = collect_bases(&home());
-    ok(json!({"ok": true, "provider_bases": map}))
+    ok(json!({"provider_bases": map}))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Orca 的 turnId / workspaceId 是唯一稳定的 join 键，解析错了就等于没读。
+    #[test]
+    fn orca_ids_parse() {
+        assert_eq!(
+            turn_session_id("p:ses_e1d42be4dffeT3DHd27xYf8Yvf:prompt%3A1794807387278-07d7718e"),
+            "ses_e1d42be4dffeT3DHd27xYf8Yvf"
+        );
+        assert_eq!(turn_session_id("turn-without-session"), "");
+        assert_eq!(
+            workspace_path("0a245f1a-ca19-409f-be22-5b533894cf91::C:/Users/me/orca/ws/Dental"),
+            "C:/Users/me/orca/ws/Dental"
+        );
+        assert_eq!(workspace_path("D:\\Project\\Dental"), "D:/Project/Dental");
+    }
+
+    /// 只认 kind=turn 且带 startedAt 的 item，其它（message / tool-call / 老 revision）全部丢掉。
+    #[test]
+    fn orca_turn_row_filter() {
+        let turn = json!({
+            "itemId": "t1",
+            "body": {"kind": "turn", "turnId": "p:ses_abc:prompt%3A1", "startedAt": 1794807387290i64,
+                     "durationMs": 1912, "contextUsage": {"used": {"kind": "report", "model": "deepseek"}}}
+        });
+        let (key, t) = orca_turn_from_row(&turn).expect("turn 应该被认出来");
+        assert_eq!(key, "t1");
+        assert_eq!(t.ses, "ses_abc");
+        assert_eq!(t.model, "deepseek");
+        assert_eq!(t.duration_ms, Some(1912.0));
+
+        let msg = json!({"itemId": "m1", "body": {"kind": "message", "role": "user"}});
+        assert!(orca_turn_from_row(&msg).is_none());
+        let no_ts = json!({"itemId": "t2", "body": {"kind": "turn", "turnId": "p:ses_abc:x"}});
+        assert!(orca_turn_from_row(&no_ts).is_none());
+    }
 }

@@ -415,7 +415,8 @@
             <div class="hint">
               直接读各家 Agent 自己的会话记录：DSH <code>~/.dsh/sessions/*/*/session.v4.jsonl.zstd</code>、
               Claude Code <code>~/.claude/projects/*/*.jsonl</code>、Pi <code>~/.pi/agent/sessions/*/*.jsonl</code>、
-              Codex <code>~/.codex/sessions/*/*/*/rollout-*.jsonl</code>。按 <b>provider / 模型</b> 汇总后，
+              Codex <code>~/.codex/sessions/*/*/*/rollout-*.jsonl</code>、Orca
+              <code>agent-session-journal.db</code>（opencode 走 ACP，磁盘上只有这一个账本）。按 <b>provider / 模型</b> 汇总后，
               与本机 <code>8010</code> 落盘流水对照：标「未走路由」的就是绕过 llm-router 直连别处的调用。
             </div>
             <div class="sess-hero-note">
@@ -444,6 +445,7 @@
               <label class="sess-check"><input type="checkbox" id="sessSrcClaude" checked><span>Claude Code</span></label>
               <label class="sess-check"><input type="checkbox" id="sessSrcPi" checked><span>Pi</span></label>
               <label class="sess-check"><input type="checkbox" id="sessSrcCodex" checked><span>Codex</span></label>
+              <label class="sess-check"><input type="checkbox" id="sessSrcOrca" checked><span>Orca</span></label>
             </div>
           </div>
           <label class="sess-field">
@@ -554,7 +556,7 @@
           <button class="mini" id="cacheRefresh">↻ 刷新</button>
         </div>
         <div class="hint" style="margin:4px 0 12px">
-          统计 <b>所有 Agent 会话</b>（DSH / Claude Code / Pi / Codex），不只本机路由经过的请求；按模型、上游和会话拆开看。
+          统计 <b>所有 Agent 会话</b>（DSH / Claude Code / Pi / Codex / Orca），不只本机路由经过的请求；按模型、上游和会话拆开看。
           「命中率 = 缓存读 ÷（输入 + 缓存读 + 缓存写）」；其中「走本机路由」只是全部会话的一个子集。
         </div>
         <div class="sess-stats" id="cacheStats"></div>
