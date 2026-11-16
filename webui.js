@@ -3926,10 +3926,11 @@ const CK_STYLE = {
   ok:      { cls: "ok",   text: "签到成功" },
   already: { cls: "ok",   text: "今天已签" },
   blocked: { cls: "warn", text: "需人机验证" },
-  auth:    { cls: "bad",  text: "令牌无效" },
+  login:   { cls: "warn", text: "需登录" },
+  auth:    { cls: "bad",  text: "认证失效" },
   error:   { cls: "bad",  text: "失败" },
   none:    { cls: "",     text: "无签到接口" },
-  nocfg:   { cls: "",     text: "未配置令牌" },
+  nocfg:   { cls: "",     text: "未配置" },
   unknown: { cls: "",     text: "未检测" },
 };
 
@@ -3938,10 +3939,12 @@ function ckRowState(r) {
   let kind, title;
   if (!r.configured) {
     kind = "nocfg";
-    title = "还没填访问令牌，点「令牌」配置";
+    title = "还没配置认证方式，点「配置」";
   } else if (!st) {
     kind = "unknown";
-    title = "还没签过，点「签到」试一次";
+    title = r.auth === "browser"
+      ? "浏览器模式还没签过：点「登录」先登录一次，再点「签到」"
+      : "还没签过，点「签到」试一次";
   } else {
     kind = st.kind || "unknown";
     title = st.message || "";
@@ -3955,26 +3958,57 @@ function renderCheckin() {
   if (!box) return;
   const rows = (ckData && ckData.rows) || [];
   if (!rows.length) {
-    applyHtml("checkin", box, '<div class="hint">还没有上游。</div>');
+    applyHtml("checkin", box,
+      '<div class="hint">还没有上游参与签到。用上方「添加到签到」把支持签到的上游加进来。</div>');
     return;
   }
 
   const html = rows.map(r => {
     const { title, st, meta } = ckRowState(r);
 
-    // ---- 正在编辑令牌：换成输入框 ----
+    // ---- 正在编辑：换成配置表单 ----
     if (ckEditing === r.id) {
-      return `<div class="ck-row" data-id="${esc(r.id)}">
+      const auth = r.auth === "browser" ? "browser" : "token";
+      const tokShow = auth === "token" ? "" : "display:none";
+      const brShow = auth === "browser" ? "" : "display:none";
+      return `<div class="ck-row ck-edit" data-id="${esc(r.id)}" data-auth="${auth}">
         <div class="ck-name">
           <b>${esc(r.name)}</b>
           <span class="hint mono">${esc(r.site_root)}</span>
         </div>
         <div class="ck-main">
-          <input class="mono" data-ck="token" type="password" autocomplete="off"
-                 placeholder="访问令牌（站点「个人设置 → 访问令牌」）"
-                 value="" style="width:100%">
-          <input class="mono" data-ck="uid" placeholder="User id（老版本才要，可空）"
-                 value="${esc(r.user_id || "")}" style="width:100%;margin-top:6px">
+          <label class="hint" style="display:flex;align-items:center;gap:8px;margin-bottom:6px">
+            认证方式
+            <select data-ck="auth">
+              <option value="token" ${auth === "token" ? "selected" : ""}>访问令牌</option>
+              <option value="browser" ${auth === "browser" ? "selected" : ""}>浏览器自动登录</option>
+            </select>
+          </label>
+          <div class="ck-token-fields" style="${tokShow}">
+            <input class="mono" data-ck="token" type="password" autocomplete="off"
+                   placeholder="访问令牌（站点「个人设置 → 访问令牌」）"
+                   value="" style="width:100%">
+            <input class="mono" data-ck="uid" placeholder="User id（老版本才要，可空）"
+                   value="${esc(r.user_id || "")}" style="width:100%;margin-top:6px">
+          </div>
+          <div class="ck-browser-fields" style="${brShow}">
+            <input class="mono" data-ck="email" placeholder="登录邮箱（推荐，会话过期时自动重登）"
+                   value="${esc(r.email || "")}" style="width:100%">
+            <input class="mono" data-ck="password" type="password" autocomplete="new-password"
+                   placeholder="${r.has_password ? "密码已保存，留空保持不变" : "站点密码（可空，留空则只复用会话）"}"
+                   value="" style="width:100%;margin-top:6px">
+            <label class="hint" style="display:flex;align-items:center;gap:6px;margin-top:4px">
+              <input type="checkbox" data-ck="pwd_clear"> 清除已保存密码
+            </label>
+            <input class="mono" data-ck="uid" placeholder="User id（可空，自动从用户信息里取）"
+                   value="${esc(r.user_id || "")}" style="width:100%;margin-top:6px">
+            <input class="mono" data-ck="site" placeholder="站点根地址（可空，默认 ${esc(r.site_root)}）"
+                   value="${esc(r.site_root_custom || "")}" style="width:100%;margin-top:6px">
+            <div class="hint" style="margin-top:6px">
+              保存后点行内「登录」，在弹出的窗口里登录一次；以后每天自动复用该窗口的会话，
+              填了邮箱密码则过期后自动重登。密码以明文保存在本机状态文件里。
+            </div>
+          </div>
         </div>
         <div class="ck-act">
           <button class="mini primary" data-ck-act="save">保存</button>
@@ -3984,14 +4018,20 @@ function renderCheckin() {
     }
 
     // ---- 常规行 ----
+    const isBrowser = r.auth === "browser";
     const reward = (st && st.reward_text)
       ? `<span class="hint" title="这次签到拿到的额度">+${esc(st.reward_text)}</span>` : "";
-    const wrong = r.token_looks_wrong
+    const wrong = !isBrowser && r.token_looks_wrong
       ? `<span class="badge bad" title="这里要填站点的访问令牌，不是 sk- 开头的推理 Key">填成了 sk-</span>`
       : "";
-    const hintBadge = r.configured
-      ? `<span class="badge mono" title="访问令牌（打码）">${esc(r.token_hint)}</span>` : "";
-    const expiredBadge = r.token_expired
+    const hintBadge = isBrowser
+      ? `<span class="badge mono" title="浏览器自动登录${r.provider ? "（" + esc(r.provider) + "）" : ""}">浏览器</span>`
+        + (r.email ? `<span class="hint mono">${esc(r.email)}</span>` : "")
+        + (r.has_password
+          ? `<span class="badge" title="会话过期时会用邮箱密码自动重登">可重登</span>` : "")
+      : (r.configured
+        ? `<span class="badge mono" title="访问令牌（打码）">${esc(r.token_hint)}</span>` : "");
+    const expiredBadge = !isBrowser && r.token_expired
       ? `<span class="badge bad" title="JWT 已过期，请到站点重新生成访问令牌后保存">令牌已过期</span>` : "";
     const partBox = r.configured
       ? `<label class="hint" style="display:flex;align-items:center;gap:5px"
@@ -4011,9 +4051,14 @@ function renderCheckin() {
       </div>
       <div class="ck-act">
         ${partBox}
-        <button class="mini" data-ck-act="edit">令牌</button>
+        <button class="mini" data-ck-act="edit">配置</button>
+        ${isBrowser
+          ? `<button class="mini" data-ck-act="login" title="打开站点登录窗口，登录一次以后自动复用">登录</button>`
+          : ""}
         <button class="mini primary" data-ck-act="run"
           ${r.configured ? "" : "disabled"}>签到</button>
+        <button class="mini" data-ck-act="remove"
+          title="从签到页移除；只删签到配置，不删除上游本身">移除</button>
       </div>
     </div>`;
   }).join("");
@@ -4027,7 +4072,7 @@ function renderCkSummary() {
   const configured = rows.filter(r => r.configured).length;
   const el = $("#ckSummary");
   if (el) {
-    el.textContent = `已配置令牌 ${configured} / ${rows.length} 个上游` +
+    el.textContent = `已配置 ${configured} / ${rows.length} 个上游` +
       ` · 今天已签 ${s.today_checked || 0}`;
   }
   const n = $("#tabN-ck");
@@ -4073,6 +4118,24 @@ function renderCkSettings() {
   setIfIdle("#ckAutoWin", s.random_minutes == null ? 30 : s.random_minutes);
 }
 
+function renderCkAvailable() {
+  const sel = $("#ckAddSel");
+  if (!sel) return;
+  const previous = sel.value;
+  const list = (ckData && ckData.available) || [];
+  sel.innerHTML = list.length
+    ? list.map(u =>
+        `<option value="${esc(u.id)}">${esc(u.name)} · ${esc(u.site_root)}</option>`
+      ).join("")
+    : '<option value="">（没有可添加的上游）</option>';
+  // 5 秒刷新会重画下拉框，别把用户正在选的值冲掉。
+  if (previous && Array.from(sel.options).some(o => o.value === previous)) {
+    sel.value = previous;
+  }
+  const btn = $("#ckAddBtn");
+  if (btn) btn.disabled = !list.length;
+}
+
 async function loadCheckin(force) {
   if (!force && ckEditing) return;      // 正在编辑令牌，别把输入刷掉
   try {
@@ -4084,6 +4147,7 @@ async function loadCheckin(force) {
   renderCkSummary();
   renderCkHistory();
   renderCkSettings();
+  renderCkAvailable();
 }
 
 // ids 为空 = 所有配了令牌且勾了「参与」的上游
@@ -4101,22 +4165,58 @@ async function runCheckin(ids, probe) {
     const list = res.results || [];
     const good = list.filter(r => r.ok).length;
     const blocked = list.filter(r => r.kind === "blocked").length;
+    const needLogin = list.filter(r => r.kind === "login").length;
     let msg = `${label}完成：${good}/${list.length} 成功`;
     if (blocked) msg += `，${blocked} 个需要人机验证`;
+    if (needLogin) msg += `，${needLogin} 个需要登录（点行内「登录」）`;
     toast(msg, good ? "" : "bad");
   } catch (e) {
     toast(`${label}失败：` + e.message, "bad");
   }
 }
 
-async function saveCkConfig(id, token, userId) {
+async function saveCkConfig(id, opts) {
   try {
-    await api("/admin/checkin/config", { id, token: token, user_id: userId });
+    await api("/admin/checkin/config", Object.assign({ id }, opts || {}));
     ckEditing = "";
     await loadCheckin(true);
     toast("已保存");
   } catch (e) {
     toast("保存失败：" + e.message, "bad");
+  }
+}
+
+async function openCkLogin(id) {
+  try {
+    await api("/admin/checkin/browser/open", { id });
+    toast("已打开登录窗口：登录完成后关掉它即可，以后会自动复用会话");
+  } catch (e) {
+    toast("打开登录窗口失败：" + e.message, "bad");
+  }
+}
+
+async function addCk() {
+  const sel = $("#ckAddSel");
+  const id = sel && sel.value;
+  if (!id) return;
+  try {
+    await api("/admin/checkin/add", { id });
+    ckEditing = id;
+    await loadCheckin(true);
+    toast("已添加，填好认证方式后点「保存」");
+  } catch (e) {
+    toast("添加失败：" + e.message, "bad");
+  }
+}
+
+async function removeCk(id) {
+  if (ckEditing === id) ckEditing = "";
+  try {
+    await api("/admin/checkin/remove", { id });
+    await loadCheckin(true);
+    toast("已从签到页移除（上游本身还在）");
+  } catch (e) {
+    toast("移除失败：" + e.message, "bad");
   }
 }
 
@@ -4159,14 +4259,57 @@ $("#ckRows").addEventListener("click", e => {
   if (act === "run") runCheckin([id], false);
   else if (act === "edit") { ckEditing = id; renderCheckin(); }
   else if (act === "cancel") { ckEditing = ""; renderCheckin(); }
+  else if (act === "login") openCkLogin(id);
+  else if (act === "remove") {
+    if (confirm("把这条从签到页移除？只删除签到配置，不删除上游本身；" +
+      "已保存的令牌 / 邮箱密码也会一起清掉。")) removeCk(id);
+  }
   else if (act === "save") {
-    const token = (row.querySelector('[data-ck="token"]') || {}).value || "";
-    const uid = (row.querySelector('[data-ck="uid"]') || {}).value || "";
-    if (!token.trim()) { toast("令牌不能为空（想停用这个上游就取消勾选「参与」）", "bad"); return; }
-    saveCkConfig(id, token.trim(), uid.trim());
+    const authEl = row.querySelector('[data-ck="auth"]');
+    const auth = authEl ? authEl.value : "token";
+    const scope = row.querySelector(
+      auth === "browser" ? ".ck-browser-fields" : ".ck-token-fields");
+    const val = (name) => {
+      const el = scope && scope.querySelector(`[data-ck="${name}"]`);
+      return el ? el.value : "";
+    };
+    const token = val("token");
+    const uid = val("uid");
+    if (auth === "token" && !token.trim()) {
+      toast("令牌不能为空（想停用这个上游就取消勾选「参与」）", "bad");
+      return;
+    }
+    let password = "__keep__";
+    if (auth === "browser") {
+      const pwd = val("password");
+      const clear = scope && scope.querySelector('[data-ck="pwd_clear"]');
+      if (pwd) password = pwd;
+      else if (clear && clear.checked) password = "";
+    }
+    saveCkConfig(id, {
+      auth: auth,
+      token: token.trim() || "__keep__",
+      user_id: uid.trim(),
+      email: auth === "browser" ? val("email").trim() : "",
+      password: password,
+      site_root: auth === "browser" ? val("site").trim() : "",
+    });
   }
 });
 $("#ckRows").addEventListener("change", e => {
+  const sel = e.target.closest('select[data-ck="auth"]');
+  if (sel) {
+    const row = sel.closest(".ck-row");
+    const browser = sel.value === "browser";
+    if (row) {
+      row.dataset.auth = browser ? "browser" : "token";
+      const tf = row.querySelector(".ck-token-fields");
+      const bf = row.querySelector(".ck-browser-fields");
+      if (tf) tf.style.display = browser ? "none" : "";
+      if (bf) bf.style.display = browser ? "" : "none";
+    }
+    return;
+  }
   const cb = e.target.closest('input[data-ck-act="toggle"]');
   if (!cb) return;
   const row = cb.closest(".ck-row");
@@ -4174,6 +4317,7 @@ $("#ckRows").addEventListener("change", e => {
 });
 $("#ckRunAll").onclick = () => runCheckin(null, false);
 $("#ckProbeAll").onclick = () => runCheckin(null, true);
+$("#ckAddBtn").onclick = addCk;
 $("#ckAutoSave").onclick = saveCkSettings;
 
 /* ================= 界面刷新间隔 ================= */

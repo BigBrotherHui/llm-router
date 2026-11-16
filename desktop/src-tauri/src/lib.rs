@@ -385,6 +385,10 @@ pub fn run() {
                     _ => {}
                 }
             }
+            // 签到浏览器是临时窗口：关掉就真的销毁，别被主窗口的「最小化到托盘」逻辑吃掉。
+            if window.label().starts_with("ck-") {
+                return;
+            }
             if let tauri::WindowEvent::CloseRequested { api, .. } = event {
                 #[cfg(desktop)]
                 {

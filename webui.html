@@ -570,9 +570,11 @@
       <div class="card">
         <h2>每日签到</h2>
         <div class="hint" style="margin:-6px 0 12px">
-          签到用的是站点「个人设置 → 访问令牌」里那个 token，
-          <b>不是</b>上游卡片里 <code>sk-</code> 开头的推理 Key。
-          只有填了令牌的上游才会出现在自动签到里。
+          两种认证：①「访问令牌」——站点「个人设置 → 访问令牌」里的 token，
+          <b>不是</b>上游卡片里 <code>sk-</code> 开头的推理 Key；
+          ②「浏览器自动登录」——用应用内 WebView2 打开站点登录，能过 Cloudflare/WAF
+          （适合 AnyRouter / AgentRouter），首次点行内「登录」登录一次，之后每天自动复用会话；
+          填了邮箱密码则会话过期后自动重登。
         </div>
 
         <div class="up-tools" style="margin-bottom:12px">
@@ -580,7 +582,15 @@
           <div class="grow"></div>
           <button class="mini" id="ckProbeAll"
             title="只探测每个站点有没有签到接口、今天签没签，不真的按下签到">只探测</button>
-          <button class="primary" id="ckRunAll" title="对每个填了令牌的上游签到">一键签到</button>
+          <button class="primary" id="ckRunAll" title="对每个配置好的上游签到">一键签到</button>
+        </div>
+
+        <div class="row" style="gap:8px;align-items:center;margin-bottom:12px;flex-wrap:wrap">
+          <select id="ckAddSel" class="mono" style="max-width:300px"></select>
+          <button class="mini primary" id="ckAddBtn">添加到签到</button>
+          <span class="hint">
+            只把支持签到的上游加进来；不支持的可以随时点行内「移除」（不会删除上游本身）。
+          </span>
         </div>
 
         <div id="ckRows"></div>
@@ -590,7 +600,7 @@
         <h2>自动签到</h2>
         <div class="row" style="gap:14px;flex-wrap:wrap;align-items:flex-end">
           <label style="display:flex;align-items:center;gap:7px;padding-bottom:8px"
-            title="打开后，每天在下面的时刻（加随机浮动）自动把填了令牌的上游签一遍">
+            title="打开后，每天在下面的时刻（加随机浮动）自动把配置好的上游签一遍">
             <input type="checkbox" id="ckAutoOn">
             <span>每天自动签到</span>
           </label>
