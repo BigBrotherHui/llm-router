@@ -1448,3 +1448,74 @@ HTML 错误页 / 裸 JSON 错误 / heartbeat）：**只有那两种切断形状�
 其余一字不改** —— 不是放宽，是纠错。另把判二进制时的错误文案带上「首 32 字节(hex)」，
 下次再遇到能直接看出是 gzip 还是别的。selftest 加 `utf8_split` 假上游行为 +
 两项回归（responses 流 / chat 流各一），**567/567 全过**。
+
+## 2026-11-16 13:06 gpt-6.1-sol 连续 502（两层原因：代理节点挂 + 上游没配 key）
+
+现象：客户端请求 gpt-6.1-sol 全 502，history 里 `连接上游 ... 失败: error sending request for
+url (https://apikey.casa|https://api-slb.crab-ai.net/v1/chat/completions)`，每条 trail 两次
+各 5 秒（连接超时）。同一时段 deepseek/magpie（本机）正常。
+
+排查结论：
+1. **Clash 代理节点已死**。当前 profile `fsllistyaml`，选择出口
+   `JP-Tokyo-h-11814712-rgxi`（vless/reality，zfapi.zalolink.com:43149），mihomo
+   `/group/选择出口/delay` 里没有它（其余 31 个节点都有延迟）。表现是所有境外 HTTPS 一律
+   TLS EOF @5s（schannel「failed to receive handshake」/ python `UNEXPECTED_EOF`），
+   国内直连 HTTPS 正常；Clash 日志 10:02 起也有同样的 `tls handshake eof`。
+   切入点是 mihomo 命名管道 API（`\\.\pipe\verge-mihomo-production-<hash>`，
+   `Authorization: Bearer <secret>`，响应是 chunked，要按字节解）。
+   **处置：把「选择出口」切到 `KR-Chuncheon-26923022-rzig`（57ms），境外 HTTPS 立刻恢复。**
+   注意 profiles.yaml 里 `current` 是 `RtqHX0cMDxnD`，不是 LFreeGH1023。
+2. **网络的病好了之后仍然 401**：路由里 gpt-6.1-sol 只启用两家，两家 `api_keys` 都是空的
+   —— `apikey`（apikey.casa）回 `API_KEY_REQUIRED`，`api-slb.crab-ai` 回
+   `POL-1003 Access denied`。历史里 gpt-6.1-sol 从无一次成功记录。
+   另外 7 个候选（nexavlinks/superqiyu/fastaitoken/agentrouter/AIProxy/dli_gpt/anyrouter）
+   都有 key，但当前都 disabled，需要用户决定启用哪家或补 key。
+
+**用 `/admin/speedtest`（tests:[{id,model}]，不落路由）把 7 家全测一遍**：
+superqiyu 200 / nexavlinks 200 / dli_gpt 200；agentrouter 401「unauthorized client
+detected」；fastaitoken 403「IP 不在白名单」（当前出口 IP 152.69.230.221，即新换的 KR 节点）；
+anyrouter 404 `Invalid URL (POST /v1/chat/completions)`；AIProxy 404（base_url 少了 /v1 类路径）。
+
+**agentrouter 401 是桌面版回归**：state 里 `user_agent = "claude-cli/2.0.30 (external, cli)"`
+（Python 版 v2.4.4 为它加的白名单 UA），但 Rust 移植的 `proxy.rs::auth_headers()` 只塞
+Authorization + content-type，**全仓 `user_agent` 只有 state 读写、没有任何请求使用**。
+实测同一 key：curl 带 `claude-cli/2.0.30` UA → `/v1/responses` 200（能回 `ok`）；
+不带该 UA → 401。要修就补 `auth_headers()`（以及 admin.rs 拉模型/测速那几处直连）把
+`up.user_agent` 非空时写进 `user-agent` 头。
+
+**最终处置：路由改为** superqiyu → nexavlinks → dli_gpt → agentrouter → api-slb → apikey
+（前两家实测 200；后两家本来没 key）。端到端实测通过：普通对话 200（"ok"），
+带 tools 请求 200 且 `finish_reason=tool_calls`、`get_weather{"city":"Paris"}`，
+history 记录 upstream=superqiyu。注意 superqiyu 对这条 3 条消息的小请求报
+prompt_tokens≈18.4k，计费口径可疑，后面看额度消耗。
+
+**追加：api-slb / apikey 的 key 丢失是桌面版保存 bug**。用户明确要用这两家，但 live API
+（`/bootstrap` → stats.upstreams）和 state 都是 `has_key=false / key_count=0`；迁移包、
+state 备份、versions 里都查不到这两家的 key（它们 10-31 之后才加进来）。webui 保存时发的是
+
+    api_keys: [{ id: 旧下标, name, key: 这次输入的值(空=保留旧值), enabled }]
+
+Rust `admin.rs::upstream_update` 只认 `x["value"]` 或裸字符串，于是整表被清成 [] ——
+用户每次在界面点保存（比如把接口类型改成 responses）都会把两个 Key 静默吃掉。
+已把解析改成：`key`/`value`/字符串都认；`key` 为空且带 `id` 时按旧下标保留原值。
+`cargo check --release` 通过；`enabled:false`（禁用单 Key）在 `api_keys: Vec<String>`
+模型下无法保存，先忽略。桌面 exe 仍在跑旧构建，需重启后 UI 保存才生效；
+临时可用 `POST /admin/upstream/update {"id":..,"api_keys":["sk-..."]}` 直接写入。
+另外 `state.rs::auth_headers()` 仍不发 `user_agent`（agentrouter 因此 401），本次未动。
+
+**13:28 编译重启与验证（完成）**
+- 停掉 PID 67560 → `CARGO_TARGET_DIR=D:\llm-router-target cargo build --release`
+  （36s）→ 带 `LLM_ROUTER_STATE=<repo>/.llmrouter/config.state.json` 重启，新 PID 3640。
+- 建了目录联接 `D:\llm-router-target\.llmrouter` → 仓库 `.llmrouter`：以后直接双击 exe
+  也走仓库状态（否则 walk-up 找不到会退回 AppData 里 1.6KB 的空状态）。
+- 修复验证（临时上游 u4d8fdf57，测完已删）：加 key → 用 webui 同款 payload
+  `[{id:0,name:"",key:"",enabled:true}]` 保存 → key 仍在（旧构建会清空）。
+- 两家 key 现在都已落盘：api-slb `sk-7n2…0PJv`、apikey `sk-d13…51ef`（与 13:06 那条
+  history 的 key 提示一致），`/admin/speedtest` 两家都 200。
+- 路由已改成**只启用这两家**：api-slb → apikey，其余 7 个候选全部 disabled。
+- 端到端实测（全部 history `upstream=api-slb.crab-ai`）：非流式 200（首包 33.5s，上游慢）；
+  非流式 tools 200 且 `finish_reason=tool_calls`；流式 200（7 chunks）；流式 + tools 200
+  （`tool_calls` 分片 + usage 块 + `[DONE]`）。
+- 回归审计：旧解析来自 848fefbe（11-13 桌面移植）；Python 版整表协议见 NOTES 442-457，
+  移植时丢了 `id/key` 语义，本次恢复，没有回退任何旧修复。单 Key `enabled:false`
+  仍无法表示（`api_keys: Vec<String>`），本次不处理。

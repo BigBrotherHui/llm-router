@@ -138,10 +138,27 @@ pub async fn upstream_update(State(state): State<Arc<AppState>>, Json(p): Json<V
             up.api_mode = Some(v.to_string());
         }
         if let Some(v) = p.get("api_keys").and_then(|v| v.as_array()) {
-            up.api_keys = v
-                .iter()
-                .filter_map(|x| x.get("value").and_then(|v| v.as_str()).map(|s| s.to_string()).or_else(|| x.as_str().map(|s| s.to_string())))
-                .collect();
+            // webui 提交的是 [{ id, name, key, enabled }]：id 是旧 Key 的下标，
+            // key 为空表示「保留旧值」。只认 value/裸字符串会把整表清空。
+            let old = std::mem::take(&mut up.api_keys);
+            let mut next: Vec<String> = Vec::new();
+            for x in v {
+                let typed = x
+                    .get("key")
+                    .and_then(|v| v.as_str())
+                    .or_else(|| x.get("value").and_then(|v| v.as_str()))
+                    .or_else(|| x.as_str())
+                    .map(|s| s.trim())
+                    .unwrap_or("");
+                if !typed.is_empty() {
+                    next.push(typed.to_string());
+                } else if let Some(i) = x.get("id").and_then(|v| v.as_i64()) {
+                    if let Some(k) = old.get(i as usize) {
+                        next.push(k.clone());
+                    }
+                }
+            }
+            up.api_keys = next;
         }
         if let Some(v) = p.get("first_timeout_seconds").and_then(|v| v.as_f64()) {
             up.first_timeout_seconds = Some(v);
