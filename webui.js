@@ -5772,6 +5772,7 @@ function sessSourceMeta(source) {
     claude: { label: "Claude Code", letter: "C", hue: 276 },
     pi: { label: "Pi", letter: "P", hue: 146 },
     codex: { label: "Codex", letter: "X", hue: 28 },
+    orca: { label: "Orca", letter: "O", hue: 190 },
   };
   return map[source] || { label: source || "未知", letter: String(source || "?").slice(0, 1).toUpperCase(), hue: 210 };
 }
@@ -5796,6 +5797,7 @@ function sessSources() {
   if ($("#sessSrcClaude") && $("#sessSrcClaude").checked) ids.push("claude");
   if ($("#sessSrcPi") && $("#sessSrcPi").checked) ids.push("pi");
   if ($("#sessSrcCodex") && $("#sessSrcCodex").checked) ids.push("codex");
+  if ($("#sessSrcOrca") && $("#sessSrcOrca").checked) ids.push("orca");
   return ids;
 }
 function sessRow(r) {
