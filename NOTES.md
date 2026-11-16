@@ -1584,3 +1584,49 @@ Rust `admin.rs::upstream_update` 只认 `x["value"]` 或裸字符串，于是整
 - 回归审计：旧解析来自 848fefbe（11-13 桌面移植）；Python 版整表协议见 NOTES 442-457，
   移植时丢了 `id/key` 语义，本次恢复，没有回退任何旧修复。单 Key `enabled:false`
   仍无法表示（`api_keys: Vec<String>`），本次不处理。
+
+
+## 2026-11-16 14:30 会话对账新增 Orca 源（读 agent-session-journal.db）
+
+起因：面板只认 dsh / claude / pi / codex，Orca 托管跑起来的 Agent 完全读不到。核实过的现状不是「没东西可读」：
+Orca 的账本在 `%APPDATA%\Orca\agent-session-journal.db`（SQLite 915 MB / 54 会话 / items 15.7 万），
+`journal_outcomes` 按「字段 → JSON 值」物化；opencode 走 ACP，磁盘上没有任何 jsonl，这个库是它唯一的账本。
+而且那些请求**一直**打在 8010 上 —— 今天流水 984 条全带 session_id，8 个 `ses_*` 里 7 个能在
+`agent_session_records` 里对上（例：`ses_e1d42be4dffeT3DHd27xYf8Yvf`，该会话在 Orca 账本里 4000+ 行、
+含 user prompt 原文）—— 但路由侧只有一串 id，拿不到 prompt/轮次，也归不到 workspace。
+
+**改动**（全只读，不写任何 Agent 的配置）
+- `sessions.rs::scan_orca()`：rusqlite 只读打开（`SQLITE_OPEN_READ_ONLY` + busy_timeout 800ms，
+  Orca 正在写 WAL 也不锁），两条查询：
+  ① `journal_outcome_generations ⋈ agent_session_records` → provider / conversationName /
+  workspaceId / providerHandleChain 里出现过的**每个** ses_*（resume 会换新 id，旧的一起登记）；
+  ② `journal_outcomes` 里 `field='items' and entry_key like '%turn%'`，`order by rowid desc limit 20000`，
+  按 `itemId` 去重（同一轮会反复重写 revision，倒序第一条就是最新版）。轮次时刻取 `startedAt`，
+  耗时取 `durationMs`（缺失时用 `completedAt - startedAt`）。
+- 会话 id 直接取 turnId 里的 `p:<ses_xxx>:prompt…` —— 和 8010 流水里的 `ses_*` 是同一个串，两边天然 join。
+- routed 判定沿用原有机制：`opencode.json` 的 `provider.*.models` 反查「模型 → provider 标签」
+  （标签优先取 provider 的 `name`，这台机器写的是 `llm-router`），再交给 `round()` 按 baseURL 判，
+  于是 43 轮正确地进了「过 LLM Router」这一侧（先前若标成未走路由，会和流水重复计一轮）。
+- **只跳过 claude / pi / codex**：它们在 Orca 里也写同一个库，但各自另有 jsonl 账本（`scan_claude` /
+  `scan_pi` / `scan_codex` 已覆盖），重复计入会把「全部请求」口径算两遍。
+- token 一律 0：Orca 只记 `contextUsage`（estimate/report），不是上游计费口径；走路由的那几轮
+  真实用量由 8010 流水提供，两边不冲突。
+- `journal_as_records()`：流水行按 `session_id` 反查 Orca 会话，agent 从「LLM Router / (本机 8010 流水)」
+  变成「Orca · opencode / <workspace 路径>」，请求记录页终于能看出是谁问的。
+- `collector.rs`：默认源清单与 10 秒预热查询都加 orca（否则不带 `sources` 的请求会命中原有的四源缓存）。
+- 前端 `webui.html` / `webui.js`：会话对账多一个 Orca 勾选框 + `sessSourceMeta`（letter O / hue 190），
+  说明文字补上账本路径与「opencode 只有这一个账本」。
+
+**验证（真跑）**
+- `cargo test --lib` 24/24（新增 `sessions::tests` 两项：turnId / workspaceId 解析、turn 行过滤）。
+- 重启 exe（PID 67268）后：
+  - `/sessions/scan?range=today` → sources 五家，orca 43 轮 / 7 会话 / 632ms，行是
+    `Orca · opencode | llm-router | deepseek | routed=true`；
+  - `/sessions/scan?sources=orca&range=168` → 153 轮 / 24 会话，会话名与 workspace 对得上
+    （abalone / Dental / llm-router）；`skipped_old` 记着窗口外的 110 轮；
+  - `/sessions/records?include=router` → 13:37 那批请求的 agent 变成 `Orca · opencode`、
+    project 是 workspace 路径，且 `source=orca` 的行数为 **0**（route=2 已滤掉走路由的轮次，没有重复计入）；
+  - 缓存账本按会话列出 orca 7 行（model deepseek），HUD `all_calls` 1491 已含 Orca。
+
+**已知取舍**：Orca 一次扫描 0.6–0.9 秒（48 万行的 LIKE 扫用不上索引），靠采集器 15 秒缓存 + 10 秒预热摊平；
+`range=all` 只覆盖账本最近 20000 行（约近 5 天），越界时 `sources[].truncated` 会打上。

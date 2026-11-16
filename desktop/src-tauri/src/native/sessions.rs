@@ -268,7 +268,7 @@ pub struct ScanQuery {
     pub hours: Option<i64>,
     /// today = 本机时区当天 00:00 起；all = 不限时间；其余按 hours
     pub range: Option<String>,
-    /// 逗号分隔：dsh,claude,pi,codex
+    /// 逗号分隔：dsh,claude,pi,codex,orca
     pub sources: Option<String>,
     /// 明细行上限
     pub limit: Option<usize>,
@@ -2526,9 +2526,11 @@ impl OrcaMeta {
     }
 }
 
-/// opencode.json 的 provider 表 → (模型名 → provider 标签, 默认标签)。
+/// opencode.json 的 provider 表 → (模型名 → provider 标签, 默认标签, 默认模型)。
 /// 标签优先取 provider 的 `name`（这台机器上写的是 llm-router），`is_router_name` 认它。
-fn opencode_labels(home: &Path) -> (HashMap<String, String>, String) {
+/// Orca 的 turn 项只在个别情况下带 model（contextUsage 是 report 时），
+/// 其余退回配置文件里的默认模型，免得整张对账表全是「(未记录)」。
+fn opencode_labels(home: &Path) -> (HashMap<String, String>, String, String) {
     let text = [
         home.join(".config").join("opencode").join("opencode.json"),
         home.join("AppData")
@@ -2544,14 +2546,14 @@ fn opencode_labels(home: &Path) -> (HashMap<String, String>, String) {
     let Ok(v) = serde_json::from_str::<Value>(&super::agents::strip_jsonc(
         text.trim_start_matches('\u{feff}'),
     )) else {
-        return (by_model, String::new());
+        return (by_model, String::new(), String::new());
     };
     let Some(providers) = v
         .get("provider")
         .or_else(|| v.get("providers"))
         .and_then(|p| p.as_object())
     else {
-        return (by_model, String::new());
+        return (by_model, String::new(), String::new());
     };
     let label = |key: &str, pv: &Value| -> String {
         pv.get("name")
@@ -2569,15 +2571,15 @@ fn opencode_labels(home: &Path) -> (HashMap<String, String>, String) {
             }
         }
     }
-    // 默认标签：opencode.json 顶层 `model` 写成 "provider/model"，取它那个 provider
-    let default = v
-        .get("model")
-        .and_then(|x| x.as_str())
-        .and_then(|m| m.split_once('/'))
-        .and_then(|(key, _)| providers.get(key).map(|pv| label(key, pv)))
+    // 顶层 `model` 写成 "provider/model"：前半是默认 provider，后半是默认模型
+    let top = v.get("model").and_then(|x| x.as_str()).unwrap_or("");
+    let (top_key, top_model) = top.split_once('/').unwrap_or(("", top));
+    let default_provider = providers
+        .get(top_key)
+        .map(|pv| label(top_key, pv))
         .or_else(|| providers.keys().next().map(|k| label(k, &providers[k])))
         .unwrap_or_default();
-    (by_model, default)
+    (by_model, default_provider, top_model.to_string())
 }
 
 struct OrcaTurn {
@@ -2681,7 +2683,7 @@ fn scan_orca(ctx: &mut Ctx, home: &Path, st: &mut SrcStat) {
     // 2) 轮次。同一轮会被反复重写（revision），rowid 倒序先看到的是最新版本，按 itemId 去重；
     //    倒序 + limit 同时把「全部时间」压在最近一段，避免 90 万行的索引整份扫一遍。
     const ORCA_ROW_LIMIT: usize = 20_000;
-    let (model_labels, default_label) = opencode_labels(home);
+    let (model_labels, default_label, default_model) = opencode_labels(home);
     let router_provider = ctx
         .bases
         .iter()
@@ -2768,11 +2770,16 @@ fn scan_orca(ctx: &mut Ctx, home: &Path, st: &mut SrcStat) {
             external_top: String::new(),
         };
         for t in turns {
-            let provider = if t.model.is_empty() {
+            let model = if t.model.is_empty() {
+                default_model.clone()
+            } else {
+                t.model.clone()
+            };
+            let provider = if model.is_empty() {
                 default_label.clone()
             } else {
                 model_labels
-                    .get(&t.model)
+                    .get(&model)
                     .cloned()
                     .unwrap_or_else(|| default_label.clone())
             };
@@ -2788,7 +2795,7 @@ fn scan_orca(ctx: &mut Ctx, home: &Path, st: &mut SrcStat) {
                 &agent,
                 &mut sess,
                 &provider,
-                &t.model,
+                &model,
                 t.at,
                 [0; 5],
                 t.duration_ms,

@@ -65,7 +65,7 @@ pub fn invalidate(key: &str) {
 
 fn norm_sources(s: Option<&str>) -> String {
     let mut v: Vec<String> = s
-        .unwrap_or("dsh,claude,pi,codex")
+        .unwrap_or("dsh,claude,pi,codex,orca")
         .split(',')
         .map(|x| x.trim().to_ascii_lowercase())
         .filter(|x| !x.is_empty())
@@ -111,7 +111,7 @@ pub fn tools_key(q: &ToolQuery) -> String {
     )
 }
 
-/// 后台预热：固定默认查询（今天/四源/200 行），每 10 秒一轮。
+/// 后台预热：固定默认查询（今天/五源/200 行），每 10 秒一轮。
 pub fn start(state: Arc<AppState>) {
     tokio::spawn(async move {
         // 错开启动，避免和第一次页面加载抢 IO。
@@ -120,7 +120,7 @@ pub fn start(state: Arc<AppState>) {
             let scan_q = ScanQuery {
                 hours: None,
                 range: Some("today".into()),
-                sources: Some("dsh,claude,pi,codex".into()),
+                sources: Some("dsh,claude,pi,codex,orca".into()),
                 limit: Some(200),
                 route: None,
                 metric: None,
