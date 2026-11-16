@@ -71,13 +71,24 @@ UI 已提示。
 站点会话和 Linux.do 会话都存在该上游专属 profile 里，之后可全自动重登。入口关键字
 可用 `checkin.oauth_hint` 覆盖（默认匹配 linux do / linux.do / linux-do / `/api/oauth/linux`）。
 
+**Chrome 登录（方案 1）**：新增 `auth=chrome`。点行内「Chrome 登录」会启动一个
+**专用 Chrome**（profile 在 `<state目录>/checkin-chrome-profile`，不影响日常 Chrome），
+用 `--remote-debugging-port=0` + `DevToolsActivePort` 连 CDP；每 2 秒读
+`Storage.getCookies`，按站点域名过滤（排除 linux.do 等第三方 cookie），再用
+`/api/user/self` 验证；成功后把 Cookie 写进 `checkin.cookies` + `cookie_at`。
+签到直接复用这份 Cookie，不再依赖 WebView2。Cookie 失效时行内状态会提示重新登录；
+内置 WebView2 白屏时优先用这个模式。调试端口只监听 127.0.0.1 的随机端口；
+Chrome 已在跑时复用同一端口，再次点击只是打开登录页。
+
 **签到页成员制**：只有 `extra.checkin` 存在时才显示该上游；新增
 `POST /admin/checkin/add`（加空配置）和 `POST /admin/checkin/remove`
 （删 `checkin` + `checkin_state`，不动上游本身），GET `/admin/checkin` 额外返回
 `available` 供下拉框选择。不支持签到的上游从此不占签到页，误加可移除。
 
-**验证**：`cargo test --lib` 19 项全过（新增 7 项覆盖 provider 检测、预设/覆盖、
-browser 配置判定、签到路径候选、cookie/标签工具、成员制）；`node --check webui.js` 通过。
+**验证**：`cargo test --lib` 22 项全过（新增 10 项覆盖 provider 检测、预设/覆盖、
+browser/chrome 配置判定、签到路径候选、cookie/域名过滤/标签工具、成员制）；
+`node --check webui.js` 通过；另外用临时 Chrome profile 实测了
+`DevToolsActivePort`、`Storage.getCookies` 和同 profile 复用端口。
 **未做的验证**：还没有用真实 AnyRouter 账号跑过端到端；Turnstile 若弹交互，
 自动登录会失败并提示手动点「登录」。
 
