@@ -45,14 +45,21 @@ UI 已提示。
 内置 WebView2 白屏时优先用这个模式。调试端口只监听 127.0.0.1 的随机端口；
 Chrome 已在跑时复用同一端口，再次点击只是打开登录页。
 
+**首次免登录**：第一次 Chrome 登录会尝试把日常 Chrome 的 `Local State` + 当前
+profile 的 `Network/Cookies` / `Preferences` 复制进专用 profile（只保留 Default），
+复制后专用 Chrome 直接是已登录状态。Chrome 运行时会独占 Cookies 文件，读不到就
+返回「请先完全退出 Chrome（一次）」；复制成功写 `.seeded`，之后不再覆盖。
+实测 Chrome 157 的 `DevToolsActivePort` / `Storage.getCookies` / 同 profile 复用
+端口均可用；复制逻辑有单测。
+
 **签到页成员制**：只有 `extra.checkin` 存在时才显示该上游；新增
 `POST /admin/checkin/add`（加空配置）和 `POST /admin/checkin/remove`
 （删 `checkin` + `checkin_state`，不动上游本身），GET `/admin/checkin` 额外返回
 `available` 供下拉框选择。不支持签到的上游从此不占签到页，误加可移除。
 
-**验证**：`cargo test --lib` 22 项全过（新增 10 项覆盖 provider 检测、预设/覆盖、
-browser/chrome 配置判定、签到路径候选、cookie/域名过滤/标签工具、成员制）；
-`node --check webui.js` 通过；另外用临时 Chrome profile 实测了
+**验证**：`cargo test --lib` 全部通过（Chrome 新增 provider 检测、预设/覆盖、
+browser/chrome 配置判定、签到路径候选、cookie/域名过滤、Chrome profile 复制、
+成员制等测试）；`node --check webui.js` 通过；另外用临时 Chrome profile 实测了
 `DevToolsActivePort`、`Storage.getCookies` 和同 profile 复用端口。
 **未做的验证**：还没有用真实 AnyRouter 账号跑过端到端；Turnstile 若弹交互，
 自动登录会失败并提示手动点「登录」。

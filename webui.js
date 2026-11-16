@@ -4032,8 +4032,9 @@ function renderCheckin() {
                    value="${esc(r.user_id || "")}" style="width:100%;margin-top:6px">
             <div class="hint" style="margin-top:6px">
               保存后点行内「Chrome 登录」会打开一个<b>专用 Chrome</b>（不影响你日常 Chrome）。
-              在里面用 Linux.do 登录一次，应用会自动抓取该站 Cookie。当前：${esc(cookieText)}。
-              之后签到直接用这份 Cookie，不再依赖内置浏览器。
+              首次会从你日常 Chrome 复制登录态：<b>需要先完全退出 Chrome 一次</b>，复制后专用
+              Chrome 直接是已登录状态，不用重新登录；复制不到时再在里面登录一次即可。
+              当前：${esc(cookieText)}。之后签到直接用这份 Cookie，不再依赖内置浏览器。
             </div>
           </div>
         </div>
