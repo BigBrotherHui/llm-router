@@ -1,5 +1,16 @@
 # NOTES
 
+## 2026-11-16 移除签到的浏览器 / Chrome 登录模式
+
+用户反馈内置 WebView2 白屏、Chrome 专用配置需要重新登录，两种都登不上去。按要求移除：
+
+- 签到只保留「访问令牌」；签到页仍是成员制（添加 / 移除上游，不影响上游本身）。
+- 删除 `/admin/checkin/browser/open`、`/admin/checkin/chrome/login` 及前后端相关代码。
+- 启动时 `migrate_removed_auth` 把遗留 `auth=browser/chrome` 回退成 token，
+  清掉 cookies / email / password / site_root / oauth_hint 等字段；有 token 的保留。
+- 专用 Chrome profile（`<state>/checkin-chrome-profile`）已删除。
+- 下面「签到接入 millylee/anyrouter-check-in」小节仅保留历史记录，功能已移除。
+
 ## 2026-11-16 v2.10.0：请求记录拆成三口径，并修掉「今日请求数」和流水对不上的四处
 
 起因：用户报「会话对账里的今日请求次数和请求记录没对上」，随后明确要的口径是

@@ -815,23 +815,6 @@ pub async fn checkin_config(
             .cloned()
             .unwrap_or_default();
         let old_token = cfg.get("token").and_then(|v| v.as_str()).unwrap_or("").to_string();
-        let old_auth = cfg
-            .get("auth")
-            .and_then(|v| v.as_str())
-            .unwrap_or("token")
-            .to_string();
-        let old_email = cfg.get("email").and_then(|v| v.as_str()).unwrap_or("").to_string();
-        if let Some(auth) = p.get("auth").and_then(|v| v.as_str()) {
-            let auth = match auth {
-                "browser" => "browser",
-                "chrome" => "chrome",
-                _ => "token",
-            };
-            if auth != old_auth {
-                cfg.insert("auth".to_string(), json!(auth));
-                up.extra.remove("checkin_state");
-            }
-        }
         if let Some(token) = p.get("token").and_then(|v| v.as_str()) {
             if token != "__keep__" {
                 let token = token.trim().to_string();
@@ -849,87 +832,17 @@ pub async fn checkin_config(
         if let Some(uid) = p.get("user_id").and_then(|v| v.as_str()) {
             cfg.insert("user_id".to_string(), json!(uid.trim()));
         }
-        if let Some(site) = p.get("site_root").and_then(|v| v.as_str()) {
-            let site = site.trim();
-            let old_site = cfg.get("site_root").and_then(|v| v.as_str()).unwrap_or("");
-            if site != old_site {
-                // 站点变了，旧 Chrome Cookie 不能再用。
-                cfg.remove("cookies");
-                cfg.remove("cookie_at");
-                up.extra.remove("checkin_state");
-            }
-            if site.is_empty() {
-                cfg.remove("site_root");
-            } else {
-                cfg.insert("site_root".to_string(), json!(site));
-            }
-        }
-        if let Some(provider) = p.get("provider").and_then(|v| v.as_str()) {
-            let provider = provider.trim();
-            let old_provider = cfg
-                .get("provider")
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .to_string();
-            if provider != old_provider {
-                up.extra.remove("checkin_state");
-            }
-            if provider.is_empty() {
-                cfg.remove("provider");
-            } else {
-                cfg.insert("provider".to_string(), json!(provider));
-            }
-        }
-        if let Some(email) = p.get("email").and_then(|v| v.as_str()) {
-            let email = email.trim();
-            if email != old_email {
-                up.extra.remove("checkin_state");
-            }
-            if email.is_empty() {
-                cfg.remove("email");
-            } else {
-                cfg.insert("email".to_string(), json!(email));
-            }
-        }
-        if let Some(password) = p.get("password").and_then(|v| v.as_str()) {
-            if password != "__keep__" {
-                if password.is_empty() {
-                    cfg.remove("password");
-                } else {
-                    cfg.insert("password".to_string(), json!(password));
-                }
-                up.extra.remove("checkin_state");
-            }
-        }
-        if let Some(hint) = p.get("oauth_hint").and_then(|v| v.as_str()) {
-            let hint = hint.trim();
-            let old_hint = cfg
-                .get("oauth_hint")
-                .and_then(|v| v.as_str())
-                .unwrap_or("");
-            if hint != old_hint {
-                up.extra.remove("checkin_state");
-            }
-            if hint.is_empty() {
-                cfg.remove("oauth_hint");
-            } else {
-                cfg.insert("oauth_hint".to_string(), json!(hint));
-            }
-        }
         let has_token = cfg
             .get("token")
             .and_then(|v| v.as_str())
             .map(|s| !s.is_empty())
             .unwrap_or(false);
-        let auth_now = cfg.get("auth").and_then(|v| v.as_str()).unwrap_or("token");
-        let browser_like = auth_now == "browser" || auth_now == "chrome";
-        let has_auth = browser_like || has_token;
         if let Some(enabled) = p.get("enabled").and_then(|v| v.as_bool()) {
-            cfg.insert("enabled".to_string(), json!(enabled && has_auth));
-        } else if has_auth && !cfg.contains_key("enabled") {
+            cfg.insert("enabled".to_string(), json!(enabled && has_token));
+        } else if has_token && !cfg.contains_key("enabled") {
             cfg.insert("enabled".to_string(), json!(true));
         }
-        if !has_auth {
+        if !has_token {
             cfg.insert("enabled".to_string(), json!(false));
         }
         up.extra.insert("checkin".to_string(), Value::Object(cfg));
@@ -977,55 +890,6 @@ pub async fn checkin_remove(
     }
     let _ = state.save();
     ok(json!({"ok": true}))
-}
-
-pub async fn checkin_chrome_login(
-    State(state): State<Arc<AppState>>,
-    Json(p): Json<Value>,
-) -> Response {
-    let id = p.get("id").and_then(|v| v.as_str()).unwrap_or("");
-    if id.is_empty() {
-        return bad("缺少 id");
-    }
-    let up = {
-        let file = state.file.read().unwrap();
-        match file.find_upstream(id) {
-            Some(u) => u.clone(),
-            None => return not_found("找不到这个上游"),
-        }
-    };
-    let st = state.clone();
-    let prepared =
-        tokio::task::spawn_blocking(move || super::checkin::prepare_chrome_login(&st, &up)).await;
-    match prepared {
-        Ok(Ok(prep)) => {
-            super::checkin::spawn_chrome_capture(state.clone(), prep);
-            ok(json!({"ok": true, "message": "已打开专用 Chrome"}))
-        }
-        Ok(Err(e)) => bad(&e),
-        Err(e) => bad(&format!("启动 Chrome 失败：{e}")),
-    }
-}
-
-pub async fn checkin_browser_open(
-    State(state): State<Arc<AppState>>,
-    Json(p): Json<Value>,
-) -> Response {
-    let id = p.get("id").and_then(|v| v.as_str()).unwrap_or("");
-    if id.is_empty() {
-        return bad("缺少 id");
-    }
-    let up = {
-        let file = state.file.read().unwrap();
-        match file.find_upstream(id) {
-            Some(u) => u.clone(),
-            None => return not_found("找不到这个上游"),
-        }
-    };
-    match super::checkin::open_login_window(&state, &up) {
-        Ok(label) => ok(json!({"ok": true, "label": label})),
-        Err(e) => bad(&e),
-    }
 }
 
 pub async fn checkin_settings(

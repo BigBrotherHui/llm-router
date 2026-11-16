@@ -197,14 +197,6 @@ pub async fn serve(state: Arc<AppState>, port: u16) -> Result<(), String> {
         .route("/admin/checkin/add", post(admin::checkin_add))
         .route("/admin/checkin/remove", post(admin::checkin_remove))
         .route("/admin/checkin/config", post(admin::checkin_config))
-        .route(
-            "/admin/checkin/browser/open",
-            post(admin::checkin_browser_open),
-        )
-        .route(
-            "/admin/checkin/chrome/login",
-            post(admin::checkin_chrome_login),
-        )
         .route("/admin/checkin/settings", post(admin::checkin_settings))
         .route("/admin/state/versions", get(admin::versions))
         .route("/admin/admin-log", get(admin::admin_log))

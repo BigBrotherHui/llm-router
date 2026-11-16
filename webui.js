@@ -3958,11 +3958,10 @@ const CK_STYLE = {
   ok:      { cls: "ok",   text: "签到成功" },
   already: { cls: "ok",   text: "今天已签" },
   blocked: { cls: "warn", text: "需人机验证" },
-  login:   { cls: "warn", text: "需登录" },
-  auth:    { cls: "bad",  text: "认证失效" },
+  auth:    { cls: "bad",  text: "令牌无效" },
   error:   { cls: "bad",  text: "失败" },
   none:    { cls: "",     text: "无签到接口" },
-  nocfg:   { cls: "",     text: "未配置" },
+  nocfg:   { cls: "",     text: "未配置令牌" },
   unknown: { cls: "",     text: "未检测" },
 };
 
@@ -3970,20 +3969,11 @@ function ckRowState(r) {
   const st = r.state || null;
   let kind, title;
   if (!r.configured) {
-    if (r.auth === "chrome") {
-      kind = "login";
-      title = "还没有 Chrome Cookie，点「Chrome 登录」打开专用 Chrome 登录一次";
-    } else {
-      kind = "nocfg";
-      title = "还没配置认证方式，点「配置」";
-    }
+    kind = "nocfg";
+    title = "还没填访问令牌，点「配置」";
   } else if (!st) {
     kind = "unknown";
-    title = r.auth === "browser"
-      ? "浏览器模式还没签过：点「登录」先登录一次，再点「签到」"
-      : r.auth === "chrome"
-        ? "Chrome Cookie 已保存，点「签到」试一次"
-        : "还没签过，点「签到」试一次";
+    title = "还没签过，点「签到」试一次";
   } else {
     kind = st.kind || "unknown";
     title = st.message || "";
@@ -4005,70 +3995,19 @@ function renderCheckin() {
   const html = rows.map(r => {
     const { title, st, meta } = ckRowState(r);
 
-    // ---- 正在编辑：换成配置表单 ----
+    // ---- 正在编辑令牌：换成输入框 ----
     if (ckEditing === r.id) {
-      const auth = (r.auth === "browser" || r.auth === "chrome") ? r.auth : "token";
-      const tokShow = auth === "token" ? "" : "display:none";
-      const brShow = auth === "browser" ? "" : "display:none";
-      const chShow = auth === "chrome" ? "" : "display:none";
-      const cookieText = r.has_cookies
-        ? "已保存 Cookie" + (r.cookie_at
-          ? "（" + new Date(r.cookie_at * 1000).toLocaleString() + "）" : "")
-        : "还没有 Cookie";
-      return `<div class="ck-row ck-edit" data-id="${esc(r.id)}" data-auth="${auth}">
+      return `<div class="ck-row" data-id="${esc(r.id)}">
         <div class="ck-name">
           <b>${esc(r.name)}</b>
           <span class="hint mono">${esc(r.site_root)}</span>
         </div>
         <div class="ck-main">
-          <label class="hint" style="display:flex;align-items:center;gap:8px;margin-bottom:6px">
-            认证方式
-            <select data-ck="auth">
-              <option value="token" ${auth === "token" ? "selected" : ""}>访问令牌</option>
-              <option value="browser" ${auth === "browser" ? "selected" : ""}>浏览器自动登录</option>
-              <option value="chrome" ${auth === "chrome" ? "selected" : ""}>Chrome 登录（自动抓 Cookie）</option>
-            </select>
-          </label>
-          <div class="ck-token-fields" style="${tokShow}">
-            <input class="mono" data-ck="token" type="password" autocomplete="off"
-                   placeholder="访问令牌（站点「个人设置 → 访问令牌」）"
-                   value="" style="width:100%">
-            <input class="mono" data-ck="uid" placeholder="User id（老版本才要，可空）"
-                   value="${esc(r.user_id || "")}" style="width:100%;margin-top:6px">
-          </div>
-          <div class="ck-browser-fields" style="${brShow}">
-            <input class="mono" data-ck="email" placeholder="登录邮箱（可选；Linux.do 登录可留空）"
-                   value="${esc(r.email || "")}" style="width:100%">
-            <input class="mono" data-ck="password" type="password" autocomplete="new-password"
-                   placeholder="${r.has_password ? "密码已保存，留空保持不变" : "站点密码（可选；Linux.do / OAuth 可留空）"}"
-                   value="" style="width:100%;margin-top:6px">
-            <label class="hint" style="display:flex;align-items:center;gap:6px;margin-top:4px">
-              <input type="checkbox" data-ck="pwd_clear"> 清除已保存密码
-            </label>
-            <input class="mono" data-ck="uid" placeholder="User id（可空，自动从用户信息里取）"
-                   value="${esc(r.user_id || "")}" style="width:100%;margin-top:6px">
-            <input class="mono" data-ck="site" placeholder="站点根地址（可空，默认 ${esc(r.site_root)}）"
-                   value="${esc(r.site_root_custom || "")}" style="width:100%;margin-top:6px">
-            <input class="mono" data-ck="oauth_hint" placeholder="OAuth 入口关键字（可空，默认 Linux.do）"
-                   value="${esc(r.oauth_hint || "")}" style="width:100%;margin-top:6px">
-            <div class="hint" style="margin-top:6px">
-              保存后点行内「登录」，在弹出的窗口里登录一次（用 Linux.do 也行）；以后每天自动复用
-              该窗口的会话。没有邮箱密码也能自动重登：会话过期后会尝试点 Linux.do 登录入口，
-              前提是登录窗口里的 Linux.do 本身还处于登录状态。密码以明文保存在本机状态文件里。
-            </div>
-          </div>
-          <div class="ck-chrome-fields" style="${chShow}">
-            <input class="mono" data-ck="site" placeholder="站点根地址（可空，默认 ${esc(r.site_root)}）"
-                   value="${esc(r.site_root_custom || "")}" style="width:100%">
-            <input class="mono" data-ck="uid" placeholder="User id（可空，自动从用户信息里取）"
-                   value="${esc(r.user_id || "")}" style="width:100%;margin-top:6px">
-            <div class="hint" style="margin-top:6px">
-              保存后点行内「Chrome 登录」会打开一个<b>专用 Chrome</b>（不影响你日常 Chrome）。
-              首次会从你日常 Chrome 复制登录态：<b>需要先完全退出 Chrome 一次</b>，复制后专用
-              Chrome 直接是已登录状态，不用重新登录；复制不到时再在里面登录一次即可。
-              当前：${esc(cookieText)}。之后签到直接用这份 Cookie，不再依赖内置浏览器。
-            </div>
-          </div>
+          <input class="mono" data-ck="token" type="password" autocomplete="off"
+                 placeholder="访问令牌（站点「个人设置 → 访问令牌」）"
+                 value="" style="width:100%">
+          <input class="mono" data-ck="uid" placeholder="User id（老版本才要，可空）"
+                 value="${esc(r.user_id || "")}" style="width:100%;margin-top:6px">
         </div>
         <div class="ck-act">
           <button class="mini primary" data-ck-act="save">保存</button>
@@ -4078,26 +4017,14 @@ function renderCheckin() {
     }
 
     // ---- 常规行 ----
-    const isBrowser = r.auth === "browser";
-    const isChrome = r.auth === "chrome";
     const reward = (st && st.reward_text)
       ? `<span class="hint" title="这次签到拿到的额度">+${esc(st.reward_text)}</span>` : "";
-    const wrong = !isBrowser && !isChrome && r.token_looks_wrong
+    const wrong = r.token_looks_wrong
       ? `<span class="badge bad" title="这里要填站点的访问令牌，不是 sk- 开头的推理 Key">填成了 sk-</span>`
       : "";
-    const hintBadge = isBrowser
-      ? `<span class="badge mono" title="浏览器自动登录，支持 Linux.do / OAuth${r.provider ? "（" + esc(r.provider) + "）" : ""}">浏览器</span>`
-        + (r.email ? `<span class="hint mono">${esc(r.email)}</span>` : "")
-        + (r.has_password
-          ? `<span class="badge" title="会话过期时会用邮箱密码自动重登">可重登</span>` : "")
-      : isChrome
-        ? `<span class="badge mono" title="用专用 Chrome 登录，自动抓 Cookie">Chrome</span>`
-          + (r.has_cookies
-            ? `<span class="badge" title="Cookie 已保存">Cookie 已存</span>`
-            : `<span class="badge bad" title="还没有 Cookie">未登录</span>`)
-        : (r.configured
-          ? `<span class="badge mono" title="访问令牌（打码）">${esc(r.token_hint)}</span>` : "");
-    const expiredBadge = !isBrowser && !isChrome && r.token_expired
+    const hintBadge = r.configured
+      ? `<span class="badge mono" title="访问令牌（打码）">${esc(r.token_hint)}</span>` : "";
+    const expiredBadge = r.token_expired
       ? `<span class="badge bad" title="JWT 已过期，请到站点重新生成访问令牌后保存">令牌已过期</span>` : "";
     const partBox = r.configured
       ? `<label class="hint" style="display:flex;align-items:center;gap:5px"
@@ -4105,7 +4032,7 @@ function renderCheckin() {
            <input type="checkbox" data-ck-act="toggle" ${r.checkin_enabled ? "checked" : ""}> 参与</label>`
       : "";
 
-    return `<div class="ck-row" data-id="${esc(r.id)}" data-auth="${r.auth}">
+    return `<div class="ck-row" data-id="${esc(r.id)}">
       <div class="ck-name">
         <b>${esc(r.name)}</b>
         <span class="hint mono">${esc(r.site_root)}</span>
@@ -4118,11 +4045,6 @@ function renderCheckin() {
       <div class="ck-act">
         ${partBox}
         <button class="mini" data-ck-act="edit">配置</button>
-        ${isBrowser
-          ? `<button class="mini" data-ck-act="login" title="打开站点登录窗口，登录一次以后自动复用">登录</button>`
-          : isChrome
-            ? `<button class="mini" data-ck-act="login" title="打开专用 Chrome，登录后自动抓 Cookie">Chrome 登录</button>`
-            : ""}
         <button class="mini primary" data-ck-act="run"
           ${r.configured ? "" : "disabled"}>签到</button>
         <button class="mini" data-ck-act="remove"
@@ -4140,7 +4062,7 @@ function renderCkSummary() {
   const configured = rows.filter(r => r.configured).length;
   const el = $("#ckSummary");
   if (el) {
-    el.textContent = `已配置 ${configured} / ${rows.length} 个上游` +
+    el.textContent = `已配置令牌 ${configured} / ${rows.length} 个上游` +
       ` · 今天已签 ${s.today_checked || 0}`;
   }
   const n = $("#tabN-ck");
@@ -4233,36 +4155,22 @@ async function runCheckin(ids, probe) {
     const list = res.results || [];
     const good = list.filter(r => r.ok).length;
     const blocked = list.filter(r => r.kind === "blocked").length;
-    const needLogin = list.filter(r => r.kind === "login").length;
     let msg = `${label}完成：${good}/${list.length} 成功`;
     if (blocked) msg += `，${blocked} 个需要人机验证`;
-    if (needLogin) msg += `，${needLogin} 个需要登录（点行内「登录」）`;
     toast(msg, good ? "" : "bad");
   } catch (e) {
     toast(`${label}失败：` + e.message, "bad");
   }
 }
 
-async function saveCkConfig(id, opts) {
+async function saveCkConfig(id, token, userId) {
   try {
-    await api("/admin/checkin/config", Object.assign({ id }, opts || {}));
+    await api("/admin/checkin/config", { id, token: token, user_id: userId });
     ckEditing = "";
     await loadCheckin(true);
     toast("已保存");
   } catch (e) {
     toast("保存失败：" + e.message, "bad");
-  }
-}
-
-async function openCkLogin(id, auth) {
-  const chrome = auth === "chrome";
-  try {
-    await api(chrome ? "/admin/checkin/chrome/login" : "/admin/checkin/browser/open", { id });
-    toast(chrome
-      ? "已打开专用 Chrome：在里面登录，成功后会自动保存 Cookie（本页每 5 秒刷新）"
-      : "已打开登录窗口：登录完成后关掉它即可，以后会自动复用会话");
-  } catch (e) {
-    toast("打开登录窗口失败：" + e.message, "bad");
   }
 }
 
@@ -4274,7 +4182,7 @@ async function addCk() {
     await api("/admin/checkin/add", { id });
     ckEditing = id;
     await loadCheckin(true);
-    toast("已添加，填好认证方式后点「保存」");
+    toast("已添加，填好访问令牌后点「保存」");
   } catch (e) {
     toast("添加失败：" + e.message, "bad");
   }
@@ -4330,61 +4238,21 @@ $("#ckRows").addEventListener("click", e => {
   if (act === "run") runCheckin([id], false);
   else if (act === "edit") { ckEditing = id; renderCheckin(); }
   else if (act === "cancel") { ckEditing = ""; renderCheckin(); }
-  else if (act === "login") openCkLogin(id, row.dataset.auth || "browser");
   else if (act === "remove") {
     if (confirm("把这条从签到页移除？只删除签到配置，不删除上游本身；" +
-      "已保存的令牌 / 邮箱密码也会一起清掉。")) removeCk(id);
+      "已保存的访问令牌也会一起清掉。")) removeCk(id);
   }
   else if (act === "save") {
-    const authEl = row.querySelector('[data-ck="auth"]');
-    const auth = authEl ? authEl.value : "token";
-    const scope = row.querySelector(
-      auth === "browser" ? ".ck-browser-fields"
-        : auth === "chrome" ? ".ck-chrome-fields" : ".ck-token-fields");
-    const val = (name) => {
-      const el = scope && scope.querySelector(`[data-ck="${name}"]`);
-      return el ? el.value : "";
-    };
-    const token = val("token");
-    const uid = val("uid");
-    if (auth === "token" && !token.trim()) {
+    const token = (row.querySelector('[data-ck="token"]') || {}).value || "";
+    const uid = (row.querySelector('[data-ck="uid"]') || {}).value || "";
+    if (!token.trim()) {
       toast("令牌不能为空（想停用这个上游就取消勾选「参与」）", "bad");
       return;
     }
-    let password = "__keep__";
-    if (auth === "browser") {
-      const pwd = val("password");
-      const clear = scope && scope.querySelector('[data-ck="pwd_clear"]');
-      if (pwd) password = pwd;
-      else if (clear && clear.checked) password = "";
-    }
-    saveCkConfig(id, {
-      auth: auth,
-      token: token.trim() || "__keep__",
-      user_id: uid.trim(),
-      email: auth === "browser" ? val("email").trim() : "",
-      password: password,
-      site_root: (auth === "browser" || auth === "chrome") ? val("site").trim() : "",
-      oauth_hint: auth === "browser" ? val("oauth_hint").trim() : "",
-    });
+    saveCkConfig(id, token.trim(), uid.trim());
   }
 });
 $("#ckRows").addEventListener("change", e => {
-  const sel = e.target.closest('select[data-ck="auth"]');
-  if (sel) {
-    const row = sel.closest(".ck-row");
-    const kind = sel.value;
-    if (row) {
-      row.dataset.auth = kind;
-      const tf = row.querySelector(".ck-token-fields");
-      const bf = row.querySelector(".ck-browser-fields");
-      const cf = row.querySelector(".ck-chrome-fields");
-      if (tf) tf.style.display = kind === "token" ? "" : "none";
-      if (bf) bf.style.display = kind === "browser" ? "" : "none";
-      if (cf) cf.style.display = kind === "chrome" ? "" : "none";
-    }
-    return;
-  }
   const cb = e.target.closest('input[data-ck-act="toggle"]');
   if (!cb) return;
   const row = cb.closest(".ck-row");

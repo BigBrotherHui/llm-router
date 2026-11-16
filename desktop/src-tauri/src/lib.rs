@@ -313,6 +313,8 @@ pub fn run() {
                     });
                 let state = Arc::new(native::state::AppState::new(state_path, Some(app.handle().clone())));
                 app.manage(state.clone());
+                // 浏览器 / Chrome 登录模式已移除：把遗留配置回退成访问令牌模式。
+                native::checkin::migrate_removed_auth(&state);
                 // 托盘 tooltip 常驻显示今日请求量 / 成功率 / P50，相当于「迷你 HUD」。
                 {
                     let handle = app.handle().clone();
@@ -388,10 +390,6 @@ pub fn run() {
                     }
                     _ => {}
                 }
-            }
-            // 签到浏览器是临时窗口：关掉就真的销毁，别被主窗口的「最小化到托盘」逻辑吃掉。
-            if window.label().starts_with("ck-") {
-                return;
             }
             if let tauri::WindowEvent::CloseRequested { api, .. } = event {
                 #[cfg(desktop)]

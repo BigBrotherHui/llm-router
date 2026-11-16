@@ -573,14 +573,9 @@
       <div class="card">
         <h2>每日签到</h2>
         <div class="hint" style="margin:-6px 0 12px">
-          三种认证：①「访问令牌」——站点「个人设置 → 访问令牌」里的 token，
-          <b>不是</b>上游卡片里 <code>sk-</code> 开头的推理 Key；
-          ②「浏览器自动登录」——用应用内 WebView2 打开站点登录，能过 Cloudflare/WAF
-          （适合 AnyRouter / AgentRouter），首次点行内「登录」登录一次，之后每天自动复用会话；
-          没有邮箱密码也行，Linux.do 等 OAuth 站点会尝试自动点登录入口重登；
-          ③「Chrome 登录」——用专用 Chrome 打开站点，首次从你日常 Chrome 复制登录态
-          （需要先完全退出 Chrome 一次），之后不用重新登录，应用自动抓 Cookie；
-          适合 Linux.do 登录、或内置窗口打不开的站点。
+          签到用的是站点「个人设置 → 访问令牌」里那个 token，
+          <b>不是</b>上游卡片里 <code>sk-</code> 开头的推理 Key。
+          只显示已加入签到的上游；不支持签到的可以随时移除，不影响上游本身。
         </div>
 
         <div class="up-tools" style="margin-bottom:12px">
