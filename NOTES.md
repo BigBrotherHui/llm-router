@@ -35,6 +35,54 @@
 （实测 609 = 325 + 284，图表同为 609，按分组筛 100 条）；`_dbg_day_boundary.py` 起一个
 临时实例塞「本机今天凌晨 03:00」的流水，断言它落在**本机日**而不是 UTC 日。
 
+## 2026-11-16 签到接入 millylee/anyrouter-check-in 的「真浏览器」能力
+
+上游项目（BSD-2-Clause）的核心不是签到路径，而是**用真浏览器拿 WAF cookie + 邮箱密码自动登录**。
+本次把它按能力接入现有签到页，不捆绑 Python/CloakBrowser：
+
+**后端 `native/checkin.rs`**
+
+- 每个上游的 `checkin` 配置新增 `auth`：`token`（默认，原逻辑不动）/ `browser`。
+- provider 预设按域名自动识别：`anyrouter`（`/api/user/sign_in`、`new-api-user`、
+  WAF cookie `acw_tc/cdn_sec_tc/acw_sc__v2`）、`agentrouter`（无签到接口，拉
+  `/api/user/self` 即自动签到）；其它站点走 `custom`，沿用三条旧 check-in 路径探测。
+  支持 `provider` / `site_root` / `login_path` / `sign_in_path` / `user_info_path` /
+  `api_user_key` 覆盖，`site_root` 用来处理「上游填的是 api.xxx 子域」的情况。
+- browser 模式流程：为每个上游建独立 WebView2 profile（`<state目录>/checkin-profiles/ck-<id>`）
+  → 隐藏窗口打开站点刷新 WAF cookie → 先用 cookie 走 HTTP 拉用户信息验证会话
+  → 失败则用邮箱密码在页面内自动填表登录（Semi Design 选择器移植自上游）
+  → 拿到 cookie 后用 reqwest 发签到请求（Chrome UA/Referer/Origin）。
+  不依赖 cookie 名叫 `session`，避免非 NewAPI 站点误判。
+- 浏览器任务用全局异步锁串行（WebView2 同时开多个容易抢 cookie / 吃内存）；
+  token 模式仍保持 6 并发。
+- 新增 `POST /admin/checkin/browser/open`：打开/复用可见登录窗口，登录一次即可，
+  cookie 持久化在上游专属 profile；自动签到会复用。`ck-` 窗口在 `lib.rs` 的
+  关闭事件里特判为「真关闭」，不走主窗口的最小化到托盘逻辑。
+- 奖励用签到前后 `quota + used_quota` 差值估算，默认 `500000 quota = $1`
+  （可用 `quota_per_unit` 覆盖），写进 `reward_text`。
+
+**前端**：签到行编辑里可选「访问令牌 / 浏览器自动登录」，浏览器模式填邮箱、
+密码（可空）、User id、站点根地址；行内多一个「登录」按钮。密码明文存本机状态文件，
+UI 已提示。
+
+**签到页成员制**：只有 `extra.checkin` 存在时才显示该上游；新增
+`POST /admin/checkin/add`（加空配置）和 `POST /admin/checkin/remove`
+（删 `checkin` + `checkin_state`，不动上游本身），GET `/admin/checkin` 额外返回
+`available` 供下拉框选择。不支持签到的上游从此不占签到页，误加可移除。
+
+**验证**：`cargo test --lib` 19 项全过（新增 7 项覆盖 provider 检测、预设/覆盖、
+browser 配置判定、签到路径候选、cookie/标签工具）；`node --check webui.js` 通过。
+**未做的验证**：还没有用真实 AnyRouter 账号跑过端到端；Turnstile 若弹交互，
+自动登录会失败并提示手动点「登录」。
+
+**私有 fork**：`https://github.com/BigBrotherHui/anyrouter-check-in`（private，
+main = 上游 `3b16662`，含 `page`/`pre-commit-ci-update-config` 分支和 v1.0.0/v1.1.0
+标签）。GitHub 不允许把公开仓库的 fork 直接设为 private，所以用「私有仓库 + 镜像推送」
+实现等价私有 fork，不是 GitHub fork 关系。同步上游：
+`git clone --bare https://github.com/millylee/anyrouter-check-in.git tmp &&
+ git --git-dir=tmp push git@github.com:BigBrotherHui/anyrouter-check-in.git
+ 'refs/heads/*:refs/heads/*' 'refs/tags/*:refs/tags/*'`。
+
 ## 2026-11-01 v2.9.1：把「直连」的谎话堵住（TUN + fake-ip 实测）
 
 用户追问：「在 llm-router 里配好了还要粘到 Clash？不能配了就生效吗？」

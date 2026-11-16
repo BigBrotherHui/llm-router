@@ -1,8 +1,11 @@
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::Duration;
 
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use futures_util::StreamExt;
 use serde_json::{json, Map, Value};
+use tauri::{Manager, WebviewUrl, WebviewWindow, WebviewWindowBuilder};
 
 use super::state::{AppState, Upstream};
 
@@ -11,6 +14,42 @@ const CHECKIN_PATHS: [&str; 3] = [
     "/api/user/checkin",
     "/api/v1/user/check-in",
 ];
+
+const CHROME_UA: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/138.0.0.0 Safari/537.36";
+
+/// 浏览器签到窗口要一个个来：多个 WebView2 同时登录同一站点容易互相抢 cookie，
+/// 也会把内存顶上去。token 模式仍然走原来的 6 并发。
+static BROWSER_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+#[derive(Clone)]
+struct Provider {
+    name: String,
+    login_path: String,
+    sign_in_path: Option<String>,
+    auto_trigger: bool,
+    user_info_path: String,
+    api_user_key: String,
+    #[allow(dead_code)]
+    waf_cookies: Vec<String>,
+}
+
+struct UserInfo {
+    ok: bool,
+    status: u16,
+    id: String,
+    quota: f64,
+    used: f64,
+    message: String,
+    blocked: bool,
+}
+
+struct SignInResp {
+    status: u16,
+    ok: bool,
+    already: bool,
+    blocked: bool,
+    message: String,
+}
 
 pub fn site_root(base_url: &str) -> String {
     let raw = base_url.trim();
@@ -37,12 +76,157 @@ fn checkin_cfg(up: &Upstream) -> Map<String, Value> {
         .unwrap_or_default()
 }
 
-fn token_of(up: &Upstream) -> String {
-    checkin_cfg(up)
-        .get("token")
+fn cfg_str(cfg: &Map<String, Value>, key: &str) -> String {
+    cfg.get(key)
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .trim()
+        .to_string()
+}
+
+fn cfg_raw(cfg: &Map<String, Value>, key: &str) -> String {
+    cfg.get(key)
         .and_then(|v| v.as_str())
         .unwrap_or("")
         .to_string()
+}
+
+fn token_of(up: &Upstream) -> String {
+    cfg_str(&checkin_cfg(up), "token")
+}
+
+fn auth_of(cfg: &Map<String, Value>) -> String {
+    let auth = cfg_str(cfg, "auth");
+    if auth == "browser" {
+        "browser".to_string()
+    } else {
+        "token".to_string()
+    }
+}
+
+fn browser_auth(cfg: &Map<String, Value>) -> bool {
+    auth_of(cfg) == "browser"
+}
+
+fn configured(up: &Upstream) -> bool {
+    let cfg = checkin_cfg(up);
+    browser_auth(&cfg) || !cfg_str(&cfg, "token").is_empty()
+}
+
+fn checkin_enabled(up: &Upstream) -> bool {
+    checkin_cfg(up)
+        .get("enabled")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false)
+}
+
+fn checkin_site_root(up: &Upstream, cfg: &Map<String, Value>) -> String {
+    let custom = cfg_str(cfg, "site_root");
+    if custom.is_empty() {
+        site_root(&up.base_url)
+    } else {
+        site_root(&custom)
+    }
+}
+
+fn provider_of(up: &Upstream, cfg: &Map<String, Value>) -> Provider {
+    let root = checkin_site_root(up, cfg);
+    let host = tauri::Url::parse(&root)
+        .ok()
+        .and_then(|u| u.host_str().map(|s| s.to_ascii_lowercase()))
+        .unwrap_or_default();
+    let explicit = cfg_str(cfg, "provider").to_ascii_lowercase();
+    let mut p = if explicit == "agentrouter" || (explicit.is_empty() && host.contains("agentrouter")) {
+        Provider {
+            name: "agentrouter".to_string(),
+            login_path: "/login".to_string(),
+            sign_in_path: None,
+            auto_trigger: true,
+            user_info_path: "/api/user/self".to_string(),
+            api_user_key: "new-api-user".to_string(),
+            waf_cookies: vec!["acw_tc".to_string()],
+        }
+    } else if explicit == "anyrouter" || (explicit.is_empty() && host.contains("anyrouter")) {
+        Provider {
+            name: "anyrouter".to_string(),
+            login_path: "/login".to_string(),
+            sign_in_path: Some("/api/user/sign_in".to_string()),
+            auto_trigger: false,
+            user_info_path: "/api/user/self".to_string(),
+            api_user_key: "new-api-user".to_string(),
+            waf_cookies: vec![
+                "acw_tc".to_string(),
+                "cdn_sec_tc".to_string(),
+                "acw_sc__v2".to_string(),
+            ],
+        }
+    } else {
+        Provider {
+            name: if explicit.is_empty() {
+                "custom".to_string()
+            } else {
+                explicit
+            },
+            login_path: "/login".to_string(),
+            sign_in_path: None,
+            auto_trigger: false,
+            user_info_path: "/api/user/self".to_string(),
+            api_user_key: "new-api-user".to_string(),
+            waf_cookies: Vec::new(),
+        }
+    };
+    if let Some(v) = cfg.get("login_path").and_then(|v| v.as_str()) {
+        let v = v.trim();
+        if !v.is_empty() {
+            p.login_path = v.to_string();
+        }
+    }
+    if let Some(v) = cfg.get("user_info_path").and_then(|v| v.as_str()) {
+        let v = v.trim();
+        if !v.is_empty() {
+            p.user_info_path = v.to_string();
+        }
+    }
+    if let Some(v) = cfg.get("api_user_key").and_then(|v| v.as_str()) {
+        let v = v.trim();
+        if !v.is_empty() {
+            p.api_user_key = v.to_string();
+        }
+    }
+    if let Some(v) = cfg.get("sign_in_path").and_then(|v| v.as_str()) {
+        let v = v.trim();
+        p.sign_in_path = if v.is_empty() {
+            None
+        } else {
+            Some(v.to_string())
+        };
+        if cfg.get("auto_trigger").and_then(|x| x.as_bool()).is_none() {
+            p.auto_trigger = p.sign_in_path.is_none() && p.auto_trigger;
+        }
+    }
+    if let Some(v) = cfg.get("auto_trigger").and_then(|x| x.as_bool()) {
+        p.auto_trigger = v;
+    }
+    p
+}
+
+fn sign_in_candidates(prov: &Provider, cfg: &Map<String, Value>) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    if let Some(p) = &prov.sign_in_path {
+        out.push(p.clone());
+    }
+    let learned = cfg_str(cfg, "path");
+    if !learned.is_empty() && !out.contains(&learned) {
+        out.push(learned);
+    }
+    if prov.name == "custom" || (prov.sign_in_path.is_none() && !prov.auto_trigger) {
+        for p in CHECKIN_PATHS {
+            if !out.iter().any(|x| x == p) {
+                out.push(p.to_string());
+            }
+        }
+    }
+    out
 }
 
 fn jwt_exp(token: &str) -> Option<i64> {
@@ -65,29 +249,62 @@ fn state_of(up: &Upstream) -> Value {
         .unwrap_or(Value::Null)
 }
 
-pub fn rows(state: &AppState) -> Vec<Value> {
+/// 只有显式加入（extra 里有 checkin 配置）的上游才出现在签到页。
+/// 不支持签到的上游可以不加入；加入后也能随时移除（只删签到配置，不动上游）。
+fn listed(up: &Upstream) -> bool {
+    up.extra.contains_key("checkin")
+}
+
+pub fn available(state: &AppState) -> Vec<Value> {
     let file = state.file.read().unwrap();
     file.upstreams
         .iter()
+        .filter(|up| !listed(up))
         .map(|up| {
-            let cfg = checkin_cfg(up);
-            let token = token_of(up);
-            let enabled = cfg.get("enabled").and_then(|v| v.as_bool()).unwrap_or(false);
             json!({
                 "id": up.id,
                 "name": up.name,
                 "base_url": up.base_url,
                 "site_root": site_root(&up.base_url),
+            })
+        })
+        .collect()
+}
+
+pub fn rows(state: &AppState) -> Vec<Value> {
+    let file = state.file.read().unwrap();
+    file.upstreams
+        .iter()
+        .filter(|up| listed(up))
+        .map(|up| {
+            let cfg = checkin_cfg(up);
+            let token = token_of(up);
+            let auth = auth_of(&cfg);
+            let browser = auth == "browser";
+            let enabled = cfg.get("enabled").and_then(|v| v.as_bool()).unwrap_or(false);
+            let prov = provider_of(up, &cfg);
+            let st = state_of(up);
+            json!({
+                "id": up.id,
+                "name": up.name,
+                "base_url": up.base_url,
+                "site_root": checkin_site_root(up, &cfg),
                 "enabled": up.enabled,
-                "configured": !token.is_empty(),
+                "configured": browser || !token.is_empty(),
+                "auth": auth,
+                "provider": prov.name,
+                "site_root_custom": cfg_str(&cfg, "site_root"),
+                "email": cfg_str(&cfg, "email"),
+                "has_password": !cfg_raw(&cfg, "password").is_empty(),
                 "checkin_enabled": enabled,
-                "token_hint": if token.is_empty() { String::new() } else { super::state::mask_key(&token) },
-                "token_expires_at": jwt_exp(&token),
-                "token_expired": token_expired(&token),
+                "token_hint": if browser || token.is_empty() { String::new() } else { super::state::mask_key(&token) },
+                "token_expires_at": if browser { Value::Null } else { json!(jwt_exp(&token)) },
+                "token_expired": !browser && token_expired(&token),
                 "user_id": cfg.get("user_id").cloned().unwrap_or_else(|| json!("")),
                 "path": cfg.get("path").cloned().unwrap_or_else(|| json!("")),
-                "token_looks_wrong": token.to_ascii_lowercase().starts_with("sk-"),
-                "state": state_of(up),
+                "token_looks_wrong": !browser && token.to_ascii_lowercase().starts_with("sk-"),
+                "login_at": st.get("login_at").cloned().unwrap_or_else(|| json!(0)),
+                "state": st,
             })
         })
         .collect()
@@ -95,13 +312,9 @@ pub fn rows(state: &AppState) -> Vec<Value> {
 
 pub fn has_targets(state: &AppState) -> bool {
     let file = state.file.read().unwrap();
-    file.upstreams.iter().any(|u| {
-        !token_of(u).is_empty()
-            && checkin_cfg(u)
-                .get("enabled")
-                .and_then(|v| v.as_bool())
-                .unwrap_or(false)
-    })
+    file.upstreams
+        .iter()
+        .any(|u| configured(u) && checkin_enabled(u))
 }
 
 /// 今天还没签过的已配置上游；自动调度用它避免重复 POST。
@@ -111,12 +324,7 @@ pub fn pending_ids(state: &AppState) -> Vec<String> {
     file.upstreams
         .iter()
         .filter(|u| {
-            if token_of(u).is_empty()
-                || !checkin_cfg(u)
-                    .get("enabled")
-                    .and_then(|v| v.as_bool())
-                    .unwrap_or(false)
-            {
+            if !configured(u) || !checkin_enabled(u) {
                 return false;
             }
             let st = state_of(u);
@@ -128,7 +336,8 @@ pub fn pending_ids(state: &AppState) -> Vec<String> {
         .collect()
 }
 
-pub fn settings(state: &AppState) -> Value {    let file = state.file.read().unwrap();
+pub fn settings(state: &AppState) -> Value {
+    let file = state.file.read().unwrap();
     let s = file.checkin_settings.as_object().cloned().unwrap_or_default();
     json!({
         "enabled": s.get("enabled").and_then(|v| v.as_bool()).unwrap_or(false),
@@ -209,13 +418,8 @@ pub async fn run(state: Arc<AppState>, ids: Vec<String>, press_checkin: bool) ->
         file.upstreams
             .iter()
             .filter(|u| {
-                let token = token_of(u);
-                let enabled = checkin_cfg(u)
-                    .get("enabled")
-                    .and_then(|v| v.as_bool())
-                    .unwrap_or(false);
                 let wanted = ids.is_empty() || ids.contains(&u.id);
-                !token.is_empty() && (enabled || !ids.is_empty()) && wanted
+                configured(u) && (checkin_enabled(u) || !ids.is_empty()) && wanted
             })
             .cloned()
             .collect()
@@ -248,6 +452,15 @@ pub async fn run(state: Arc<AppState>, ids: Vec<String>, press_checkin: bool) ->
 }
 
 async fn run_one(state: &AppState, up: &Upstream, press: bool) -> Value {
+    let cfg = checkin_cfg(up);
+    if browser_auth(&cfg) {
+        run_browser(state, up, press).await
+    } else {
+        run_one_token(state, up, press).await
+    }
+}
+
+async fn run_one_token(state: &AppState, up: &Upstream, press: bool) -> Value {
     let token = token_of(up);
     if token.is_empty() {
         return result("nocfg", false, "还没配置访问令牌", Value::Null);
@@ -284,7 +497,7 @@ async fn run_one(state: &AppState, up: &Upstream, press: bool) -> Value {
         }
     }
     let user_id = cfg.get("user_id").and_then(|v| v.as_str()).unwrap_or("");
-    let timeout = std::time::Duration::from_secs(15);
+    let timeout = Duration::from_secs(15);
     let mut last = result("none", false, "站点没有可用的签到接口", Value::Null);
     let mut saw_auth = false;
     for path in candidates {
@@ -372,7 +585,11 @@ async fn run_one(state: &AppState, up: &Upstream, press: bool) -> Value {
             last = result(
                 "error",
                 false,
-                &format!("HTTP {}：{}", status.as_u16(), if msg.is_empty() { "站点拒绝请求" } else { &msg }),
+                &format!(
+                    "HTTP {}：{}",
+                    status.as_u16(),
+                    if msg.is_empty() { "站点拒绝请求" } else { &msg }
+                ),
                 json!({"status": status.as_u16()}),
             );
             continue;
@@ -386,7 +603,12 @@ async fn run_one(state: &AppState, up: &Upstream, press: bool) -> Value {
                 .unwrap_or(false);
             let enabled = data.get("enabled").and_then(|v| v.as_bool()).unwrap_or(true);
             if !enabled {
-                return result("none", false, "站点没开启签到功能", json!({"path": path, "status": status.as_u16()}));
+                return result(
+                    "none",
+                    false,
+                    "站点没开启签到功能",
+                    json!({"path": path, "status": status.as_u16()}),
+                );
             }
             return result(
                 if checked { "already" } else { "ok" },
@@ -422,7 +644,12 @@ async fn run_one(state: &AppState, up: &Upstream, press: bool) -> Value {
             );
         }
         if msg.to_ascii_lowercase().contains("already") || msg.contains("已签到") {
-            return result("already", true, if msg.is_empty() { "今天已经签过了" } else { &msg }, json!({"path": path, "status": status.as_u16()}));
+            return result(
+                "already",
+                true,
+                if msg.is_empty() { "今天已经签过了" } else { &msg },
+                json!({"path": path, "status": status.as_u16()}),
+            );
         }
         last = result(
             "error",
@@ -435,6 +662,725 @@ async fn run_one(state: &AppState, up: &Upstream, press: bool) -> Value {
         return result("auth", false, "站点拒绝了访问令牌", Value::Null);
     }
     last
+}
+
+/// 打开（或复用）一个可见的站点登录窗口。登录后 cookie 会留在该上游专属的
+/// WebView2 profile 里，之后自动签到直接复用，不用再登。
+pub fn open_login_window(state: &AppState, up: &Upstream) -> Result<String, String> {
+    let app = state
+        .app
+        .lock()
+        .unwrap()
+        .clone()
+        .ok_or_else(|| "浏览器登录只在桌面版可用".to_string())?;
+    let cfg = checkin_cfg(up);
+    let prov = provider_of(up, &cfg);
+    let root = checkin_site_root(up, &cfg);
+    if root.is_empty() {
+        return Err("上游没填地址".to_string());
+    }
+    let label = format!("ck-{}", safe_label(&up.id));
+    let login_url = format!("{root}{}", prov.login_path);
+    if let Some(w) = app.get_webview_window(&label) {
+        if let Ok(url) = tauri::Url::parse(&login_url) {
+            let _ = w.navigate(url);
+        }
+        let _ = w.set_skip_taskbar(false);
+        let _ = w.show();
+        let _ = w.set_focus();
+        return Ok(label);
+    }
+    let w = build_browser_window(&app, state, &label, &up.name, &login_url, true)?;
+    let _ = w.set_focus();
+    Ok(label)
+}
+
+async fn run_browser(state: &AppState, up: &Upstream, press: bool) -> Value {
+    let cfg = checkin_cfg(up);
+    let prov = provider_of(up, &cfg);
+    let root = checkin_site_root(up, &cfg);
+    if root.is_empty() {
+        return result("error", false, "上游没填地址", Value::Null);
+    }
+    let app = state.app.lock().unwrap().clone();
+    let Some(app) = app else {
+        return result("error", false, "浏览器签到只在桌面版可用", Value::Null);
+    };
+    let label = format!("ck-{}", safe_label(&up.id));
+    let _guard = BROWSER_LOCK.lock().await;
+    let existing = app.get_webview_window(&label);
+    let visible = existing
+        .as_ref()
+        .and_then(|w| w.is_visible().ok())
+        .unwrap_or(false);
+    let win = match existing {
+        Some(w) => w,
+        None => match build_browser_window(&app, state, &label, &up.name, &root, false) {
+            Ok(w) => w,
+            Err(e) => {
+                return result(
+                    "error",
+                    false,
+                    &format!("打开签到浏览器失败：{e}"),
+                    Value::Null,
+                )
+            }
+        },
+    };
+
+    // 可见窗口可能是用户正在手动登录，别打断它，直接复用现有 cookie。
+    if !visible {
+        if let Ok(url) = tauri::Url::parse(&root) {
+            let _ = win.navigate(url);
+        }
+        let _ = wait_page_ready(&win, 30).await;
+        tokio::time::sleep(Duration::from_millis(1200)).await;
+    }
+
+    let mut cookies = cookies_now(&win, &root).await;
+    let mut login_at = state_of(up)
+        .get("login_at")
+        .and_then(|v| v.as_i64())
+        .unwrap_or(0);
+    let mut login_note = String::new();
+    let cfg_user = cfg_str(&cfg, "user_id");
+    let mut info = http_user_info(state, &root, &prov, &cookie_header(&cookies), &cfg_user).await;
+    // 不强制依赖 cookie 名叫 session：先拿用户信息验证会话。失败且站点有响应时，
+    // 再用邮箱密码自动登录一次（凭证没配就是 Ok(false)，直接跳过）。
+    if !info.ok && info.status != 0 && !info.blocked {
+        match try_browser_login(&win, &root, &prov, &cfg).await {
+            Ok(true) => {
+                login_at = chrono::Utc::now().timestamp();
+                cookies = cookies_now(&win, &root).await;
+                info = http_user_info(
+                    state,
+                    &root,
+                    &prov,
+                    &cookie_header(&cookies),
+                    &cfg_user,
+                )
+                .await;
+                login_note = "已自动登录；".to_string();
+            }
+            Ok(false) => {}
+            Err(e) => login_note = format!("自动登录未完成（{e}）；"),
+        }
+    }
+    if !info.ok {
+        if !visible {
+            let _ = win.close();
+        }
+        if info.blocked {
+            return result(
+                "blocked",
+                false,
+                if info.message.is_empty() {
+                    "站点要求人机验证（Cloudflare/Turnstile），请打开登录窗口手动通过"
+                } else {
+                    &info.message
+                },
+                json!({"need_login": true, "status": info.status}),
+            );
+        }
+        if info.status == 0 {
+            let message = if info.message.is_empty() {
+                format!("连不上 {root}")
+            } else {
+                info.message.clone()
+            };
+            return result("error", false, &message, json!({"status": 0}));
+        }
+        let message = if login_note.is_empty() {
+            "浏览器还没登录：请在签到页点「登录」，在弹出的窗口里登录一次".to_string()
+        } else {
+            format!("{login_note}需要登录：请在签到页点「登录」完成站点登录")
+        };
+        return result(
+            "login",
+            false,
+            &message,
+            json!({"need_login": true, "status": info.status}),
+        );
+    }
+
+    let api_user = if !info.id.is_empty() {
+        info.id.clone()
+    } else {
+        cfg_user
+    };
+    let per_unit = cfg
+        .get("quota_per_unit")
+        .and_then(|v| v.as_f64())
+        .filter(|x| *x > 0.0)
+        .unwrap_or(500000.0);
+    let base = json!({
+        "provider": prov.name,
+        "path": prov.sign_in_path.clone().unwrap_or_default(),
+        "status": info.status,
+        "quota": info.quota,
+        "used_quota": info.used,
+        "quota_usd": round2(info.quota / per_unit),
+        "login_at": login_at,
+    });
+    if !press {
+        if !visible {
+            let _ = win.close();
+        }
+        return result(
+            "ok",
+            true,
+            if login_note.is_empty() {
+                "浏览器已登录，可以签到"
+            } else {
+                "已自动登录，可以签到"
+            },
+            base,
+        );
+    }
+
+    if prov.auto_trigger {
+        let after = http_user_info(
+            state,
+            &root,
+            &prov,
+            &cookie_header(&cookies),
+            &api_user,
+        )
+        .await;
+        if !visible {
+            let _ = win.close();
+        }
+        if !after.ok {
+            return result("error", false, "拉取用户信息触发签到失败", base);
+        }
+        let reward = (after.quota + after.used) - (info.quota + info.used);
+        let mut out = result(
+            "ok",
+            true,
+            &format!("{login_note}签到完成（拉取用户信息时自动触发）"),
+            base,
+        );
+        out["reward"] = json!(reward.max(0.0));
+        if reward > 0.0 {
+            out["reward_text"] = json!(format!("${:.2}", reward / per_unit));
+        }
+        return out;
+    }
+
+    let mut last = result("none", false, "站点没有可用的签到接口", base.clone());
+    let mut saw_auth = false;
+    for path in sign_in_candidates(&prov, &cfg) {
+        let r = http_sign_in(
+            state,
+            &root,
+            &path,
+            &prov,
+            &cookie_header(&cookies),
+            &api_user,
+        )
+        .await;
+        if r.blocked {
+            if !visible {
+                let _ = win.close();
+            }
+            return result(
+                "blocked",
+                false,
+                "站点要求人机验证（Cloudflare/Turnstile），浏览器会话可能已失效",
+                json!({"blocked": "cf", "status": r.status, "path": path}),
+            );
+        }
+        if r.status == 401 || r.status == 403 {
+            saw_auth = true;
+            last = result(
+                "auth",
+                false,
+                &format!("站点拒绝了浏览器会话（HTTP {}），请重新登录", r.status),
+                json!({"path": path, "status": r.status}),
+            );
+            continue;
+        }
+        if r.status == 404 || r.status == 405 {
+            last = result(
+                "none",
+                false,
+                &format!("站点没有 {path}（HTTP {}）", r.status),
+                json!({"path": path, "status": r.status}),
+            );
+            continue;
+        }
+        if r.ok || r.already {
+            let after = http_user_info(
+                state,
+                &root,
+                &prov,
+                &cookie_header(&cookies),
+                &api_user,
+            )
+            .await;
+            let reward = if after.ok {
+                (after.quota + after.used) - (info.quota + info.used)
+            } else {
+                0.0
+            };
+            if !visible {
+                let _ = win.close();
+            }
+            let mut out = result(
+                if r.already { "already" } else { "ok" },
+                true,
+                if r.message.is_empty() {
+                    if r.already {
+                        "今天已经签过了"
+                    } else {
+                        "签到成功"
+                    }
+                } else {
+                    &r.message
+                },
+                json!({
+                    "path": path,
+                    "status": r.status,
+                    "checked_in_today": r.already,
+                    "quota": info.quota,
+                    "used_quota": info.used,
+                    "quota_usd": round2(info.quota / per_unit),
+                    "login_at": login_at,
+                    "provider": prov.name,
+                }),
+            );
+            if reward > 0.0 {
+                out["reward"] = json!(reward);
+                out["reward_text"] = json!(format!("${:.2}", reward / per_unit));
+            }
+            return out;
+        }
+        last = result(
+            "error",
+            false,
+            if r.message.is_empty() {
+                "站点没有接受这次签到"
+            } else {
+                &r.message
+            },
+            json!({"path": path, "status": r.status}),
+        );
+    }
+    if !visible {
+        let _ = win.close();
+    }
+    if saw_auth {
+        return result(
+            "auth",
+            false,
+            "浏览器会话被站点拒绝（401/403），请重新登录",
+            base,
+        );
+    }
+    last
+}
+
+fn build_browser_window(
+    app: &tauri::AppHandle,
+    state: &AppState,
+    label: &str,
+    name: &str,
+    url: &str,
+    visible: bool,
+) -> Result<WebviewWindow, String> {
+    let parsed = tauri::Url::parse(url).map_err(|e| e.to_string())?;
+    let profile = profile_dir(state, label);
+    std::fs::create_dir_all(&profile).map_err(|e| e.to_string())?;
+    let profile = if profile.is_absolute() {
+        profile
+    } else {
+        std::env::current_dir()
+            .map(|dir| dir.join(&profile))
+            .unwrap_or(profile)
+    };
+    WebviewWindowBuilder::new(app, label, WebviewUrl::External(parsed))
+        .title(if visible {
+            format!("签到登录 · {name}")
+        } else {
+            format!("签到 · {name}")
+        })
+        .inner_size(980.0, 760.0)
+        .visible(visible)
+        .skip_taskbar(!visible)
+        .data_directory(profile)
+        .incognito(false)
+        .build()
+        .map_err(|e| e.to_string())
+}
+
+fn profile_dir(state: &AppState, label: &str) -> PathBuf {
+    state
+        .state_path
+        .parent()
+        .unwrap_or_else(|| Path::new("."))
+        .join("checkin-profiles")
+        .join(label)
+}
+
+fn safe_label(id: &str) -> String {
+    let mut out = String::new();
+    for ch in id.chars() {
+        if ch.is_ascii_alphanumeric() || ch == '-' || ch == '_' {
+            out.push(ch);
+        } else {
+            out.push('-');
+        }
+        if out.len() >= 40 {
+            break;
+        }
+    }
+    let trimmed = out.trim_matches('-').to_string();
+    if trimmed.is_empty() {
+        "up".to_string()
+    } else {
+        trimmed
+    }
+}
+
+async fn cookies_now(win: &WebviewWindow, root: &str) -> Vec<(String, String)> {
+    let win = win.clone();
+    let root = root.to_string();
+    tokio::task::spawn_blocking(move || read_cookies(&win, &root))
+        .await
+        .ok()
+        .and_then(|r| r.ok())
+        .unwrap_or_default()
+}
+
+fn read_cookies(win: &WebviewWindow, root: &str) -> Result<Vec<(String, String)>, String> {
+    let url = tauri::Url::parse(root).map_err(|e| e.to_string())?;
+    let list = win.cookies_for_url(url).map_err(|e| e.to_string())?;
+    Ok(list
+        .into_iter()
+        .map(|c| (c.name().to_string(), c.value().to_string()))
+        .collect())
+}
+
+fn has_session(cookies: &[(String, String)]) -> bool {
+    cookies
+        .iter()
+        .any(|(k, v)| k == "session" && !v.is_empty())
+}
+
+fn cookie_header(cookies: &[(String, String)]) -> String {
+    cookies
+        .iter()
+        .map(|(k, v)| format!("{k}={v}"))
+        .collect::<Vec<_>>()
+        .join("; ")
+}
+
+async fn try_browser_login(
+    win: &WebviewWindow,
+    root: &str,
+    prov: &Provider,
+    cfg: &Map<String, Value>,
+) -> Result<bool, String> {
+    let email = cfg_str(cfg, "email");
+    let password = cfg_raw(cfg, "password");
+    if email.is_empty() || password.is_empty() {
+        return Ok(false);
+    }
+    let login_url = format!("{root}{}", prov.login_path);
+    let parsed = tauri::Url::parse(&login_url).map_err(|e| e.to_string())?;
+    win.navigate(parsed).map_err(|e| e.to_string())?;
+    let _ = wait_page_ready(win, 40).await;
+    tokio::time::sleep(Duration::from_millis(1200)).await;
+    let js = login_script(&email, &password);
+    let outcome = eval_json(win, &js).await.unwrap_or(Value::Null);
+    if outcome.get("ok").and_then(|v| v.as_bool()) != Some(true) {
+        let reason = outcome
+            .get("reason")
+            .and_then(|v| v.as_str())
+            .unwrap_or("登录表单没有提交成功");
+        return Err(reason.to_string());
+    }
+    for _ in 0..60 {
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        let cookies = cookies_now(win, root).await;
+        if has_session(&cookies) {
+            return Ok(true);
+        }
+    }
+    Err("登录后 60 秒内没有拿到 session cookie".to_string())
+}
+
+async fn wait_page_ready(win: &WebviewWindow, timeout_secs: u64) -> Value {
+    let deadline = std::time::Instant::now() + Duration::from_secs(timeout_secs);
+    loop {
+        if let Some(v) = eval_json(win, PAGE_STATE_JS).await {
+            if v.get("blocked").and_then(|x| x.as_bool()) == Some(true) {
+                return v;
+            }
+            if v.get("ready").and_then(|x| x.as_bool()) == Some(true) {
+                return v;
+            }
+        }
+        if std::time::Instant::now() > deadline {
+            return Value::Null;
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+}
+
+async fn eval_json(win: &WebviewWindow, js: &str) -> Option<Value> {
+    let (tx, rx) = tokio::sync::oneshot::channel::<String>();
+    let tx = std::sync::Mutex::new(Some(tx));
+    let script = js.to_string();
+    win.eval_with_callback(script, move |s| {
+        if let Some(tx) = tx.lock().unwrap().take() {
+            let _ = tx.send(s);
+        }
+    })
+    .ok()?;
+    let raw = tokio::time::timeout(Duration::from_secs(20), rx)
+        .await
+        .ok()?
+        .ok()?;
+    serde_json::from_str(&raw).ok()
+}
+
+async fn http_user_info(
+    state: &AppState,
+    root: &str,
+    prov: &Provider,
+    cookie: &str,
+    api_user: &str,
+) -> UserInfo {
+    let url = format!("{root}{}", prov.user_info_path);
+    let mut req = state
+        .client
+        .get(&url)
+        .header("User-Agent", CHROME_UA)
+        .header("Accept", "application/json, text/plain, */*")
+        .header("Accept-Language", "zh-CN,zh;q=0.9,en;q=0.8")
+        .header("Referer", format!("{root}/"))
+        .header("Origin", root)
+        .timeout(Duration::from_secs(25));
+    if !cookie.is_empty() {
+        req = req.header("Cookie", cookie);
+    }
+    if !api_user.is_empty() && !prov.api_user_key.is_empty() {
+        req = req.header(&prov.api_user_key, api_user);
+    }
+    let resp = match req.send().await {
+        Ok(r) => r,
+        Err(e) => {
+            return UserInfo {
+                ok: false,
+                status: 0,
+                id: String::new(),
+                quota: 0.0,
+                used: 0.0,
+                message: format!("连不上 {root}：{e}"),
+                blocked: false,
+            }
+        }
+    };
+    let status = resp.status().as_u16();
+    let text = resp.text().await.unwrap_or_default();
+    if looks_blocked(&text) {
+        return UserInfo {
+            ok: false,
+            status,
+            id: String::new(),
+            quota: 0.0,
+            used: 0.0,
+            message: "站点要求人机验证（Cloudflare/Turnstile），浏览器会话没有通过".to_string(),
+            blocked: true,
+        };
+    }
+    let payload: Value = match serde_json::from_str(&text) {
+        Ok(v) => v,
+        Err(_) => {
+            return UserInfo {
+                ok: false,
+                status,
+                id: String::new(),
+                quota: 0.0,
+                used: 0.0,
+                message: format!("用户信息接口返回的不是 JSON（HTTP {status}），登录可能已失效"),
+                blocked: false,
+            }
+        }
+    };
+    let success = payload
+        .get("success")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    let data = payload.get("data").cloned().unwrap_or(Value::Null);
+    let obj = if data.is_object() { data } else { payload.clone() };
+    let id = obj
+        .get("id")
+        .map(|v| {
+            v.as_str()
+                .map(|s| s.to_string())
+                .unwrap_or_else(|| v.to_string())
+        })
+        .unwrap_or_default();
+    let quota = obj.get("quota").and_then(|v| v.as_f64()).unwrap_or(0.0);
+    let used = obj
+        .get("used_quota")
+        .or_else(|| obj.get("used"))
+        .and_then(|v| v.as_f64())
+        .unwrap_or(0.0);
+    let message = payload
+        .get("msg")
+        .or_else(|| payload.get("message"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    if !success && id.is_empty() {
+        return UserInfo {
+            ok: false,
+            status,
+            id,
+            quota,
+            used,
+            message: if message.is_empty() {
+                format!("读取用户信息失败（HTTP {status}）")
+            } else {
+                message
+            },
+            blocked: false,
+        };
+    }
+    UserInfo {
+        ok: true,
+        status,
+        id,
+        quota,
+        used,
+        message,
+        blocked: false,
+    }
+}
+
+async fn http_sign_in(
+    state: &AppState,
+    root: &str,
+    path: &str,
+    prov: &Provider,
+    cookie: &str,
+    api_user: &str,
+) -> SignInResp {
+    let url = format!("{root}{path}");
+    let mut req = state
+        .client
+        .post(&url)
+        .header("User-Agent", CHROME_UA)
+        .header("Accept", "application/json, text/plain, */*")
+        .header("Accept-Language", "zh-CN,zh;q=0.9,en;q=0.8")
+        .header("Content-Type", "application/json")
+        .header("X-Requested-With", "XMLHttpRequest")
+        .header("Referer", format!("{root}/"))
+        .header("Origin", root)
+        .timeout(Duration::from_secs(25));
+    if !cookie.is_empty() {
+        req = req.header("Cookie", cookie);
+    }
+    if !api_user.is_empty() && !prov.api_user_key.is_empty() {
+        req = req.header(&prov.api_user_key, api_user);
+    }
+    let resp = match req.send().await {
+        Ok(r) => r,
+        Err(e) => {
+            return SignInResp {
+                status: 0,
+                ok: false,
+                already: false,
+                blocked: false,
+                message: format!("连不上 {root}：{e}"),
+            }
+        }
+    };
+    let status = resp.status().as_u16();
+    let text = resp.text().await.unwrap_or_default();
+    if looks_blocked(&text) {
+        return SignInResp {
+            status,
+            ok: false,
+            already: false,
+            blocked: true,
+            message: "站点要求人机验证（Cloudflare/Turnstile）".to_string(),
+        };
+    }
+    let payload: Value = match serde_json::from_str(&text) {
+        Ok(v) => v,
+        Err(_) => {
+            let ok = text.to_ascii_lowercase().contains("success");
+            return SignInResp {
+                status,
+                ok,
+                already: false,
+                blocked: false,
+                message: if ok {
+                    "签到成功".to_string()
+                } else {
+                    format!("签到接口返回的不是 JSON（HTTP {status}）")
+                },
+            };
+        }
+    };
+    let msg = payload
+        .get("msg")
+        .or_else(|| payload.get("message"))
+        .or_else(|| {
+            payload
+                .get("data")
+                .and_then(|d| d.get("msg").or_else(|| d.get("message")))
+        })
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    let success = payload.get("ret").and_then(as_i64_like) == Some(1)
+        || payload.get("code").and_then(as_i64_like) == Some(0)
+        || payload.get("success").and_then(|v| v.as_bool()) == Some(true)
+        || payload
+            .get("data")
+            .and_then(|d| d.get("success"))
+            .and_then(|v| v.as_bool())
+            == Some(true);
+    let low = msg.to_ascii_lowercase();
+    let already = status == 409
+        || low.contains("already")
+        || msg.contains("已经签到")
+        || msg.contains("已签到")
+        || msg.contains("重复签到");
+    SignInResp {
+        status,
+        ok: success && !already,
+        already,
+        blocked: false,
+        message: msg,
+    }
+}
+
+fn as_i64_like(v: &Value) -> Option<i64> {
+    v.as_i64()
+        .or_else(|| v.as_str().and_then(|s| s.parse::<i64>().ok()))
+}
+
+fn looks_blocked(text: &str) -> bool {
+    let low = text.to_ascii_lowercase();
+    low.contains("just a moment")
+        || low.contains("__cf_chl_")
+        || low.contains("turnstile")
+        || low.contains("attention required")
+        || low.contains("access denied")
+        || low.contains("verify you are human")
+        || text.contains("请进行验证")
+        || text.contains("访问受限")
+        || text.contains("为了更好的访问体验")
+}
+
+fn round2(v: f64) -> f64 {
+    (v * 100.0).round() / 100.0
 }
 
 fn result(kind: &str, ok: bool, message: &str, extra: Value) -> Value {
@@ -451,4 +1397,218 @@ fn result(kind: &str, ok: bool, message: &str, extra: Value) -> Value {
         }
     }
     v
+}
+
+const PAGE_STATE_JS: &str = r#"(() => {
+  const vis = (el) => {
+    if (!el || !el.isConnected) return false;
+    const st = window.getComputedStyle(el);
+    if (st.display === 'none' || st.visibility === 'hidden' || parseFloat(st.opacity) === 0) return false;
+    const r = el.getBoundingClientRect();
+    return r.width > 0 && r.height > 0;
+  };
+  const text = (document.body && document.body.innerText || '');
+  const blocked = /请进行验证|为了更好的访问体验|访问受限|Access denied|verify you are human/i.test(text);
+  const hasUser = ['#username','input[name="username"]','input[name="email"]','input[type="email"]'].some(s => vis(document.querySelector(s)));
+  const ready = document.readyState !== 'loading' &&
+    (hasUser || !!document.querySelector('.semi-card, form, button') || text.trim().length > 30);
+  return {ready, blocked, hasUser, url: location.href, title: document.title || '', text: text.slice(0, 200)};
+})()"#;
+
+fn login_script(email: &str, password: &str) -> String {
+    let email = serde_json::to_string(email).unwrap_or_else(|_| "\"\"".to_string());
+    let password = serde_json::to_string(password).unwrap_or_else(|_| "\"\"".to_string());
+    format!(
+        r#"(() => {{
+  const email = {email};
+  const password = {password};
+  const vis = (el) => {{
+    if (!el || !el.isConnected) return false;
+    const st = window.getComputedStyle(el);
+    if (st.display === 'none' || st.visibility === 'hidden' || parseFloat(st.opacity) === 0) return false;
+    const r = el.getBoundingClientRect();
+    return r.width > 0 && r.height > 0;
+  }};
+  const setVal = (el, v) => {{
+    const setter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value')?.set;
+    if (setter) setter.call(el, v); else el.value = v;
+    el.dispatchEvent(new Event('input', {{bubbles: true}}));
+    el.dispatchEvent(new Event('change', {{bubbles: true}}));
+  }};
+  const userSels = ['#username', 'input[name="username"]', 'input[name="email"]', 'input[type="email"]'];
+  const pwdSels = ['#password', 'input[name="password"]', 'input[type="password"]'];
+  const findUser = () => {{
+    for (const s of userSels) {{
+      const el = document.querySelector(s);
+      if (vis(el)) return el;
+    }}
+    return null;
+  }};
+  for (const s of ['.semi-modal-close', '.ant-modal-close', '[aria-label="Close"]']) {{
+    document.querySelectorAll(s).forEach(b => {{ if (vis(b)) {{ try {{ b.click(); }} catch (e) {{}} }} }});
+  }}
+  try {{ document.dispatchEvent(new KeyboardEvent('keydown', {{key: 'Escape', bubbles: true}})); }} catch (e) {{}}
+  if (!findUser()) {{
+    const entries = [
+      '.semi-card button:has(.semi-icon-mail)',
+      '.semi-card button:has([aria-label="mail"])',
+      'button:has(.semi-icon-mail)'
+    ];
+    for (const s of entries) {{
+      for (const b of document.querySelectorAll(s)) {{
+        if (!vis(b)) continue;
+        try {{ b.click(); }} catch (e) {{}}
+        if (findUser()) break;
+      }}
+      if (findUser()) break;
+    }}
+    if (!findUser()) {{
+      for (const t of document.querySelectorAll('.semi-card .semi-tabs-tab')) {{
+        if (!vis(t)) continue;
+        try {{ t.click(); }} catch (e) {{}}
+        if (findUser()) break;
+      }}
+    }}
+  }}
+  const user = findUser();
+  if (!user) return {{ok: false, reason: '没有找到邮箱输入框（可能仍在人机验证，或页面没加载完）'}};
+  let pwd = null;
+  for (const s of pwdSels) {{
+    const el = document.querySelector(s);
+    if (vis(el)) {{ pwd = el; break; }}
+  }}
+  if (!pwd) return {{ok: false, reason: '没有找到密码输入框'}};
+  setVal(user, email);
+  setVal(pwd, password);
+  const form = user.closest('form') || document;
+  let submit = form.querySelector('button[type="submit"]');
+  if (!submit) {{
+    const re = /^(登录|登 录|Login|Sign in|Sign In|继续|Continue)$/;
+    submit = [...document.querySelectorAll('button')].find(b => vis(b) && re.test((b.innerText || '').trim()));
+  }}
+  if (!submit) return {{ok: false, reason: '没有找到登录按钮'}};
+  submit.click();
+  return {{ok: true}};
+}})()"#,
+        email = email,
+        password = password
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn up(base: &str) -> Upstream {
+        Upstream {
+            base_url: base.to_string(),
+            ..Default::default()
+        }
+    }
+
+    fn cfg(v: Value) -> Map<String, Value> {
+        v.as_object().cloned().unwrap_or_default()
+    }
+
+    #[test]
+    fn provider_detects_builtin_sites() {
+        let empty = Map::new();
+        let any = provider_of(&up("https://anyrouter.top/v1"), &empty);
+        assert_eq!(any.name, "anyrouter");
+        assert_eq!(any.sign_in_path.as_deref(), Some("/api/user/sign_in"));
+        assert!(!any.auto_trigger);
+        assert_eq!(any.user_info_path, "/api/user/self");
+        assert_eq!(any.api_user_key, "new-api-user");
+
+        let agent = provider_of(&up("https://agentrouter.org"), &empty);
+        assert_eq!(agent.name, "agentrouter");
+        assert!(agent.auto_trigger);
+        assert!(agent.sign_in_path.is_none());
+    }
+
+    #[test]
+    fn provider_honours_overrides_and_site_root() {
+        let u = up("https://api.example.com/v1");
+        let c = cfg(json!({
+            "provider": "custom",
+            "site_root": "https://panel.example.com/",
+            "sign_in_path": "/api/user/sign_in",
+            "login_path": "/signin",
+            "api_user_key": "X-User"
+        }));
+        let p = provider_of(&u, &c);
+        assert_eq!(checkin_site_root(&u, &c), "https://panel.example.com");
+        assert_eq!(p.login_path, "/signin");
+        assert_eq!(p.sign_in_path.as_deref(), Some("/api/user/sign_in"));
+        assert_eq!(p.api_user_key, "X-User");
+    }
+
+    #[test]
+    fn browser_mode_is_configured_without_token() {
+        let mut u = up("https://anyrouter.top");
+        u.extra.insert(
+            "checkin".to_string(),
+            json!({"auth": "browser", "enabled": true}),
+        );
+        assert!(configured(&u));
+        assert!(checkin_enabled(&u));
+        assert_eq!(auth_of(&checkin_cfg(&u)), "browser");
+        assert!(!configured(&up("https://anyrouter.top")));
+    }
+
+    #[test]
+    fn sign_in_candidates_builtin_vs_custom() {
+        let empty = Map::new();
+        let any = provider_of(&up("https://anyrouter.top"), &empty);
+        assert_eq!(
+            sign_in_candidates(&any, &empty),
+            vec!["/api/user/sign_in".to_string()]
+        );
+
+        let custom = provider_of(&up("https://example.com"), &empty);
+        let got = sign_in_candidates(&custom, &empty);
+        assert!(got.contains(&"/api/user/self/checkin".to_string()));
+        assert!(got.contains(&"/api/user/checkin".to_string()));
+
+        let learned = cfg(json!({"path": "/api/user/self/checkin"}));
+        let got = sign_in_candidates(&custom, &learned);
+        assert_eq!(
+            got.first().map(String::as_str),
+            Some("/api/user/self/checkin")
+        );
+    }
+
+    #[test]
+    fn numeric_and_block_detection_helpers() {
+        assert_eq!(as_i64_like(&json!(1)), Some(1));
+        assert_eq!(as_i64_like(&json!("0")), Some(0));
+        assert_eq!(as_i64_like(&json!(null)), None);
+        assert!(looks_blocked("<title>Just a moment...</title>"));
+        assert!(looks_blocked("Access denied"));
+        assert!(!looks_blocked("{\"success\":true}"));
+        assert_eq!(round2(1.2345), 1.23);
+    }
+
+    #[test]
+    fn membership_is_explicit() {
+        let mut u = up("https://anyrouter.top");
+        assert!(!listed(&u));
+        u.extra.insert("checkin".to_string(), json!({}));
+        assert!(listed(&u));
+    }
+
+    #[test]
+    fn cookie_header_and_labels() {
+        assert_eq!(
+            cookie_header(&[
+                ("acw_tc".to_string(), "1".to_string()),
+                ("session".to_string(), "abc".to_string())
+            ]),
+            "acw_tc=1; session=abc"
+        );
+        assert!(has_session(&[("session".to_string(), "x".to_string())]));
+        assert!(!has_session(&[("session".to_string(), String::new())]));
+        assert_eq!(safe_label("a/b:c d"), "a-b-c-d");
+        assert_eq!(safe_label(""), "up");
+    }
 }
