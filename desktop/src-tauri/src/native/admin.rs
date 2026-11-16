@@ -805,7 +805,11 @@ pub async fn checkin_config(
             .to_string();
         let old_email = cfg.get("email").and_then(|v| v.as_str()).unwrap_or("").to_string();
         if let Some(auth) = p.get("auth").and_then(|v| v.as_str()) {
-            let auth = if auth == "browser" { "browser" } else { "token" };
+            let auth = match auth {
+                "browser" => "browser",
+                "chrome" => "chrome",
+                _ => "token",
+            };
             if auth != old_auth {
                 cfg.insert("auth".to_string(), json!(auth));
                 up.extra.remove("checkin_state");
@@ -832,6 +836,9 @@ pub async fn checkin_config(
             let site = site.trim();
             let old_site = cfg.get("site_root").and_then(|v| v.as_str()).unwrap_or("");
             if site != old_site {
+                // 站点变了，旧 Chrome Cookie 不能再用。
+                cfg.remove("cookies");
+                cfg.remove("cookie_at");
                 up.extra.remove("checkin_state");
             }
             if site.is_empty() {
@@ -897,8 +904,9 @@ pub async fn checkin_config(
             .and_then(|v| v.as_str())
             .map(|s| !s.is_empty())
             .unwrap_or(false);
-        let browser = cfg.get("auth").and_then(|v| v.as_str()) == Some("browser");
-        let has_auth = browser || has_token;
+        let auth_now = cfg.get("auth").and_then(|v| v.as_str()).unwrap_or("token");
+        let browser_like = auth_now == "browser" || auth_now == "chrome";
+        let has_auth = browser_like || has_token;
         if let Some(enabled) = p.get("enabled").and_then(|v| v.as_bool()) {
             cfg.insert("enabled".to_string(), json!(enabled && has_auth));
         } else if has_auth && !cfg.contains_key("enabled") {
@@ -952,6 +960,34 @@ pub async fn checkin_remove(
     }
     let _ = state.save();
     ok(json!({"ok": true}))
+}
+
+pub async fn checkin_chrome_login(
+    State(state): State<Arc<AppState>>,
+    Json(p): Json<Value>,
+) -> Response {
+    let id = p.get("id").and_then(|v| v.as_str()).unwrap_or("");
+    if id.is_empty() {
+        return bad("缺少 id");
+    }
+    let up = {
+        let file = state.file.read().unwrap();
+        match file.find_upstream(id) {
+            Some(u) => u.clone(),
+            None => return not_found("找不到这个上游"),
+        }
+    };
+    let st = state.clone();
+    let prepared =
+        tokio::task::spawn_blocking(move || super::checkin::prepare_chrome_login(&st, &up)).await;
+    match prepared {
+        Ok(Ok(prep)) => {
+            super::checkin::spawn_chrome_capture(state.clone(), prep);
+            ok(json!({"ok": true, "message": "已打开专用 Chrome"}))
+        }
+        Ok(Err(e)) => bad(&e),
+        Err(e) => bad(&format!("启动 Chrome 失败：{e}")),
+    }
 }
 
 pub async fn checkin_browser_open(

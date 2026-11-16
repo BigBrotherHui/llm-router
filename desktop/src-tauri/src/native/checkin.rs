@@ -1,11 +1,15 @@
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::process::Stdio;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
-use futures_util::StreamExt;
+use futures_util::{SinkExt, StreamExt};
 use serde_json::{json, Map, Value};
 use tauri::{Manager, WebviewUrl, WebviewWindow, WebviewWindowBuilder};
+use tokio_tungstenite::tungstenite::Message;
 
 use super::state::{AppState, Upstream};
 
@@ -100,21 +104,20 @@ fn token_of(up: &Upstream) -> String {
 }
 
 fn auth_of(cfg: &Map<String, Value>) -> String {
-    let auth = cfg_str(cfg, "auth");
-    if auth == "browser" {
-        "browser".to_string()
-    } else {
-        "token".to_string()
+    match cfg_str(cfg, "auth").as_str() {
+        "browser" => "browser".to_string(),
+        "chrome" => "chrome".to_string(),
+        _ => "token".to_string(),
     }
-}
-
-fn browser_auth(cfg: &Map<String, Value>) -> bool {
-    auth_of(cfg) == "browser"
 }
 
 fn configured(up: &Upstream) -> bool {
     let cfg = checkin_cfg(up);
-    browser_auth(&cfg) || !cfg_str(&cfg, "token").is_empty()
+    match auth_of(&cfg).as_str() {
+        "browser" => true,
+        "chrome" => !stored_cookies(&cfg).is_empty(),
+        _ => !cfg_str(&cfg, "token").is_empty(),
+    }
 }
 
 fn checkin_enabled(up: &Upstream) -> bool {
@@ -285,6 +288,13 @@ pub fn rows(state: &AppState) -> Vec<Value> {
             let token = token_of(up);
             let auth = auth_of(&cfg);
             let browser = auth == "browser";
+            let chrome = auth == "chrome";
+            let has_cookies = !stored_cookies(&cfg).is_empty();
+            let configured = match auth.as_str() {
+                "browser" => true,
+                "chrome" => has_cookies,
+                _ => !token.is_empty(),
+            };
             let enabled = cfg.get("enabled").and_then(|v| v.as_bool()).unwrap_or(false);
             let prov = provider_of(up, &cfg);
             let st = state_of(up);
@@ -294,20 +304,22 @@ pub fn rows(state: &AppState) -> Vec<Value> {
                 "base_url": up.base_url,
                 "site_root": checkin_site_root(up, &cfg),
                 "enabled": up.enabled,
-                "configured": browser || !token.is_empty(),
+                "configured": configured,
                 "auth": auth,
                 "provider": prov.name,
                 "site_root_custom": cfg_str(&cfg, "site_root"),
                 "oauth_hint": cfg_str(&cfg, "oauth_hint"),
                 "email": cfg_str(&cfg, "email"),
                 "has_password": !cfg_raw(&cfg, "password").is_empty(),
+                "has_cookies": has_cookies,
+                "cookie_at": cfg.get("cookie_at").cloned().unwrap_or_else(|| json!(0)),
                 "checkin_enabled": enabled,
-                "token_hint": if browser || token.is_empty() { String::new() } else { super::state::mask_key(&token) },
-                "token_expires_at": if browser { Value::Null } else { json!(jwt_exp(&token)) },
-                "token_expired": !browser && token_expired(&token),
+                "token_hint": if browser || chrome || token.is_empty() { String::new() } else { super::state::mask_key(&token) },
+                "token_expires_at": if browser || chrome { Value::Null } else { json!(jwt_exp(&token)) },
+                "token_expired": !browser && !chrome && token_expired(&token),
                 "user_id": cfg.get("user_id").cloned().unwrap_or_else(|| json!("")),
                 "path": cfg.get("path").cloned().unwrap_or_else(|| json!("")),
-                "token_looks_wrong": !browser && token.to_ascii_lowercase().starts_with("sk-"),
+                "token_looks_wrong": !browser && !chrome && token.to_ascii_lowercase().starts_with("sk-"),
                 "login_at": st.get("login_at").cloned().unwrap_or_else(|| json!(0)),
                 "state": st,
             })
@@ -458,10 +470,10 @@ pub async fn run(state: Arc<AppState>, ids: Vec<String>, press_checkin: bool) ->
 
 async fn run_one(state: &AppState, up: &Upstream, press: bool) -> Value {
     let cfg = checkin_cfg(up);
-    if browser_auth(&cfg) {
-        run_browser(state, up, press).await
-    } else {
-        run_one_token(state, up, press).await
+    match auth_of(&cfg).as_str() {
+        "browser" => run_browser(state, up, press).await,
+        "chrome" => run_one_chrome(state, up, press).await,
+        _ => run_one_token(state, up, press).await,
     }
 }
 
@@ -665,6 +677,179 @@ async fn run_one_token(state: &AppState, up: &Upstream, press: bool) -> Value {
     }
     if saw_auth && last.get("kind").and_then(|v| v.as_str()) == Some("none") {
         return result("auth", false, "站点拒绝了访问令牌", Value::Null);
+    }
+    last
+}
+
+async fn run_one_chrome(state: &AppState, up: &Upstream, press: bool) -> Value {
+    let cfg = checkin_cfg(up);
+    let cookies = stored_cookies(&cfg);
+    if cookies.is_empty() {
+        return result(
+            "login",
+            false,
+            "还没有用 Chrome 登录：点行内「登录」打开专用 Chrome 登录一次",
+            json!({"need_login": true, "chrome": true}),
+        );
+    }
+    let root = checkin_site_root(up, &cfg);
+    if root.is_empty() {
+        return result("error", false, "上游没填地址", Value::Null);
+    }
+    let prov = provider_of(up, &cfg);
+    let cfg_user = cfg_str(&cfg, "user_id");
+    let cookie = cookie_header(&cookies);
+    let mut info = http_user_info(state, &root, &prov, &cookie, &cfg_user).await;
+    if !info.ok {
+        let (kind, message) = if info.blocked {
+            (
+                "blocked",
+                "站点要求人机验证，Chrome 保存的 Cookie 不够用，请重新登录".to_string(),
+            )
+        } else if info.status == 0 {
+            (
+                "error",
+                if info.message.is_empty() {
+                    format!("连不上 {root}")
+                } else {
+                    info.message.clone()
+                },
+            )
+        } else {
+            (
+                "login",
+                "Chrome 保存的 Cookie 已失效，请点「登录」重新登录".to_string(),
+            )
+        };
+        return result(
+            kind,
+            false,
+            &message,
+            json!({"need_login": true, "status": info.status, "chrome": true}),
+        );
+    }
+    let api_user = if !info.id.is_empty() {
+        info.id.clone()
+    } else {
+        cfg_user
+    };
+    let per_unit = cfg
+        .get("quota_per_unit")
+        .and_then(|v| v.as_f64())
+        .filter(|x| *x > 0.0)
+        .unwrap_or(500000.0);
+    let base = json!({
+        "provider": prov.name,
+        "path": prov.sign_in_path.clone().unwrap_or_default(),
+        "status": info.status,
+        "quota": info.quota,
+        "used_quota": info.used,
+        "quota_usd": round2(info.quota / per_unit),
+        "login_at": cfg.get("cookie_at").cloned().unwrap_or_else(|| json!(0)),
+        "chrome": true,
+    });
+    if !press {
+        return result("ok", true, "Chrome Cookie 可用，可以签到", base);
+    }
+    if prov.auto_trigger {
+        let after = http_user_info(state, &root, &prov, &cookie, &api_user).await;
+        if !after.ok {
+            return result("error", false, "拉取用户信息触发签到失败", base);
+        }
+        let reward = (after.quota + after.used) - (info.quota + info.used);
+        let mut out = result("ok", true, "签到完成（拉取用户信息时自动触发）", base);
+        out["reward"] = json!(reward.max(0.0));
+        if reward > 0.0 {
+            out["reward_text"] = json!(format!("${:.2}", reward / per_unit));
+        }
+        return out;
+    }
+    let mut last = result("none", false, "站点没有可用的签到接口", base.clone());
+    let mut saw_auth = false;
+    for path in sign_in_candidates(&prov, &cfg) {
+        let r = http_sign_in(state, &root, &path, &prov, &cookie, &api_user).await;
+        if r.blocked {
+            return result(
+                "blocked",
+                false,
+                "站点要求人机验证，请重新用 Chrome 登录",
+                json!({"blocked": "cf", "status": r.status, "path": path}),
+            );
+        }
+        if r.status == 401 || r.status == 403 {
+            saw_auth = true;
+            last = result(
+                "auth",
+                false,
+                "站点拒绝了 Chrome Cookie（401/403），请重新登录",
+                json!({"path": path, "status": r.status}),
+            );
+            continue;
+        }
+        if r.status == 404 || r.status == 405 {
+            last = result(
+                "none",
+                false,
+                &format!("站点没有 {path}（HTTP {}）", r.status),
+                json!({"path": path, "status": r.status}),
+            );
+            continue;
+        }
+        if r.ok || r.already {
+            let after = http_user_info(state, &root, &prov, &cookie, &api_user).await;
+            let reward = if after.ok {
+                (after.quota + after.used) - (info.quota + info.used)
+            } else {
+                0.0
+            };
+            let mut out = result(
+                if r.already { "already" } else { "ok" },
+                true,
+                if r.message.is_empty() {
+                    if r.already {
+                        "今天已经签过了"
+                    } else {
+                        "签到成功"
+                    }
+                } else {
+                    &r.message
+                },
+                json!({
+                    "path": path,
+                    "status": r.status,
+                    "checked_in_today": r.already,
+                    "quota": info.quota,
+                    "used_quota": info.used,
+                    "quota_usd": round2(info.quota / per_unit),
+                    "login_at": base["login_at"].clone(),
+                    "provider": prov.name,
+                    "chrome": true,
+                }),
+            );
+            if reward > 0.0 {
+                out["reward"] = json!(reward);
+                out["reward_text"] = json!(format!("${:.2}", reward / per_unit));
+            }
+            return out;
+        }
+        last = result(
+            "error",
+            false,
+            if r.message.is_empty() {
+                "站点没有接受这次签到"
+            } else {
+                &r.message
+            },
+            json!({"path": path, "status": r.status}),
+        );
+    }
+    if saw_auth {
+        return result(
+            "auth",
+            false,
+            "Chrome Cookie 被站点拒绝（401/403），请重新登录",
+            base,
+        );
     }
     last
 }
@@ -983,6 +1168,374 @@ async fn run_browser(state: &AppState, up: &Upstream, press: bool) -> Value {
         );
     }
     last
+}
+
+/// 方案 1：用专用 Chrome 登录，CDP 自动抓该站 Cookie。
+/// Chrome 用独立 profile（<state目录>/checkin-chrome-profile），不影响日常 Chrome。
+pub struct ChromeLogin {
+    pub up: Upstream,
+    pub root: String,
+    pub port: u16,
+    pub ws_path: String,
+}
+
+static CHROME_TASKS: OnceLock<Mutex<HashMap<String, Arc<AtomicBool>>>> = OnceLock::new();
+
+fn chrome_tasks() -> &'static Mutex<HashMap<String, Arc<AtomicBool>>> {
+    CHROME_TASKS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+pub fn prepare_chrome_login(state: &AppState, up: &Upstream) -> Result<ChromeLogin, String> {
+    let cfg = checkin_cfg(up);
+    if auth_of(&cfg) != "chrome" {
+        return Err("这个上游不是 Chrome 登录模式".to_string());
+    }
+    let root = checkin_site_root(up, &cfg);
+    if root.is_empty() {
+        return Err("上游没填地址".to_string());
+    }
+    let prov = provider_of(up, &cfg);
+    let login_url = format!("{root}{}", prov.login_path);
+    let profile = chrome_profile_dir(state);
+    let (port, ws_path) = ensure_chrome(&profile, &login_url)?;
+    Ok(ChromeLogin {
+        up: up.clone(),
+        root,
+        port,
+        ws_path,
+    })
+}
+
+pub fn spawn_chrome_capture(state: Arc<AppState>, prep: ChromeLogin) {
+    let uid = prep.up.id.clone();
+    let running = {
+        let mut tasks = chrome_tasks().lock().unwrap();
+        if let Some(flag) = tasks.get(&uid) {
+            if flag.load(Ordering::Relaxed) {
+                return;
+            }
+        }
+        let flag = Arc::new(AtomicBool::new(true));
+        tasks.insert(uid.clone(), flag.clone());
+        flag
+    };
+    let pending = result(
+        "login",
+        false,
+        "已打开 Chrome：请在窗口里登录，成功后会自动保存 Cookie",
+        json!({"chrome": true, "pending": true}),
+    );
+    set_state(&state, &uid, &pending);
+    let _ = state.save();
+    let _ = tauri::async_runtime::spawn(async move {
+        capture_chrome_login(state, prep).await;
+        running.store(false, Ordering::Relaxed);
+    });
+}
+
+async fn capture_chrome_login(state: Arc<AppState>, prep: ChromeLogin) {
+    let cfg = checkin_cfg(&prep.up);
+    let prov = provider_of(&prep.up, &cfg);
+    let host = host_of(&prep.root);
+    let api_user = cfg_str(&cfg, "user_id");
+    let deadline = std::time::Instant::now() + Duration::from_secs(900);
+    let mut client: Option<Cdp> = None;
+    let mut connect_fail = 0u32;
+    loop {
+        if std::time::Instant::now() > deadline {
+            break;
+        }
+        if client.is_none() {
+            match Cdp::connect(prep.port, &prep.ws_path).await {
+                Ok(c) => {
+                    client = Some(c);
+                    connect_fail = 0;
+                }
+                Err(_) => {
+                    connect_fail += 1;
+                    // 调试端口在 Chrome 启动时就有；连续 30 秒连不上基本是窗口被关了。
+                    if connect_fail >= 15 {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_secs(2)).await;
+                    continue;
+                }
+            }
+        }
+        let cookies = match client.as_mut().unwrap().site_cookies(&host).await {
+            Ok(v) => v,
+            Err(_) => {
+                client = None;
+                continue;
+            }
+        };
+        if !cookies.is_empty() {
+            let info = http_user_info(
+                &state,
+                &prep.root,
+                &prov,
+                &cookie_header(&cookies),
+                &api_user,
+            )
+            .await;
+            if info.ok {
+                save_chrome_cookies(&state, &prep.up.id, &cookies, &info.id);
+                return;
+            }
+        }
+        tokio::time::sleep(Duration::from_secs(2)).await;
+    }
+    let fail = result(
+        "login",
+        false,
+        "Chrome 登录未完成或窗口已关闭，请重试",
+        json!({"chrome": true}),
+    );
+    set_state(&state, &prep.up.id, &fail);
+    let _ = state.save();
+}
+
+fn save_chrome_cookies(state: &AppState, uid: &str, cookies: &[(String, String)], api_user: &str) {
+    let now = chrono::Utc::now().timestamp();
+    let mut file = state.file.write().unwrap();
+    if let Some(up) = file.find_upstream_mut(uid) {
+        let mut cfg = checkin_cfg(up);
+        let mut obj = Map::new();
+        for (k, v) in cookies {
+            obj.insert(k.clone(), json!(v));
+        }
+        cfg.insert("cookies".to_string(), Value::Object(obj));
+        cfg.insert("cookie_at".to_string(), json!(now));
+        if !api_user.is_empty() && cfg_str(&cfg, "user_id").is_empty() {
+            cfg.insert("user_id".to_string(), json!(api_user));
+        }
+        up.extra.insert("checkin".to_string(), Value::Object(cfg));
+        let ok = result(
+            "ok",
+            true,
+            "Chrome 登录成功，已保存 Cookie",
+            json!({"login_at": now, "chrome": true, "cookie_count": cookies.len()}),
+        );
+        up.extra.insert("checkin_state".to_string(), ok);
+    }
+    drop(file);
+    let _ = state.save();
+}
+
+fn stored_cookies(cfg: &Map<String, Value>) -> Vec<(String, String)> {
+    cfg.get("cookies")
+        .and_then(|v| v.as_object())
+        .map(|m| {
+            m.iter()
+                .filter_map(|(k, v)| {
+                    v.as_str()
+                        .filter(|s| !s.is_empty())
+                        .map(|s| (k.clone(), s.to_string()))
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn host_of(url: &str) -> String {
+    tauri::Url::parse(url)
+        .ok()
+        .and_then(|u| u.host_str().map(|s| s.to_ascii_lowercase()))
+        .unwrap_or_default()
+}
+
+fn domain_matches(domain: &str, host: &str) -> bool {
+    let d = domain.trim_start_matches('.').to_ascii_lowercase();
+    let h = host.to_ascii_lowercase();
+    if d.is_empty() || h.is_empty() {
+        return false;
+    }
+    h == d || h.ends_with(&format!(".{d}"))
+}
+
+fn extract_site_cookies(cookies: &[Value], host: &str) -> Vec<(String, String)> {
+    let now = chrono::Utc::now().timestamp() as f64;
+    let mut map: HashMap<String, String> = HashMap::new();
+    for c in cookies {
+        let Some(name) = c.get("name").and_then(|v| v.as_str()) else {
+            continue;
+        };
+        let Some(value) = c.get("value").and_then(|v| v.as_str()) else {
+            continue;
+        };
+        if name.is_empty() {
+            continue;
+        }
+        let domain = c.get("domain").and_then(|v| v.as_str()).unwrap_or("");
+        if !domain_matches(domain, host) {
+            continue;
+        }
+        let expires = c.get("expires").and_then(|v| v.as_f64()).unwrap_or(-1.0);
+        if expires > 0.0 && expires < now {
+            continue;
+        }
+        map.insert(name.to_string(), value.to_string());
+    }
+    map.into_iter().collect()
+}
+
+type CdpSocket = tokio_tungstenite::WebSocketStream<
+    tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+>;
+
+struct Cdp {
+    ws: CdpSocket,
+    next: u64,
+}
+
+impl Cdp {
+    async fn connect(port: u16, ws_path: &str) -> Result<Self, String> {
+        let url = format!("ws://127.0.0.1:{port}{ws_path}");
+        let (ws, _) = tokio_tungstenite::connect_async(url.as_str())
+            .await
+            .map_err(|e| e.to_string())?;
+        Ok(Self { ws, next: 1 })
+    }
+
+    async fn call(&mut self, method: &str, params: Value) -> Result<Value, String> {
+        let id = self.next;
+        self.next += 1;
+        let payload = json!({"id": id, "method": method, "params": params});
+        self.ws
+            .send(Message::Text(payload.to_string()))
+            .await
+            .map_err(|e| e.to_string())?;
+        loop {
+            let item = tokio::time::timeout(Duration::from_secs(15), self.ws.next())
+                .await
+                .map_err(|_| "CDP 响应超时".to_string())?;
+            match item {
+                Some(Ok(Message::Text(text))) => {
+                    let v: Value = serde_json::from_str(&text).unwrap_or(Value::Null);
+                    if v.get("id").and_then(|x| x.as_u64()) == Some(id) {
+                        if let Some(err) = v.get("error") {
+                            return Err(err.to_string());
+                        }
+                        return Ok(v.get("result").cloned().unwrap_or(Value::Null));
+                    }
+                }
+                Some(Ok(Message::Ping(p))) => {
+                    let _ = self.ws.send(Message::Pong(p)).await;
+                }
+                Some(Ok(Message::Close(_))) | None => {
+                    return Err("CDP 连接已关闭".to_string())
+                }
+                Some(Err(e)) => return Err(e.to_string()),
+                _ => {}
+            }
+        }
+    }
+
+    async fn site_cookies(&mut self, host: &str) -> Result<Vec<(String, String)>, String> {
+        let result = match self.call("Storage.getCookies", json!({})).await {
+            Ok(v) => v,
+            Err(_) => self.call("Network.getAllCookies", json!({})).await?,
+        };
+        let list = result
+            .get("cookies")
+            .and_then(|v| v.as_array())
+            .cloned()
+            .unwrap_or_default();
+        Ok(extract_site_cookies(&list, host))
+    }
+}
+
+fn chrome_profile_dir(state: &AppState) -> PathBuf {
+    state
+        .state_path
+        .parent()
+        .unwrap_or_else(|| Path::new("."))
+        .join("checkin-chrome-profile")
+}
+
+fn chrome_exe() -> Result<PathBuf, String> {
+    if let Ok(p) = std::env::var("CHROME_PATH") {
+        let p = PathBuf::from(p);
+        if p.exists() {
+            return Ok(p);
+        }
+    }
+    #[cfg(windows)]
+    {
+        let mut candidates = vec![
+            PathBuf::from(r"C:\Program Files\Google\Chrome\Application\chrome.exe"),
+            PathBuf::from(r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe"),
+        ];
+        if let Ok(local) = std::env::var("LOCALAPPDATA") {
+            candidates.push(PathBuf::from(local).join(r"Google\Chrome\Application\chrome.exe"));
+        }
+        for p in candidates {
+            if p.exists() {
+                return Ok(p);
+            }
+        }
+    }
+    Err("没有找到 Google Chrome；可以设置 CHROME_PATH 指向 chrome.exe".to_string())
+}
+
+fn launch_chrome(profile: &Path, login_url: &str) -> Result<(), String> {
+    let exe = chrome_exe()?;
+    let mut cmd = std::process::Command::new(exe);
+    cmd.arg(format!("--user-data-dir={}", profile.display()))
+        .arg("--remote-debugging-port=0")
+        .arg("--remote-allow-origins=*")
+        .arg("--no-first-run")
+        .arg("--no-default-browser-check")
+        .arg("--new-window")
+        .arg(login_url)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    cmd.spawn().map_err(|e| format!("启动 Chrome 失败：{e}"))?;
+    Ok(())
+}
+
+fn read_devtools_port(path: &Path) -> Option<(u16, String)> {
+    let text = std::fs::read_to_string(path).ok()?;
+    let mut lines = text.lines();
+    let port = lines.next()?.trim().parse().ok()?;
+    let ws_path = lines.next()?.trim().to_string();
+    if ws_path.is_empty() {
+        None
+    } else {
+        Some((port, ws_path))
+    }
+}
+
+fn port_open(port: u16) -> bool {
+    std::net::TcpStream::connect_timeout(
+        &std::net::SocketAddr::from(([127, 0, 0, 1], port)),
+        Duration::from_millis(400),
+    )
+    .is_ok()
+}
+
+fn ensure_chrome(profile: &Path, login_url: &str) -> Result<(u16, String), String> {
+    std::fs::create_dir_all(profile).map_err(|e| format!("创建 Chrome 配置目录失败：{e}"))?;
+    let port_file = profile.join("DevToolsActivePort");
+    if let Some((port, ws_path)) = read_devtools_port(&port_file) {
+        if port_open(port) {
+            // Chrome 已经在跑：再启动一次只是把登录页开成新窗口/标签，端口沿用。
+            let _ = launch_chrome(profile, login_url);
+            return Ok((port, ws_path));
+        }
+    }
+    let _ = std::fs::remove_file(&port_file);
+    launch_chrome(profile, login_url)?;
+    for _ in 0..120 {
+        std::thread::sleep(Duration::from_millis(250));
+        if let Some((port, ws_path)) = read_devtools_port(&port_file) {
+            if port > 0 && port_open(port) {
+                return Ok((port, ws_path));
+            }
+        }
+    }
+    Err("Chrome 启动后没有开放调试端口。若专用 Chrome 已经开着（没有调试端口），请先关掉它再试。".to_string())
 }
 
 fn build_browser_window(
@@ -1761,5 +2314,48 @@ mod tests {
         );
         assert_eq!(safe_label("a/b:c d"), "a-b-c-d");
         assert_eq!(safe_label(""), "up");
+    }
+
+    #[test]
+    fn chrome_mode_needs_cookies() {
+        let mut u = up("https://anyrouter.top");
+        u.extra.insert(
+            "checkin".to_string(),
+            json!({"auth": "chrome", "enabled": true}),
+        );
+        assert_eq!(auth_of(&checkin_cfg(&u)), "chrome");
+        assert!(!configured(&u));
+        u.extra.insert(
+            "checkin".to_string(),
+            json!({"auth": "chrome", "enabled": true, "cookies": {"session": "x"}}),
+        );
+        assert!(configured(&u));
+        assert_eq!(stored_cookies(&checkin_cfg(&u)).len(), 1);
+    }
+
+    #[test]
+    fn chrome_cookie_extraction_filters_site_and_expiry() {
+        assert!(domain_matches(".anyrouter.top", "anyrouter.top"));
+        assert!(domain_matches(".anyrouter.top", "www.anyrouter.top"));
+        assert!(!domain_matches(".linux.do", "anyrouter.top"));
+        let cookies = vec![
+            json!({"name":"session","value":"s","domain":".anyrouter.top","path":"/","expires":-1}),
+            json!({"name":"acw_tc","value":"a","domain":"anyrouter.top","path":"/","expires":0}),
+            json!({"name":"linuxdo","value":"l","domain":".linux.do","path":"/","expires":-1}),
+            json!({"name":"old","value":"o","domain":".anyrouter.top","path":"/","expires":1}),
+        ];
+        let got = extract_site_cookies(&cookies, "anyrouter.top");
+        assert!(got.iter().any(|(k, v)| k == "session" && v == "s"));
+        assert!(got.iter().any(|(k, _)| k == "acw_tc"));
+        assert!(!got.iter().any(|(k, _)| k == "linuxdo"));
+        assert!(!got.iter().any(|(k, _)| k == "old"));
+    }
+
+    #[test]
+    fn chrome_host_and_cookie_storage() {
+        assert_eq!(host_of("https://anyrouter.top/v1"), "anyrouter.top");
+        assert_eq!(host_of("not a url"), "");
+        let c = cfg(json!({"cookies":{"session":"s","acw_tc":"a"}}));
+        assert_eq!(stored_cookies(&c).len(), 2);
     }
 }
