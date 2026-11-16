@@ -1648,3 +1648,51 @@ Orca 的账本在 `%APPDATA%\Orca\agent-session-journal.db`（SQLite 915 MB / 54
 
 **已知取舍**：Orca 一次扫描 0.6–0.9 秒（48 万行的 LIKE 扫用不上索引），靠采集器 15 秒缓存 + 10 秒预热摊平；
 `range=all` 只覆盖账本最近 20000 行（约近 5 天），越界时 `sources[].truncated` 会打上。
+
+
+## 2026-11-16 16:40 请求记录里的 Orca 请求：补会话归属 + 列表可见
+
+用户报「当前过 Orca 的请求没有显示到请求记录里」。排查发现请求一直在流水里（当天 1900+ 条、
+本条会话 35 条），缺的是**归属与可见性**：
+
+- Orca 的 `agent-session-journal.db` 只记 **ACP 托管**的会话（`agent_session_records` 里
+  `providerHandleChain` 带 ses_* 的那些）。在 Orca 终端里直接跑的 opencode 根本不进这个库——
+  实测本会话 `ses_e1c8df4b8ffe1knCLPyykTrawH` 在 Orca 库里 0 行，于是
+  `orca_session_labels()` 命不中，流水落成「LLM Router / (本机 8010 流水)」。
+- 即便命中了（托管会话），请求记录列表也**不渲染 agent/project**；「只过 LLM Router」
+  口径走 `journal::query`，那边连这两个字段都没有。用户看不出哪几行是 Orca。
+
+**改动**
+
+- `sessions.rs`：新增 `session_labels()`（30 秒缓存，`SessionLabel { agent, project }`）：
+  1. 先取 Orca ACP 账本（原 `orca_session_labels`，语义不变）；
+  2. 再读 opencode 自己的会话库（`~/.local/share/opencode/opencode.db` 等四处候选），
+     用 `session.directory` 落在 Orca 工作区内的会话补上「Orca · opencode」。
+     Orca 工作区列表取自 `%APPDATA%/Orca/orca-usage-worktree-history.json`
+     （`<workspace uuid>::<path>`，含刚建的 worktree；实测 kokanee 在里面），
+     兜底再认 `~/orca/workspaces` 根目录；归一化盘符大小写 / 正反斜杠，
+     按 `dir == root || dir.starts_with(root + "/")` 匹配，避免 `D:/Project/D-other` 误中 `D:/Project/D`。
+  - project 用 opencode 会话标题（没有标题时退回目录名）。Orca 账本已经给出可读会话名时不覆盖；
+    账本只有工作区路径（`conversationName` 为空，实测刚注册的会话就是这样）时，用 opencode 标题替换。
+- `journal_as_records()` 改用 `session_labels()`；`journal::query()`（只过 LLM Router 口径）
+  给每页条目补 `agent` / `project`（只在命中时加字段，不影响分页和 strip_heavy 的瘦身）。
+- `webui.js`：请求行在模型名后渲染 `agentBadge(h)`（Orca 用紫色徽标，非 LLM Router 才显示），
+  展开详情加「会话来源：Orca · opencode · <会话名>」。
+
+**验证（真跑）**
+
+- `cargo test --lib` 17/17（新增 `orca_workspace_match`：反斜杠 / 大小写 / 前缀边界）。
+- debug 版起在 8011（复制一份 `.llmrouter` 指向 `LLM_ROUTER_STATE`，不动生产状态）：
+  - `/admin/journal?day=2026-11-16` → 本会话条目带 `agent=Orca · opencode`、
+    `project=Orca 请求未显示在请求记录中`；一页 199 条都有归属。
+  - `/sessions/records?include=router&metric=current` → `total=1962`，本会话前 3 条都是
+    `Orca · opencode`。
+  - 用 ego 打开页面：默认「全部 Agent 会话」与「只过 LLM Router」两种口径的行头都出现
+    `Orca · opencode` 徽标；展开详情显示「会话来源」。
+- 未动 3670051 的三口径去重（仍是 route=2 的 Agent 轮 + 8010 全部流水），统计数不变。
+
+**已知限制**：只补了「经过 8010 的请求」的归属。完全绕过路由的 opencode 会话目前仍进不了
+「会话对账 / 不过 LLM Router」（没有 opencode 会话扫描源）；opencode.db 只用来反查归属。
+另：`refresh_magpie()` 冷启动在 async 上下文里同步建 `reqwest::blocking::Client` 会 panic
+（`Cannot drop a runtime in a context where blocking is not allowed`，debug 版实测每 10 秒刷屏）；
+release 靠托盘线程先热身躲过，属于独立问题，本次未修。

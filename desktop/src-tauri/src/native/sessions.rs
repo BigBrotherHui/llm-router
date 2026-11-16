@@ -2818,6 +2818,200 @@ fn scan_orca(ctx: &mut Ctx, home: &Path, st: &mut SrcStat) {
     };
 }
 
+/// 一个会话在流水里的归属：请求记录用它显示「这轮是谁问的」。
+#[derive(Clone, Default)]
+pub struct SessionLabel {
+    pub agent: String,
+    pub project: String,
+}
+
+/// 会话归属缓存：Orca 账本 + opencode 会话库都不大，但请求记录每几秒查一次；
+/// 30 秒内复用，避免每次刷新都重开两个 SQLite。
+fn session_label_cache() -> &'static Mutex<Option<(Instant, HashMap<String, SessionLabel>)>> {
+    static CACHE: OnceLock<Mutex<Option<(Instant, HashMap<String, SessionLabel>)>>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(None))
+}
+
+pub fn session_labels() -> HashMap<String, SessionLabel> {
+    if let Ok(cache) = session_label_cache().lock() {
+        if let Some((at, map)) = cache.as_ref() {
+            if at.elapsed() < Duration::from_secs(30) {
+                return map.clone();
+            }
+        }
+    }
+    let map = build_session_labels();
+    if let Ok(mut cache) = session_label_cache().lock() {
+        *cache = Some((Instant::now(), map.clone()));
+    }
+    map
+}
+
+/// opencode 的会话库：ACP 托管的 opencode 在 Orca 账本里有记录，但在 Orca 终端里
+/// 直接跑的 opencode 不进 `agent-session-journal.db`，只有 opencode 自己的库知道
+/// 「这个 ses_* 是哪个工作区、哪次对话」。
+fn opencode_db(home: &Path) -> Option<PathBuf> {
+    [
+        home.join(".local").join("share").join("opencode").join("opencode.db"),
+        home.join("AppData").join("Local").join("opencode").join("opencode.db"),
+        home.join("AppData").join("Roaming").join("opencode").join("opencode.db"),
+        home.join("Library").join("Application Support").join("opencode").join("opencode.db"),
+    ]
+    .into_iter()
+    .find(|p| p.is_file())
+}
+
+fn opencode_sessions(home: &Path) -> Vec<(String, String, String)> {
+    let mut out = Vec::new();
+    let Some(db) = opencode_db(home) else {
+        return out;
+    };
+    let Some(conn) = orca_open(&db) else {
+        return out;
+    };
+    // 新版 opencode 有 session_v2 迁移表；两边的 id/directory/title 语义一样。
+    for table in ["session", "session_v2"] {
+        let sql = format!(
+            "select id, coalesce(title, ''), coalesce(directory, '') from {table}"
+        );
+        let Ok(mut stmt) = conn.prepare(&sql) else {
+            continue;
+        };
+        let Ok(rows) = stmt.query_map([], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, String>(2)?,
+            ))
+        }) else {
+            continue;
+        };
+        for row in rows.flatten() {
+            out.push(row);
+        }
+    }
+    out
+}
+
+/// Windows 的盘符大小写 / 分隔符都不稳定，统一成 `c:/a/b` 再比。
+fn norm_path(p: &str) -> String {
+    let mut s = p.trim().replace('\\', "/").to_lowercase();
+    while s.ends_with('/') {
+        s.pop();
+    }
+    s
+}
+
+/// Orca 用过的每个 workspace / worktree：应用自己会写
+/// `%APPDATA%/Orca/orca-usage-worktree-history.json`，比按路径猜准。
+fn orca_workspaces(home: &Path) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for dir in [
+        home.join("AppData").join("Roaming").join("Orca"),
+        home.join("Library").join("Application Support").join("Orca"),
+        home.join(".config").join("Orca"),
+    ] {
+        let Ok(text) = std::fs::read_to_string(dir.join("orca-usage-worktree-history.json")) else {
+            continue;
+        };
+        let Ok(v) = serde_json::from_str::<Value>(&text) else {
+            continue;
+        };
+        let Some(list) = v.get("worktrees").and_then(|w| w.as_array()) else {
+            continue;
+        };
+        for item in list {
+            let raw = item.get(0).and_then(|x| x.as_str()).unwrap_or("");
+            // 每一项是 `<workspace uuid>::<path>`
+            let path = raw.split_once("::").map(|(_, p)| p).unwrap_or(raw);
+            let p = norm_path(path);
+            if !p.is_empty() && !out.contains(&p) {
+                out.push(p);
+            }
+        }
+    }
+    // 兜底：默认工作区根目录（刚建的 worktree 还没写进历史时也认得出来）。
+    let root = norm_path(&home.join("orca").join("workspaces").to_string_lossy());
+    if !out.contains(&root) {
+        out.push(root);
+    }
+    out
+}
+
+/// 会话目录在某个 Orca workspace / worktree 之内（含子目录）。
+fn is_orca_workspace(dir: &str, roots: &[String]) -> bool {
+    let d = norm_path(dir);
+    if d.is_empty() {
+        return false;
+    }
+    roots
+        .iter()
+        .any(|r| !r.is_empty() && (d == *r || d.starts_with(&format!("{r}/"))))
+}
+
+fn path_leaf(p: &str) -> String {
+    p.trim_end_matches(['/', '\\'])
+        .rsplit(['/', '\\'])
+        .next()
+        .unwrap_or("")
+        .to_string()
+}
+
+/// ses_* → agent/project。两层来源：
+/// 1. Orca 的 ACP 账本（有会话名和工作区，最准）；
+/// 2. opencode 自己的会话库（补上没进 Orca 账本的：Orca 终端里直接跑的 opencode）。
+fn looks_like_path(s: &str) -> bool {
+    let s = s.trim();
+    s.contains("::") || s.contains('/') || s.contains('\\')
+}
+
+fn build_session_labels() -> HashMap<String, SessionLabel> {
+    let home = home();
+    let mut out: HashMap<String, SessionLabel> = HashMap::new();
+    for (ses, (agent, project)) in orca_session_labels() {
+        out.insert(ses, SessionLabel { agent, project });
+    }
+    let roots = orca_workspaces(&home);
+    for (id, title, dir) in opencode_sessions(&home) {
+        if id.is_empty() {
+            continue;
+        }
+        let managed = out.contains_key(&id);
+        if !managed && !is_orca_workspace(&dir, &roots) {
+            continue;
+        }
+        let title = title.trim().to_string();
+        if managed {
+            // Orca 账本只给了工作区路径（conversationName 为空）时，用 opencode 的会话标题
+            // 更好认；账本已经有可读名字就别覆盖。
+            let project = if !title.is_empty() {
+                title
+            } else if !dir.is_empty() {
+                path_leaf(&dir)
+            } else {
+                String::new()
+            };
+            if let Some(existing) = out.get_mut(&id) {
+                if !project.is_empty()
+                    && (existing.project.trim().is_empty() || looks_like_path(&existing.project))
+                {
+                    existing.project = project;
+                }
+            }
+        } else {
+            let project = if title.is_empty() { path_leaf(&dir) } else { title };
+            out.insert(
+                id,
+                SessionLabel {
+                    agent: "Orca · opencode".to_string(),
+                    project,
+                },
+            );
+        }
+    }
+    out
+}
+
 /// ses_* → (agent, project)：把 Orca 的会话名挂到本机流水那几行上，
 /// 否则流水里全是「(本机 8010 流水)」，看不出某条请求是谁问的。
 fn orca_session_labels() -> HashMap<String, (String, String)> {
@@ -2920,7 +3114,7 @@ fn journal_as_records(
     model: &str,
 ) -> (Vec<Value>, Vec<String>, Vec<String>) {
     let since = if since_ms > 0 { since_ms as f64 / 1000.0 } else { 0.0 };
-    let labels = orca_session_labels();
+    let labels = session_labels();
     let mut out: Vec<Value> = Vec::new();
     let mut days: Vec<String> = Vec::new();
     let mut months: Vec<String> = Vec::new();
@@ -2972,7 +3166,7 @@ fn journal_as_records(
             .get("session_id")
             .and_then(|v| v.as_str())
             .and_then(|sid| labels.get(sid))
-            .map(|(a, p)| (a.as_str(), p.as_str()))
+            .map(|l| (l.agent.as_str(), l.project.as_str()))
             .unwrap_or(("LLM Router", "(本机 8010 流水)"));
         out.push(json!({
             // 与会话记录同名的字段：列表按它区分来源、展开正文时按 at + upstream 取
@@ -3754,5 +3948,23 @@ mod tests {
         assert!(orca_turn_from_row(&msg).is_none());
         let no_ts = json!({"itemId": "t2", "body": {"kind": "turn", "turnId": "p:ses_abc:x"}});
         assert!(orca_turn_from_row(&no_ts).is_none());
+    }
+
+    /// Orca 终端里直跑的 opencode 会话只能按目录认：必须支持反斜杠、盘符大小写，
+    /// 且不能用裸前缀把 `D:/Project/D-other` 误认成 Orca 的 `D:/Project/D`。
+    #[test]
+    fn orca_workspace_match() {
+        let roots = vec![
+            norm_path("C:/Users/me/orca/workspaces"),
+            norm_path("D:/Project/D"),
+        ];
+        assert!(is_orca_workspace("C:/Users/me/orca/workspaces/llm-router/kokanee", &roots));
+        assert!(is_orca_workspace("C:\\Users\\ME\\Orca\\Workspaces\\Dental\\bramble", &roots));
+        assert!(is_orca_workspace("D:/Project/D/Dental", &roots));
+        assert!(is_orca_workspace("D:/Project/D", &roots));
+        assert!(!is_orca_workspace("D:/Project/D-other", &roots));
+        assert!(!is_orca_workspace("D:/Project/Dental", &roots));
+        assert!(!is_orca_workspace("", &roots));
+        assert_eq!(path_leaf("C:/Users/me/orca/workspaces/llm-router/kokanee"), "kokanee");
     }
 }

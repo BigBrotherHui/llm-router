@@ -153,11 +153,22 @@ pub fn query(state: &AppState, q: &HashMap<String, String>) -> Value {
     let total = keep.len();
     let offset = q.get("offset").and_then(|v| v.parse::<usize>().ok()).unwrap_or(0);
     let limit = q.get("limit").and_then(|v| v.parse::<usize>().ok()).unwrap_or(100).min(1000);
+    // 流水里只有 session_id；挂上 Orca 的会话归属，请求记录才看得出是谁问的。
+    let labels = super::sessions::session_labels();
     let page: Vec<Value> = keep
         .into_iter()
         .skip(offset)
         .take(limit)
-        .map(strip_heavy)
+        .map(|entry| {
+            let mut e = strip_heavy(entry);
+            if let Some(sid) = e.get("session_id").and_then(|v| v.as_str()) {
+                if let Some(l) = labels.get(sid) {
+                    e["agent"] = json!(l.agent);
+                    e["project"] = json!(l.project);
+                }
+            }
+            e
+        })
         .collect();
     json!({
         "entries": page,

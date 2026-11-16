@@ -2618,6 +2618,17 @@ function usageCells(u, withCache) {
   }).join("") + `</div>`;
 }
 
+// 会话归属徽标：Orca 托管 / Orca 终端里跑的会话在流水里带 agent（如「Orca · opencode」），
+// 直接标出来，否则「过 Orca 的请求」和普通本机流水看起来一模一样。
+function agentBadge(h) {
+  const agent = String(h.agent || "").trim();
+  if (!agent || agent === "LLM Router") return "";
+  const project = String(h.project || "").trim();
+  const tone = agent.startsWith("Orca") ? "purple" : "";
+  const tip = project ? `${agent} · ${project}` : agent;
+  return `<span class="badge ${tone}" title="${esc(tip)}">${esc(agent)}</span>`;
+}
+
 function renderSide() {
   // 统计和列表**都以落盘流水为准**（后端启动时会按流水把聚合对平）。
   // 老的实现里列表读的是内存里那 500 条 history，所以白天/昨天的记录翻不到，
@@ -2837,6 +2848,7 @@ function renderSide() {
         <span class="req-idx mono">${esc(h.time)}</span>
         ${badge}
         <span class="req-model" title="${esc(h.model)}">${esc(h.model)}</span>
+        ${agentBadge(h)}
         <span class="badge">${esc(subjUp)}</span>
         ${h.key ? `<span class="badge" title="这个请求用的是哪个 Key（名字）">${esc(h.key)}</span>` : ""}
         ${fellBack ? `<span class="hint">→ ${esc(h.upstream)}</span>` : ""}
@@ -2876,6 +2888,7 @@ function renderSide() {
         <div class="req-sec">
           <h5>详情</h5>
           <div class="hint" style="line-height:1.8">
+            ${h.agent ? `会话来源：<code>${esc(h.agent)}</code>${h.project ? `　·　${esc(h.project)}` : ""}<br>` : ""}
             实际发往上游的模型：<code>${esc(h.effective_model || "-")}</code><br>
             ${h.key ? `实际使用的 Key：<code>${esc(h.key)}</code>（Key 名字）<br>` : ""}
             路由来源：${esc(h.route_source || "-")}　·　${requestAttemptLabel(h, trail)}
